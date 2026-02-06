@@ -46,6 +46,7 @@ import (
 	"github.com/gorilla/mux"
 	auth "github.com/kubernetes-sigs/headlamp/backend/pkg/auth"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/clusterinventory"
 	cfg "github.com/kubernetes-sigs/headlamp/backend/pkg/config"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/serviceproxy"
 
@@ -450,7 +451,7 @@ func createHeadlampHandler(config *HeadlampConfig) http.Handler {
 
 	// In-cluster
 	if config.UseInCluster {
-		context, err := kubeconfig.GetInClusterContext(
+		inClusterContext, err := kubeconfig.GetInClusterContext(
 			config.InClusterContextName,
 			config.oidcIdpIssuerURL,
 			config.oidcClientID, config.oidcClientSecret,
@@ -461,16 +462,20 @@ func createHeadlampHandler(config *HeadlampConfig) http.Handler {
 			logger.Log(logger.LevelError, nil, err, "Failed to get in-cluster context")
 		}
 
-		context.Source = kubeconfig.InCluster
+		inClusterContext.Source = kubeconfig.InCluster
 
-		err = context.SetupProxy()
+		err = inClusterContext.SetupProxy()
 		if err != nil {
 			logger.Log(logger.LevelError, nil, err, "Failed to setup proxy for in-cluster context")
 		}
 
-		err = config.KubeConfigStore.AddContext(context)
+		err = config.KubeConfigStore.AddContext(inClusterContext)
 		if err != nil {
 			logger.Log(logger.LevelError, nil, err, "Failed to add in-cluster context")
+		}
+
+		if config.EnableClusterInventory {
+			go clusterinventory.WatchAndSync(context.Background(), config.KubeConfigStore, config.ClusterInventoryProviderFile)
 		}
 	}
 
