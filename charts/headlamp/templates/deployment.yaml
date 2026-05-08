@@ -264,6 +264,9 @@ spec:
             {{- with .Values.config.podDebugImage }}
             - "-pod-debug-image={{ . }}"
             {{- end }}
+            {{- with .Values.config.clusterInventory.labelSelector }}
+            - "-cluster-inventory-label-selector={{ . }}"
+            {{- end }}
             {{- if not $oidc.externalSecret.enabled}}
             # Check if externalSecret is disabled
             {{- if or (ne $oidc.clientID "") (ne $clientID "") }}

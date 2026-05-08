@@ -2,6 +2,7 @@ package headlampconfig
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/config"
@@ -47,6 +48,7 @@ type HeadlampCFG struct {
 	Insecure               bool
 	EnableHelm             bool
 	EnableDynamicClusters  bool
+	EnableClusterInventory bool
 	AllowKubeconfigChanges bool
 	WatchPluginsChanges    bool
 	Port                   uint
@@ -61,9 +63,15 @@ type HeadlampCFG struct {
 	Metrics                *telemetry.Metrics
 	BaseURL                string
 	ProxyURLs              []string
-	TLSCertPath            string
-	TLSKeyPath             string
-	SessionTTL             int
-	PodDebugImage          string
-	OidcUseCookie          bool
+
+	ClusterInventoryProviderFile          string
+	ClusterInventoryLabelSelector         string
+	ClusterInventoryRootReconcileInterval time.Duration
+	ClusterInventoryNoCRDCacheTTL         time.Duration
+
+	TLSCertPath   string
+	TLSKeyPath    string
+	SessionTTL    int
+	PodDebugImage string
+	OidcUseCookie bool
 }
