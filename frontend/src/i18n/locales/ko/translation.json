@@ -60,6 +60,7 @@
   "Delete": "삭제",
   "Delete Cluster": "클러스터 삭제",
   "Active": "활성",
+  "Control plane unhealthy": "",
   "Plugin": "플러그인",
   "In-cluster": "클러스터 내부",
   "Cluster Inventory": "",

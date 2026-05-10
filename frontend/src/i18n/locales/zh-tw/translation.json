@@ -60,6 +60,7 @@
   "Delete": "刪除",
   "Delete Cluster": "刪除叢集",
   "Active": "活躍",
+  "Control plane unhealthy": "",
   "Plugin": "外掛",
   "In-cluster": "叢集內",
   "Cluster Inventory": "",

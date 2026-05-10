@@ -60,6 +60,7 @@
   "Delete": "削除",
   "Delete Cluster": "クラスターの削除",
   "Active": "アクティブ",
+  "Control plane unhealthy": "",
   "Plugin": "プラグイン",
   "In-cluster": "クラスター内",
   "Cluster Inventory": "",

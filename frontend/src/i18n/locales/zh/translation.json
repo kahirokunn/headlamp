@@ -60,6 +60,7 @@
   "Delete": "删除",
   "Delete Cluster": "删除集群",
   "Active": "活跃",
+  "Control plane unhealthy": "",
   "Plugin": "插件",
   "In-cluster": "集群内",
   "Cluster Inventory": "",

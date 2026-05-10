@@ -60,6 +60,7 @@
   "Delete": "Borrar",
   "Delete Cluster": "Borrar cluster",
   "Active": "Activo",
+  "Control plane unhealthy": "",
   "Plugin": "Plugin",
   "In-cluster": "En-cluster",
   "Cluster Inventory": "",
