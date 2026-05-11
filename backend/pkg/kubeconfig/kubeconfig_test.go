@@ -85,6 +85,7 @@ func TestContextSourceStr(t *testing.T) {
 		{"dynamic cluster", kubeconfig.DynamicCluster, "dynamic_cluster"},
 		{"in cluster", kubeconfig.InCluster, "incluster"},
 		{"cluster inventory", kubeconfig.ClusterInventory, "cluster_inventory"},
+		{"cluster api", kubeconfig.ClusterAPI, "cluster_api"},
 		{"unknown", 0, "unknown"},
 	}
 
@@ -612,6 +613,24 @@ func newTestContext() *kubeconfig.Context {
 		Error:          "test-error",
 		KubeConfigPath: "/path/to/kubeconfig",
 		ClusterID:      "test-cluster-id",
+		ClusterAPI: &kubeconfig.ClusterAPIMetadata{
+			Cluster: kubeconfig.ClusterAPICluster{
+				Root:      "in-cluster",
+				Namespace: "default",
+				Name:      "spoke-a",
+				Key:       "in-cluster/default/spoke-a",
+			},
+			Conditions: []metav1.Condition{
+				{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Available"},
+			},
+			Phase:             "Provisioned",
+			KubernetesVersion: "v1.35.0",
+			KubeconfigSecret: kubeconfig.ClusterAPIKubeconfigSecret{
+				Namespace: "default",
+				Name:      "spoke-a-kubeconfig",
+				Key:       "default/spoke-a-kubeconfig",
+			},
+		},
 	}
 }
 
@@ -641,6 +660,8 @@ func TestContextCopyKeepsNestedStructuresIndependent(t *testing.T) {
 	original.OidcConf.Scopes = append(original.OidcConf.Scopes, "new-scope")
 	*original.OidcConf.SkipTLSVerify = false
 	*original.OidcConf.CACert = "modified-ca-cert"
+	original.ClusterAPI.Conditions[0].Status = metav1.ConditionFalse
+	original.ClusterAPI.KubeconfigSecret.Name = "modified-kubeconfig"
 
 	assert.Equal(t, "test-ns", copied.KubeContext.Namespace)
 	assert.Equal(t, "https://test.example.com", copied.Cluster.Server)
@@ -649,6 +670,8 @@ func TestContextCopyKeepsNestedStructuresIndependent(t *testing.T) {
 	assert.Equal(t, []string{"profile", "email"}, copied.OidcConf.Scopes)
 	assert.True(t, *copied.OidcConf.SkipTLSVerify)
 	assert.Equal(t, "test-ca-cert", *copied.OidcConf.CACert)
+	assert.Equal(t, metav1.ConditionTrue, copied.ClusterAPI.Conditions[0].Status)
+	assert.Equal(t, "spoke-a-kubeconfig", copied.ClusterAPI.KubeconfigSecret.Name)
 }
 
 func TestContextCopyWithNilOidcConf(t *testing.T) {

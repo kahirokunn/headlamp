@@ -57,6 +57,7 @@ const (
 	DynamicCluster
 	InCluster
 	ClusterInventory
+	ClusterAPI
 )
 
 // Context contains all information related to a kubernetes context.
@@ -76,6 +77,8 @@ type Context struct {
 	ClusterID string `json:"clusterID"`
 	// ClusterInventory stores metadata copied from a Cluster Inventory ClusterProfile.
 	ClusterInventory *ClusterInventoryMetadata `json:"clusterInventory,omitempty"`
+	// ClusterAPI stores metadata copied from a Cluster API Cluster.
+	ClusterAPI *ClusterAPIMetadata `json:"clusterAPI,omitempty"`
 }
 
 // ClusterInventoryProfile identifies the ClusterProfile that produced a context.
@@ -105,6 +108,30 @@ type ClusterInventoryMetadata struct {
 	Properties []ClusterInventoryProperty `json:"properties,omitempty"`
 }
 
+// ClusterAPICluster identifies the Cluster API Cluster that produced a context.
+type ClusterAPICluster struct {
+	Root      string `json:"root"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	Key       string `json:"key"`
+}
+
+// ClusterAPIKubeconfigSecret identifies the Secret used for workload cluster access.
+type ClusterAPIKubeconfigSecret struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	Key       string `json:"key"`
+}
+
+// ClusterAPIMetadata contains non-sensitive Cluster API status metadata.
+type ClusterAPIMetadata struct {
+	Cluster           ClusterAPICluster          `json:"cluster"`
+	Conditions        []metav1.Condition         `json:"conditions,omitempty"`
+	Phase             string                     `json:"phase,omitempty"`
+	KubernetesVersion string                     `json:"kubernetesVersion,omitempty"`
+	KubeconfigSecret  ClusterAPIKubeconfigSecret `json:"kubeconfigSecret"`
+}
+
 // DeepCopy returns an independent copy of ClusterInventoryMetadata.
 func (m *ClusterInventoryMetadata) DeepCopy() *ClusterInventoryMetadata {
 	if m == nil {
@@ -123,6 +150,21 @@ func (m *ClusterInventoryMetadata) DeepCopy() *ClusterInventoryMetadata {
 	}
 
 	return copied
+}
+
+// DeepCopy returns an independent copy of ClusterAPIMetadata.
+func (m *ClusterAPIMetadata) DeepCopy() *ClusterAPIMetadata {
+	if m == nil {
+		return nil
+	}
+
+	return &ClusterAPIMetadata{
+		Cluster:           m.Cluster,
+		Conditions:        append([]metav1.Condition(nil), m.Conditions...),
+		Phase:             m.Phase,
+		KubernetesVersion: m.KubernetesVersion,
+		KubeconfigSecret:  m.KubeconfigSecret,
+	}
 }
 
 // Copy creates a deep copy of the Context, excluding the proxy field which is created on demand.
@@ -176,6 +218,7 @@ func (c *Context) Copy() *Context {
 		KubeConfigPath:   c.KubeConfigPath,
 		ClusterID:        c.ClusterID,
 		ClusterInventory: c.ClusterInventory.DeepCopy(),
+		ClusterAPI:       c.ClusterAPI.DeepCopy(),
 	}
 }
 
@@ -459,6 +502,8 @@ func (c *Context) SourceStr() string {
 		return "incluster"
 	case ClusterInventory:
 		return "cluster_inventory"
+	case ClusterAPI:
+		return "cluster_api"
 	default:
 		return "unknown"
 	}
