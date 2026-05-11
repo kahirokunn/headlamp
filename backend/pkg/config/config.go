@@ -16,6 +16,7 @@ import (
 	"github.com/knadh/koanf"
 	"github.com/knadh/koanf/providers/basicflag"
 	"github.com/knadh/koanf/providers/env"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/clusterapi"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/clusterinventory"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/logger"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/spa"
@@ -51,6 +52,7 @@ type Config struct {
 	EnableHelm             bool   `koanf:"enable-helm"`
 	EnableDynamicClusters  bool   `koanf:"enable-dynamic-clusters"`
 	EnableClusterInventory bool   `koanf:"enable-cluster-inventory"`
+	EnableClusterAPI       bool   `koanf:"enable-cluster-api"`
 	AllowKubeconfigChanges bool   `koanf:"allow-kubeconfig-changes"`
 	ListenAddr             string `koanf:"listen-addr"`
 	WatchPluginsChanges    bool   `koanf:"watch-plugins-changes"`
@@ -69,6 +71,9 @@ type Config struct {
 	ClusterInventoryLabelSelector         string        `koanf:"cluster-inventory-label-selector"`
 	ClusterInventoryRootReconcileInterval time.Duration `koanf:"cluster-inventory-root-reconcile-interval"`
 	ClusterInventoryNoCRDCacheTTL         time.Duration `koanf:"cluster-inventory-no-crd-cache-ttl"`
+	ClusterAPILabelSelector               string        `koanf:"cluster-api-label-selector"`
+	ClusterAPIRootReconcileInterval       time.Duration `koanf:"cluster-api-root-reconcile-interval"`
+	ClusterAPINoCRDCacheTTL               time.Duration `koanf:"cluster-api-no-crd-cache-ttl"`
 
 	OidcClientID              string `koanf:"oidc-client-id"`
 	OidcValidatorClientID     string `koanf:"oidc-validator-client-id"`
@@ -159,7 +164,19 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if err := c.validateClusterDiscovery(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Config) validateClusterDiscovery() error {
 	if err := c.validateClusterInventory(); err != nil {
+		return err
+	}
+
+	if err := c.validateClusterAPI(); err != nil {
 		return err
 	}
 
@@ -196,6 +213,27 @@ func (c *Config) validateClusterInventory() error {
 	}
 
 	c.ClusterInventoryLabelSelector = labelSelector
+
+	return nil
+}
+
+func (c *Config) validateClusterAPI() error {
+	if c.ClusterAPIRootReconcileInterval < 0 {
+		return errors.New("cluster-api-root-reconcile-interval cannot be negative")
+	}
+
+	if c.ClusterAPINoCRDCacheTTL < 0 {
+		return errors.New("cluster-api-no-crd-cache-ttl cannot be negative")
+	}
+
+	labelSelector := strings.TrimSpace(c.ClusterAPILabelSelector)
+	if labelSelector != "" {
+		if _, err := labels.Parse(labelSelector); err != nil {
+			return fmt.Errorf("invalid cluster-api-label-selector: %w", err)
+		}
+	}
+
+	c.ClusterAPILabelSelector = labelSelector
 
 	return nil
 }
@@ -514,6 +552,13 @@ func addGeneralFlags(f *flag.FlagSet) {
 		"Interval for reconciling Cluster Inventory roots")
 	f.Duration("cluster-inventory-no-crd-cache-ttl", clusterinventory.DefaultNoCRDCacheTTL,
 		"How long to cache that an API server has no ClusterProfile CRD")
+	f.Bool("enable-cluster-api", false, "Enable automatic discovery of Cluster API v1beta2 workload clusters")
+	f.String("cluster-api-label-selector", "",
+		"Label selector used to filter Cluster API v1beta2 Cluster resources")
+	f.Duration("cluster-api-root-reconcile-interval", clusterapi.DefaultRootReconcileInterval,
+		"Interval for reconciling Cluster API discovery roots")
+	f.Duration("cluster-api-no-crd-cache-ttl", clusterapi.DefaultNoCRDCacheTTL,
+		"How long to cache that an API server has no Cluster API v1beta2 Cluster CRD")
 }
 
 func addOIDCFlags(f *flag.FlagSet) {

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/clusterapi"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/clusterinventory"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/config"
 	"github.com/stretchr/testify/assert"
@@ -15,23 +16,27 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	clusterInventoryEnv := []string{
+	clusterDiscoveryEnv := []string{
 		"HEADLAMP_CONFIG_ENABLE_CLUSTER_INVENTORY",
 		"HEADLAMP_CONFIG_CLUSTER_INVENTORY_PROVIDER_FILE",
 		"HEADLAMP_CONFIG_CLUSTER_INVENTORY_LABEL_SELECTOR",
 		"HEADLAMP_CONFIG_CLUSTER_INVENTORY_ROOT_RECONCILE_INTERVAL",
 		"HEADLAMP_CONFIG_CLUSTER_INVENTORY_NO_CRD_CACHE_TTL",
+		"HEADLAMP_CONFIG_ENABLE_CLUSTER_API",
+		"HEADLAMP_CONFIG_CLUSTER_API_LABEL_SELECTOR",
+		"HEADLAMP_CONFIG_CLUSTER_API_ROOT_RECONCILE_INTERVAL",
+		"HEADLAMP_CONFIG_CLUSTER_API_NO_CRD_CACHE_TTL",
 	}
 
 	previous := map[string]string{}
-	for _, key := range clusterInventoryEnv {
+	for _, key := range clusterDiscoveryEnv {
 		previous[key] = os.Getenv(key)
 		_ = os.Unsetenv(key)
 	}
 
 	code := m.Run()
 
-	for _, key := range clusterInventoryEnv {
+	for _, key := range clusterDiscoveryEnv {
 		if previous[key] == "" {
 			_ = os.Unsetenv(key)
 		} else {
@@ -191,6 +196,22 @@ var ParseWithEnvTests = []struct {
 			assert.Equal(t, "warn", conf.LogLevel)
 		},
 	},
+	{
+		name: "cluster_api_from_env",
+		args: []string{"go run ./cmd"},
+		env: map[string]string{
+			"HEADLAMP_CONFIG_ENABLE_CLUSTER_API":                  "true",
+			"HEADLAMP_CONFIG_CLUSTER_API_LABEL_SELECTOR":          " environment=dev ",
+			"HEADLAMP_CONFIG_CLUSTER_API_ROOT_RECONCILE_INTERVAL": "2m",
+			"HEADLAMP_CONFIG_CLUSTER_API_NO_CRD_CACHE_TTL":        "30m",
+		},
+		verify: func(t *testing.T, conf *config.Config) {
+			assert.True(t, conf.EnableClusterAPI)
+			assert.Equal(t, "environment=dev", conf.ClusterAPILabelSelector)
+			assert.Equal(t, 2*time.Minute, conf.ClusterAPIRootReconcileInterval)
+			assert.Equal(t, 30*time.Minute, conf.ClusterAPINoCRDCacheTTL)
+		},
+	},
 }
 
 func TestParseWithEnv(t *testing.T) {
@@ -240,6 +261,21 @@ func TestParseErrors(t *testing.T) {
 			args:          []string{"go run ./cmd", "--no-browser", "--in-cluster"},
 			errorContains: "no-browser cannot be used in in-cluster mode",
 		},
+		{
+			name:          "invalid_cluster_api_label_selector",
+			args:          []string{"go run ./cmd", "--cluster-api-label-selector=headlamp.dev/ignore in ("},
+			errorContains: "invalid cluster-api-label-selector",
+		},
+		{
+			name:          "negative_cluster_api_root_reconcile_interval",
+			args:          []string{"go run ./cmd", "--cluster-api-root-reconcile-interval=-1s"},
+			errorContains: "cluster-api-root-reconcile-interval cannot be negative",
+		},
+		{
+			name:          "negative_cluster_api_no_crd_cache_ttl",
+			args:          []string{"go run ./cmd", "--cluster-api-no-crd-cache-ttl=-1s"},
+			errorContains: "cluster-api-no-crd-cache-ttl cannot be negative",
+		},
 	}
 
 	for _, tt := range tests {
@@ -252,6 +288,7 @@ func TestParseErrors(t *testing.T) {
 	}
 }
 
+//nolint:funlen
 func TestParseFlags(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -284,6 +321,31 @@ func TestParseFlags(t *testing.T) {
 			args: []string{"go run ./cmd", "--enable-helm"},
 			verify: func(t *testing.T, conf *config.Config) {
 				assert.Equal(t, true, conf.EnableHelm)
+			},
+		},
+		{
+			name: "enable_cluster_api",
+			args: []string{
+				"go run ./cmd",
+				"--enable-cluster-api",
+				"--cluster-api-label-selector=environment=dev",
+				"--cluster-api-root-reconcile-interval=10m",
+				"--cluster-api-no-crd-cache-ttl=1h",
+			},
+			verify: func(t *testing.T, conf *config.Config) {
+				assert.True(t, conf.EnableClusterAPI)
+				assert.Equal(t, "environment=dev", conf.ClusterAPILabelSelector)
+				assert.Equal(t, 10*time.Minute, conf.ClusterAPIRootReconcileInterval)
+				assert.Equal(t, time.Hour, conf.ClusterAPINoCRDCacheTTL)
+			},
+		},
+		{
+			name: "cluster_api_defaults",
+			args: []string{"go run ./cmd"},
+			verify: func(t *testing.T, conf *config.Config) {
+				assert.False(t, conf.EnableClusterAPI)
+				assert.Equal(t, clusterapi.DefaultRootReconcileInterval, conf.ClusterAPIRootReconcileInterval)
+				assert.Equal(t, clusterapi.DefaultNoCRDCacheTTL, conf.ClusterAPINoCRDCacheTTL)
 			},
 		},
 		{

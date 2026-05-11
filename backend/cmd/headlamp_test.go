@@ -395,6 +395,54 @@ func TestGetClustersClusterInventorySource(t *testing.T) {
 	assert.Equal(t, "False", configCondition["status"])
 }
 
+func TestGetClustersIncludesClusterAPIMetadata(t *testing.T) {
+	kubeConfigStore := kubeconfig.NewContextStore()
+	clusterAPI := &kubeconfig.ClusterAPIMetadata{
+		Cluster: kubeconfig.ClusterAPICluster{
+			Root:      "in-cluster",
+			Namespace: "default",
+			Name:      "spoke-a",
+			Key:       "in-cluster/default/spoke-a",
+		},
+		Conditions: []metav1.Condition{
+			{Type: "Ready", Status: metav1.ConditionTrue, Reason: "Available"},
+		},
+		Phase:             "Provisioned",
+		KubernetesVersion: "v1.35.0",
+		KubeconfigSecret: kubeconfig.ClusterAPIKubeconfigSecret{
+			Namespace: "default",
+			Name:      "spoke-a-kubeconfig",
+			Key:       "default/spoke-a-kubeconfig",
+		},
+	}
+
+	err := kubeConfigStore.AddContext(&kubeconfig.Context{
+		Name:        "cluster-api-in-cluster--default--spoke-a--dbdb0aa95e5d",
+		KubeContext: &api.Context{Cluster: "spoke-a", AuthInfo: "spoke-a", Namespace: "default"},
+		Cluster:     &api.Cluster{Server: "https://spoke-a.example.com"},
+		AuthInfo:    &api.AuthInfo{Token: "token"},
+		Source:      kubeconfig.ClusterAPI,
+		ClusterID:   "cluster-api/in-cluster/default/spoke-a",
+		ClusterAPI:  clusterAPI,
+	})
+	require.NoError(t, err)
+
+	c := HeadlampConfig{
+		HeadlampConfig: &headlampconfig.HeadlampConfig{
+			HeadlampCFG: &headlampconfig.HeadlampCFG{
+				KubeConfigStore: kubeConfigStore,
+			},
+		},
+	}
+
+	clusters := c.getClusters()
+	require.Len(t, clusters, 1)
+
+	assert.Equal(t, "cluster_api", clusters[0].Metadata["source"])
+	assert.Equal(t, "cluster-api/in-cluster/default/spoke-a", clusters[0].Metadata["clusterID"])
+	assert.Equal(t, clusterAPI, clusters[0].Metadata["clusterAPI"])
+}
+
 func clusterInventoryConfigContext() *kubeconfig.Context {
 	return &kubeconfig.Context{
 		Name:        "cluster-inventory-in-cluster--default--spoke-a--dbdb0aa95e5d",

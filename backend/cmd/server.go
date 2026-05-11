@@ -95,6 +95,7 @@ func buildHeadlampCFG(conf *config.Config, kubeConfigStore kubeconfig.ContextSto
 		EnableHelm:             conf.EnableHelm,
 		EnableDynamicClusters:  conf.EnableDynamicClusters,
 		EnableClusterInventory: conf.EnableClusterInventory,
+		EnableClusterAPI:       conf.EnableClusterAPI,
 		AllowKubeconfigChanges: conf.AllowKubeconfigChanges,
 		WatchPluginsChanges:    conf.WatchPluginsChanges,
 		KubeConfigStore:        kubeConfigStore,
@@ -105,6 +106,9 @@ func buildHeadlampCFG(conf *config.Config, kubeConfigStore kubeconfig.ContextSto
 		ClusterInventoryLabelSelector:         conf.ClusterInventoryLabelSelector,
 		ClusterInventoryRootReconcileInterval: conf.ClusterInventoryRootReconcileInterval,
 		ClusterInventoryNoCRDCacheTTL:         conf.ClusterInventoryNoCRDCacheTTL,
+		ClusterAPILabelSelector:               conf.ClusterAPILabelSelector,
+		ClusterAPIRootReconcileInterval:       conf.ClusterAPIRootReconcileInterval,
+		ClusterAPINoCRDCacheTTL:               conf.ClusterAPINoCRDCacheTTL,
 
 		TLSCertPath:   conf.TLSCertPath,
 		TLSKeyPath:    conf.TLSKeyPath,

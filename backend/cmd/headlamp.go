@@ -49,6 +49,7 @@ import (
 	"github.com/gorilla/mux"
 	auth "github.com/kubernetes-sigs/headlamp/backend/pkg/auth"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/clusterapi"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/clusterinventory"
 	cfg "github.com/kubernetes-sigs/headlamp/backend/pkg/config"
 	headlampcfg "github.com/kubernetes-sigs/headlamp/backend/pkg/headlampconfig"
@@ -429,6 +430,39 @@ func startClusterInventory(ctx context.Context, config *HeadlampConfig) error {
 	return nil
 }
 
+func startClusterAPI(ctx context.Context, config *HeadlampConfig) error {
+	if !config.EnableClusterAPI {
+		return nil
+	}
+
+	var hubConfig *rest.Config
+
+	if config.UseInCluster {
+		inClusterConfig, err := rest.InClusterConfig()
+		if err != nil {
+			return fmt.Errorf("get in-cluster config for Cluster API discovery: %w", err)
+		}
+
+		hubConfig = inClusterConfig
+	}
+
+	runner, err := clusterapi.NewRunner(clusterapi.Options{
+		Store:                 config.KubeConfigStore,
+		LabelSelector:         config.ClusterAPILabelSelector,
+		RootReconcileInterval: config.ClusterAPIRootReconcileInterval,
+		NoCRDCacheTTL:         config.ClusterAPINoCRDCacheTTL,
+		HubConfig:             hubConfig,
+		DiscoverFromStore:     !config.UseInCluster,
+	})
+	if err != nil {
+		return err
+	}
+
+	go runner.Run(ctx)
+
+	return nil
+}
+
 func addInClusterContext(config *HeadlampConfig) {
 	headlampContext, err := kubeconfig.GetInClusterContext(
 		config.InClusterContextName,
@@ -467,6 +501,7 @@ func createHeadlampHandler(ctx context.Context, config *HeadlampConfig) http.Han
 	logger.Log(logger.LevelInfo, nil, nil, "User plugins dir: "+config.UserPluginDir)
 	logger.Log(logger.LevelInfo, nil, nil, "Plugins dir: "+config.PluginDir)
 	logger.Log(logger.LevelInfo, nil, nil, "Dynamic clusters support: "+fmt.Sprint(config.EnableDynamicClusters))
+	logger.Log(logger.LevelInfo, nil, nil, "Cluster API discovery support: "+fmt.Sprint(config.EnableClusterAPI))
 	logger.Log(logger.LevelInfo, nil, nil, "Helm support: "+fmt.Sprint(config.EnableHelm))
 	logger.Log(logger.LevelInfo, nil, nil, "Proxy URLs: "+fmt.Sprint(config.ProxyURLs))
 	logger.Log(logger.LevelInfo, nil, nil, "TLS certificate path: "+config.TLSCertPath)
@@ -1249,7 +1284,11 @@ func serverHandler(ctx context.Context, config *HeadlampConfig) (http.Handler, e
 	handler := createHeadlampHandler(ctx, config)
 
 	if err := startClusterInventory(ctx, config); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("starting cluster inventory discovery: %w", err)
+	}
+
+	if err := startClusterAPI(ctx, config); err != nil {
+		return nil, fmt.Errorf("starting Cluster API discovery: %w", err)
 	}
 
 	handler = config.OIDCTokenRefreshMiddleware(handler)
@@ -1298,7 +1337,7 @@ func StartHeadlampServer(config *HeadlampConfig) {
 
 	handler, err := serverHandler(ctx, config)
 	if err != nil {
-		logger.Log(logger.LevelError, nil, err, "starting cluster inventory discovery")
+		logger.Log(logger.LevelError, nil, err, "starting discovery")
 		return
 	}
 
@@ -1841,6 +1880,7 @@ func (c *HeadlampConfig) handleClusterRequests(router *mux.Router) {
 	handleClusterAPI(c, router)
 }
 
+//nolint:funlen
 func (c *HeadlampConfig) getClusters() []Cluster {
 	clusters := []Cluster{}
 
@@ -1893,6 +1933,10 @@ func (c *HeadlampConfig) getClusters() []Cluster {
 
 		if context.Source == kubeconfig.ClusterInventory && context.ClusterInventory != nil {
 			metadata["clusterInventory"] = context.ClusterInventory
+		}
+
+		if context.Source == kubeconfig.ClusterAPI && context.ClusterAPI != nil {
+			metadata["clusterAPI"] = context.ClusterAPI
 		}
 
 		clusters = append(clusters, Cluster{

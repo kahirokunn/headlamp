@@ -49,6 +49,7 @@ type HeadlampCFG struct {
 	EnableHelm             bool
 	EnableDynamicClusters  bool
 	EnableClusterInventory bool
+	EnableClusterAPI       bool
 	AllowKubeconfigChanges bool
 	WatchPluginsChanges    bool
 	Port                   uint
@@ -68,6 +69,9 @@ type HeadlampCFG struct {
 	ClusterInventoryLabelSelector         string
 	ClusterInventoryRootReconcileInterval time.Duration
 	ClusterInventoryNoCRDCacheTTL         time.Duration
+	ClusterAPILabelSelector               string
+	ClusterAPIRootReconcileInterval       time.Duration
+	ClusterAPINoCRDCacheTTL               time.Duration
 
 	TLSCertPath   string
 	TLSKeyPath    string
