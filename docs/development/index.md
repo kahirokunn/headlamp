@@ -73,6 +73,12 @@ Example:
 npm run backend:start -- --log-level warn
 ```
 
+### Cluster API discovery
+
+Headlamp can discover Cluster API v1beta2 workload clusters. See the
+[Cluster API discovery](./cluster-api.md) guide for flags, Helm values, RBAC,
+and local verification steps.
+
 ## Generate API documentation
 
 To generate the TypeScript API documentation:
