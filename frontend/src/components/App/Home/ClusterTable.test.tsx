@@ -27,8 +27,24 @@ import ClusterTable from './ClusterTable';
 
 const theme = createMuiTheme({ name: 'light', base: 'light' });
 
-function renderWithTheme(ui: ReactNode) {
-  return render(<ThemeProvider theme={theme}>{ui}</ThemeProvider>);
+function renderClusterTable(ui: ReactNode) {
+  return render(
+    <ThemeProvider theme={theme}>
+      <MemoryRouter>{ui}</MemoryRouter>
+    </ThemeProvider>
+  );
+}
+
+function renderWithCluster(cluster: Cluster, error: any = null) {
+  renderClusterTable(
+    <ClusterTable
+      customNameClusters={[cluster]}
+      clusters={{ [cluster.name]: cluster }}
+      versions={{}}
+      errors={{ [cluster.name]: error }}
+      warningLabels={{}}
+    />
+  );
 }
 
 vi.mock('react-i18next', async importOriginal => {
@@ -74,6 +90,7 @@ vi.mock('../../common/Table', () => ({
   default: ({ columns, data }: { columns: any[]; data: Cluster[] }) => {
     const originColumn = columns.find(column => column.id === 'origin');
     const statusColumn = columns.find(column => column.id === 'status');
+
     return (
       <table>
         <tbody>
@@ -99,55 +116,43 @@ describe('ClusterTable', () => {
   });
 
   it('renders Cluster Inventory source labels', () => {
-    const cluster = {
+    renderWithCluster({
       name: 'spoke-a',
       auth_type: '',
       meta_data: {
         source: 'cluster_inventory',
       },
-    } as Cluster;
-
-    renderWithTheme(
-      <MemoryRouter>
-        <ClusterTable
-          customNameClusters={[cluster]}
-          clusters={{ 'spoke-a': cluster }}
-          versions={{}}
-          errors={{ 'spoke-a': null }}
-          warningLabels={{}}
-        />
-      </MemoryRouter>
-    );
+    } as Cluster);
 
     expect(screen.getByText('Cluster Inventory')).toBeInTheDocument();
   });
 
+  it('renders Cluster API source labels', () => {
+    renderWithCluster({
+      name: 'spoke-a',
+      auth_type: '',
+      meta_data: {
+        source: 'cluster_api',
+      },
+    } as Cluster);
+
+    expect(screen.getByText('Cluster API')).toBeInTheDocument();
+  });
+
   it('renders in-cluster source labels', () => {
-    const cluster = {
+    renderWithCluster({
       name: 'in-cluster',
       auth_type: '',
       meta_data: {
         source: 'incluster',
       },
-    } as Cluster;
-
-    renderWithTheme(
-      <MemoryRouter>
-        <ClusterTable
-          customNameClusters={[cluster]}
-          clusters={{ 'in-cluster': cluster }}
-          versions={{}}
-          errors={{ 'in-cluster': null }}
-          warningLabels={{}}
-        />
-      </MemoryRouter>
-    );
+    } as Cluster);
 
     expect(screen.getByText('In-cluster')).toBeInTheDocument();
   });
 
   it('renders unhealthy Cluster Inventory control plane status', () => {
-    const cluster = {
+    renderWithCluster({
       name: 'spoke-a',
       auth_type: '',
       meta_data: {
@@ -164,25 +169,13 @@ describe('ClusterTable', () => {
           ],
         },
       },
-    } as Cluster;
-
-    renderWithTheme(
-      <MemoryRouter>
-        <ClusterTable
-          customNameClusters={[cluster]}
-          clusters={{ 'spoke-a': cluster }}
-          versions={{}}
-          errors={{ 'spoke-a': null }}
-          warningLabels={{}}
-        />
-      </MemoryRouter>
-    );
+    } as Cluster);
 
     expect(screen.getByText('Control plane unhealthy')).toBeInTheDocument();
   });
 
   it('keeps Active status for healthy Cluster Inventory clusters', () => {
-    const cluster = {
+    renderWithCluster({
       name: 'spoke-a',
       auth_type: '',
       meta_data: {
@@ -196,77 +189,47 @@ describe('ClusterTable', () => {
           ],
         },
       },
-    } as Cluster;
-
-    renderWithTheme(
-      <MemoryRouter>
-        <ClusterTable
-          customNameClusters={[cluster]}
-          clusters={{ 'spoke-a': cluster }}
-          versions={{}}
-          errors={{ 'spoke-a': null }}
-          warningLabels={{}}
-        />
-      </MemoryRouter>
-    );
+    } as Cluster);
 
     expect(screen.getByText('Active')).toBeInTheDocument();
   });
 
   it('falls back to reachability status when Cluster Inventory condition is missing', () => {
-    const cluster = {
-      name: 'spoke-a',
-      auth_type: '',
-      meta_data: {
-        source: 'cluster_inventory',
-        clusterInventory: {
-          conditions: [],
+    renderWithCluster(
+      {
+        name: 'spoke-a',
+        auth_type: '',
+        meta_data: {
+          source: 'cluster_inventory',
+          clusterInventory: {
+            conditions: [],
+          },
         },
-      },
-    } as Cluster;
-
-    renderWithTheme(
-      <MemoryRouter>
-        <ClusterTable
-          customNameClusters={[cluster]}
-          clusters={{ 'spoke-a': cluster }}
-          versions={{}}
-          errors={{ 'spoke-a': { status: 500, message: 'dial tcp timeout' } as any }}
-          warningLabels={{}}
-        />
-      </MemoryRouter>
+      } as Cluster,
+      { status: 500, message: 'dial tcp timeout' }
     );
 
     expect(screen.getByText('dial tcp timeout')).toBeInTheDocument();
   });
 
-  it('keeps status accessor aligned with reachability errors for unknown control plane health', () => {
-    const cluster = {
-      name: 'spoke-a',
-      auth_type: '',
-      meta_data: {
-        source: 'cluster_inventory',
-        clusterInventory: {
-          conditions: [
-            {
-              type: 'ControlPlaneHealthy',
-              status: 'Unknown',
-            },
-          ],
+  it('keeps status accessor aligned with reachability errors for unknown inventory health', () => {
+    renderWithCluster(
+      {
+        name: 'spoke-a',
+        auth_type: '',
+        meta_data: {
+          source: 'cluster_inventory',
+          clusterInventory: {
+            conditions: [
+              {
+                type: 'ControlPlaneHealthy',
+                status: 'Unknown',
+              },
+            ],
+          },
         },
-      },
-    } as Cluster;
-
-    renderWithTheme(
-      <MemoryRouter>
-        <ClusterTable
-          customNameClusters={[cluster]}
-          clusters={{ 'spoke-a': cluster }}
-          versions={{}}
-          errors={{ 'spoke-a': { status: 500, message: 'dial tcp timeout' } as any }}
-          warningLabels={{}}
-        />
-      </MemoryRouter>
+      } as Cluster,
+      { status: 500, message: 'dial tcp timeout' }
     );
 
     expect(screen.getByText('dial tcp timeout')).toBeInTheDocument();
@@ -277,30 +240,99 @@ describe('ClusterTable', () => {
   });
 
   it('keeps authorization errors in the status accessor while rendering Active', () => {
-    const cluster = {
-      name: 'spoke-a',
-      auth_type: '',
-      meta_data: {
-        source: 'kubeconfig',
-      },
-    } as Cluster;
-
-    renderWithTheme(
-      <MemoryRouter>
-        <ClusterTable
-          customNameClusters={[cluster]}
-          clusters={{ 'spoke-a': cluster }}
-          versions={{}}
-          errors={{ 'spoke-a': { status: 403, message: 'Forbidden' } as any }}
-          warningLabels={{}}
-        />
-      </MemoryRouter>
+    renderWithCluster(
+      {
+        name: 'spoke-a',
+        auth_type: '',
+        meta_data: {
+          source: 'kubeconfig',
+        },
+      } as Cluster,
+      { status: 403, message: 'Forbidden' }
     );
 
     expect(screen.getByText('Active')).toBeInTheDocument();
     expect(screen.getByTestId('cluster-row-spoke-a')).toHaveAttribute(
       'data-status-accessor',
       'Forbidden'
+    );
+  });
+
+  it('renders unhealthy Cluster API status from Available condition', () => {
+    renderWithCluster({
+      name: 'spoke-a',
+      auth_type: '',
+      meta_data: {
+        source: 'cluster_api',
+        clusterAPI: {
+          conditions: [
+            {
+              type: 'Available',
+              status: 'False',
+              reason: 'ControlPlaneNotReady',
+              message: 'control plane endpoint is not ready',
+              lastTransitionTime: '2026-05-10T00:00:00Z',
+            },
+          ],
+        },
+      },
+    } as Cluster);
+
+    expect(screen.getByText('Cluster API unhealthy')).toBeInTheDocument();
+    expect(screen.getByTestId('cluster-row-spoke-a')).toHaveAttribute(
+      'data-status-accessor',
+      'Cluster API unhealthy'
+    );
+  });
+
+  it('keeps Active status for healthy Cluster API clusters', () => {
+    renderWithCluster({
+      name: 'spoke-a',
+      auth_type: '',
+      meta_data: {
+        source: 'cluster_api',
+        clusterAPI: {
+          conditions: [{ type: 'Available', status: 'True' }],
+        },
+      },
+    } as Cluster);
+
+    expect(screen.getByText('Active')).toBeInTheDocument();
+  });
+
+  it('falls back to reachability status when Cluster API condition is missing', () => {
+    renderWithCluster(
+      {
+        name: 'spoke-a',
+        auth_type: '',
+        meta_data: {
+          source: 'cluster_api',
+          clusterAPI: {
+            conditions: [],
+          },
+        },
+      } as Cluster,
+      { status: 500, message: 'dial tcp timeout' }
+    );
+
+    expect(screen.getByText('dial tcp timeout')).toBeInTheDocument();
+  });
+
+  it('uses Unknown accessor for unknown Cluster API condition', () => {
+    renderWithCluster({
+      name: 'spoke-a',
+      auth_type: '',
+      meta_data: {
+        source: 'cluster_api',
+        clusterAPI: {
+          conditions: [{ type: 'Available', status: 'Unknown' }],
+        },
+      },
+    } as Cluster);
+
+    expect(screen.getByTestId('cluster-row-spoke-a')).toHaveAttribute(
+      'data-status-accessor',
+      'Unknown'
     );
   });
 });

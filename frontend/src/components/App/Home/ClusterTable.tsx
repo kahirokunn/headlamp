@@ -50,18 +50,37 @@ import { getCustomClusterNames } from './customClusterNames';
 
 const CLUSTER_INVENTORY_SOURCE = 'cluster_inventory';
 const CONTROL_PLANE_HEALTHY_CONDITION = 'ControlPlaneHealthy';
+const CLUSTER_API_SOURCE = 'cluster_api';
+const CLUSTER_API_STATUS_CONDITION_PRIORITY = [
+  'Available',
+  'Ready',
+  'ControlPlaneAvailable',
+  'ControlPlaneReady',
+];
 
-type ClusterInventoryCondition = Pick<
+/**
+ * Discovery condition fields used by cluster health status helpers.
+ */
+type ClusterDiscoveryCondition = Pick<
   KubeCondition,
   'type' | 'status' | 'reason' | 'message' | 'lastTransitionTime'
 >;
 
+/**
+ * Cluster health states shown in the cluster table status column.
+ */
 type ClusterStatusKind = 'active' | 'error' | 'unknown';
 
+/**
+ * Status details used to render the cluster table status cell.
+ */
 interface ClusterStatusInfo {
+  /** Visual status variant for icon and color selection. */
   kind: ClusterStatusKind;
+  /** Text displayed in the status cell. */
   text: string;
-  condition: ClusterInventoryCondition | null;
+  /** Discovery condition to expose in the status tooltip, when available. */
+  condition: ClusterDiscoveryCondition | null;
 }
 
 const STATUS_VARIANTS: Record<
@@ -73,7 +92,10 @@ const STATUS_VARIANTS: Record<
   unknown: { icon: 'mdi:cloud-question', colorKey: 'unknown', coloredText: false },
 };
 
-function getControlPlaneHealthyCondition(cluster: Cluster): ClusterInventoryCondition | null {
+/**
+ * Gets the Cluster Inventory control plane health condition for a cluster.
+ */
+function getControlPlaneHealthyCondition(cluster: Cluster): ClusterDiscoveryCondition | null {
   if (cluster?.meta_data?.source !== CLUSTER_INVENTORY_SOURCE) {
     return null;
   }
@@ -85,28 +107,74 @@ function getControlPlaneHealthyCondition(cluster: Cluster): ClusterInventoryCond
 
   return (
     conditions.find(
-      (condition: ClusterInventoryCondition) => condition.type === CONTROL_PLANE_HEALTHY_CONDITION
+      (condition: ClusterDiscoveryCondition) => condition.type === CONTROL_PLANE_HEALTHY_CONDITION
     ) ?? null
   );
 }
 
-function getConditionTooltip(condition: ClusterInventoryCondition): string {
-  return [condition.reason, condition.message, condition.lastTransitionTime]
+/**
+ * Gets the highest-priority Cluster API status condition for a cluster.
+ */
+function getClusterAPIStatusCondition(cluster: Cluster): ClusterDiscoveryCondition | null {
+  if (cluster?.meta_data?.source !== CLUSTER_API_SOURCE) {
+    return null;
+  }
+
+  const conditions = cluster?.meta_data?.clusterAPI?.conditions;
+  if (!Array.isArray(conditions)) {
+    return null;
+  }
+
+  const prioritizedConditions = CLUSTER_API_STATUS_CONDITION_PRIORITY.map(conditionType =>
+    conditions.find((condition: ClusterDiscoveryCondition) => condition.type === conditionType)
+  ).filter(Boolean) as ClusterDiscoveryCondition[];
+
+  return (
+    prioritizedConditions.find(condition => condition.status === 'False') ??
+    prioritizedConditions.find(condition => condition.status === 'Unknown') ??
+    prioritizedConditions[0] ??
+    null
+  );
+}
+
+/**
+ * Formats discovery condition fields for the status tooltip.
+ */
+function getConditionTooltip(condition: ClusterDiscoveryCondition): string {
+  return [condition.type, condition.reason, condition.message, condition.lastTransitionTime]
     .filter(Boolean)
     .join('\n');
 }
 
+/**
+ * Gets display status details for a cluster based on discovery health and reachability.
+ */
 function getClusterStatusInfo(
   cluster: Cluster,
   error: ApiError | null | undefined,
   t: (key: string) => string
 ): ClusterStatusInfo {
-  const condition = getControlPlaneHealthyCondition(cluster);
+  const inventoryCondition = getControlPlaneHealthyCondition(cluster);
 
-  if (condition?.status === 'False') {
-    return { kind: 'error', text: t('translation|Control plane unhealthy'), condition };
+  if (inventoryCondition?.status === 'False') {
+    return {
+      kind: 'error',
+      text: t('translation|Control plane unhealthy'),
+      condition: inventoryCondition,
+    };
   }
 
+  const clusterAPICondition = getClusterAPIStatusCondition(cluster);
+
+  if (clusterAPICondition?.status === 'False') {
+    return {
+      kind: 'error',
+      text: t('translation|Cluster API unhealthy'),
+      condition: clusterAPICondition,
+    };
+  }
+
+  const condition = inventoryCondition ?? clusterAPICondition;
   const reachError = error && error.status !== 401 && error.status !== 403 ? error : null;
   if (reachError) {
     return { kind: 'error', text: reachError.message, condition };
@@ -119,16 +187,25 @@ function getClusterStatusInfo(
   return { kind: 'active', text: t('translation|Active'), condition };
 }
 
+/**
+ * Gets the sortable/filterable status value for a cluster table row.
+ */
 function getClusterStatusAccessor(
   cluster: Cluster,
   error: ApiError | null | undefined,
   t: (key: string) => string
 ): string | undefined {
-  const condition = getControlPlaneHealthyCondition(cluster);
-  if (condition?.status === 'False') {
+  const inventoryCondition = getControlPlaneHealthyCondition(cluster);
+  if (inventoryCondition?.status === 'False') {
     return t('translation|Control plane unhealthy');
   }
 
+  const clusterAPICondition = getClusterAPIStatusCondition(cluster);
+  if (clusterAPICondition?.status === 'False') {
+    return t('translation|Cluster API unhealthy');
+  }
+
+  const condition = inventoryCondition ?? clusterAPICondition;
   const reachError = error && error.status !== 401 && error.status !== 403 ? error : null;
   if (reachError) {
     return reachError.message;
@@ -141,6 +218,9 @@ function getClusterStatusAccessor(
   return error === null ? t('translation|Active') : error?.message;
 }
 
+/**
+ * Renders the cluster status cell, including plugin-provided custom statuses.
+ */
 function ClusterStatus({ error, cluster }: { error?: ApiError | null; cluster: Cluster }) {
   const { t } = useTranslation(['translation']);
   const theme = useTheme();
@@ -187,6 +267,9 @@ function ClusterStatus({ error, cluster }: { error?: ApiError | null; cluster: C
   );
 }
 
+/**
+ * Props for the home cluster table.
+ */
 export interface ClusterTableProps {
   /** Some clusters have custom names. */
   customNameClusters: ReturnType<typeof getCustomClusterNames>;
@@ -200,11 +283,11 @@ export interface ClusterTableProps {
   warningLabels: { [cluster: string]: string };
 }
 
-/**
- * ClusterTable component displays a table of clusters with their status, origin, and version.
- */
 const CLUSTER_TABLE_ID = 'home-clusters';
 
+/**
+ * Displays the home cluster table with cluster status, origin, warnings, and version columns.
+ */
 export default function ClusterTable({
   customNameClusters,
   versions,
@@ -279,6 +362,8 @@ export default function ClusterTable({
       return t('translation|In-cluster');
     } else if (cluster?.meta_data?.source === CLUSTER_INVENTORY_SOURCE) {
       return t('translation|Cluster Inventory');
+    } else if (cluster?.meta_data?.source === CLUSTER_API_SOURCE) {
+      return t('translation|Cluster API');
     }
     return t('translation|Unknown');
   }
