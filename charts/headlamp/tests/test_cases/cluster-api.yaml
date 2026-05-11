@@ -1,0 +1,6 @@
+config:
+  clusterAPI:
+    enabled: true
+    labelSelector: headlamp.dev/discovery=enabled
+    rootReconcileInterval: 30s
+    noCRDCacheTTL: 10m

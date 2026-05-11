@@ -110,6 +110,10 @@ config:
 | config.clusterInventory.labelSelector | string | `"!headlamp.dev/ignore"` | Kubernetes label selector used to filter ClusterProfile resources |
 | config.clusterInventory.rootReconcileInterval | string | `""` | Override the Cluster Inventory root reconcile interval. Empty uses the Headlamp default |
 | config.clusterInventory.noCRDCacheTTL | string | `""` | Override the Cluster Inventory no-CRD cache TTL. Empty uses the Headlamp default |
+| config.clusterAPI.enabled | bool | `false` | Enable Cluster API v1beta2 discovery |
+| config.clusterAPI.labelSelector | string | `""` | Label selector used to filter Cluster API Cluster resources |
+| config.clusterAPI.rootReconcileInterval | string | `""` | Override the Cluster API root reconcile interval |
+| config.clusterAPI.noCRDCacheTTL | string | `""` | Override the Cluster API no-CRD cache TTL |
 | config.extraArgs   | array  | `[]`                  | Additional arguments for Headlamp server                                  |
 | config.tlsCertPath | string | `""`                  | Certificate for serving TLS                                               |
 | config.tlsKeyPath  | string | `""`                  | Key for serving TLS                                                       |

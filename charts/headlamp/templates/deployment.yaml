@@ -16,6 +16,8 @@
 {{- $clusterInventoryProviderFile := "/etc/cluster-inventory/config.json" }}
 {{- $clusterInventoryProviderMountDir := "/etc/cluster-inventory" }}
 {{- $clusterInventoryProviderConfigPath := "config.json" }}
+{{- $clusterAPI := .Values.config.clusterAPI | default dict }}
+{{- $clusterAPIEnabled := $clusterAPI.enabled | default false }}
 {{- $readOnlyRootFs := eq (include "headlamp.readOnlyRootFilesystem" .Values) "true" }}
 {{- $pluginManagerSecurityContext := dict }}
 {{- if .Values.pluginsManager.securityContext }}
@@ -280,6 +282,18 @@ spec:
             {{- end }}
             {{- with $clusterInventory.noCRDCacheTTL }}
             - "-cluster-inventory-no-crd-cache-ttl={{ . }}"
+            {{- end }}
+            {{- end }}
+            {{- if $clusterAPIEnabled }}
+            - "-enable-cluster-api"
+            {{- with $clusterAPI.labelSelector }}
+            - "-cluster-api-label-selector={{ . }}"
+            {{- end }}
+            {{- with $clusterAPI.rootReconcileInterval }}
+            - "-cluster-api-root-reconcile-interval={{ . }}"
+            {{- end }}
+            {{- with $clusterAPI.noCRDCacheTTL }}
+            - "-cluster-api-no-crd-cache-ttl={{ . }}"
             {{- end }}
             {{- end }}
             {{- if not $oidc.externalSecret.enabled}}

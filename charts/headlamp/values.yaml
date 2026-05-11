@@ -141,6 +141,15 @@ config:
     rootReconcileInterval: ""
     # -- Override the Cluster Inventory no-CRD cache TTL. Empty uses the Headlamp default.
     noCRDCacheTTL: ""
+  clusterAPI:
+    # -- Enable Cluster API v1beta2 discovery.
+    enabled: false
+    # -- Kubernetes label selector used to filter Cluster API Cluster resources.
+    labelSelector: ""
+    # -- Override the Cluster API root reconcile interval. Empty uses the Headlamp default.
+    rootReconcileInterval: ""
+    # -- Override the Cluster API no-CRD cache TTL. Empty uses the Headlamp default.
+    noCRDCacheTTL: ""
   # Extra arguments that can be given to the container. See charts/headlamp/README.md for more information.
   extraArgs: []
 

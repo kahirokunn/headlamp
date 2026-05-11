@@ -308,6 +308,32 @@
             }
           }
         },
+        "clusterAPI": {
+          "type": "object",
+          "description": "Cluster API v1beta2 discovery configuration",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable Cluster API v1beta2 discovery",
+              "default": false
+            },
+            "labelSelector": {
+              "type": "string",
+              "description": "Kubernetes label selector used to filter Cluster API Cluster resources",
+              "default": ""
+            },
+            "rootReconcileInterval": {
+              "type": "string",
+              "description": "Override the Cluster API root reconcile interval. Empty uses the Headlamp default",
+              "default": ""
+            },
+            "noCRDCacheTTL": {
+              "type": "string",
+              "description": "Override the Cluster API no-CRD cache TTL. Empty uses the Headlamp default",
+              "default": ""
+            }
+          }
+        },
         "extraArgs": {
           "type": "array",
           "description": "Extra arguments to pass to the application",
