@@ -328,6 +328,18 @@
               "description": "Kubernetes label selector used to filter experimental/alpha ClusterProfile resources",
               "default": "!headlamp.dev/ignore"
             },
+            "namespaces": {
+              "type": "array",
+              "description": "Namespaces watched for experimental/alpha ClusterProfile resources. Empty uses the Headlamp pod namespace; [\"*\"] watches all",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 63,
+                "pattern": "^(\\*|[a-z0-9]([-a-z0-9]*[a-z0-9])?)$"
+              },
+              "uniqueItems": true,
+              "default": []
+            },
             "rootReconcileInterval": {
               "type": "string",
               "description": "Override the experimental/alpha Cluster Inventory root reconcile interval. Empty uses the Headlamp default",

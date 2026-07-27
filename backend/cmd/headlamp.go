@@ -501,12 +501,22 @@ func startClusterInventory(ctx context.Context, config *HeadlampConfig) error {
 		return nil
 	}
 
-	var hubConfig *rest.Config
+	var (
+		hubConfig    *rest.Config
+		hubNamespace string
+	)
 
 	if config.UseInCluster {
 		inClusterConfig, err := rest.InClusterConfig()
 		if err != nil {
 			return fmt.Errorf("get in-cluster config for cluster inventory: %w", err)
+		}
+
+		hubNamespace, _, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			&clientcmd.ClientConfigLoadingRules{}, &clientcmd.ConfigOverrides{},
+		).Namespace()
+		if err != nil {
+			return fmt.Errorf("get pod namespace for cluster inventory: %w", err)
 		}
 
 		hubConfig = inClusterConfig
@@ -516,9 +526,11 @@ func startClusterInventory(ctx context.Context, config *HeadlampConfig) error {
 		Store:                 config.KubeConfigStore,
 		ProviderFile:          config.ClusterInventoryProviderFile,
 		LabelSelector:         config.ClusterInventoryLabelSelector,
+		Namespaces:            config.ClusterInventoryNamespaces,
 		RootReconcileInterval: config.ClusterInventoryRootReconcileInterval,
 		NoCRDCacheTTL:         config.ClusterInventoryNoCRDCacheTTL,
 		HubConfig:             hubConfig,
+		HubNamespace:          hubNamespace,
 		DiscoverFromStore:     !config.UseInCluster,
 	})
 	if err != nil {

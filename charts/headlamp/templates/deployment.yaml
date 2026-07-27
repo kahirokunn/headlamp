@@ -19,6 +19,7 @@
 {{- $meUserInfoURL := "" }}
 {{- $clusterInventory := .Values.config.clusterInventory | default dict }}
 {{- $clusterInventoryEnabled := $clusterInventory.enabled | default false }}
+{{- $clusterInventoryNamespaces := $clusterInventory.namespaces | default (list) }}
 {{- $clusterInventoryProviderFile := "/etc/cluster-inventory/config.json" }}
 {{- $clusterInventoryProviderMountDir := "/etc/cluster-inventory" }}
 {{- $clusterInventoryProviderConfigPath := "config.json" }}
@@ -302,6 +303,12 @@ spec:
             - "-cluster-inventory-provider-file={{ $clusterInventoryProviderFile }}"
             {{- with $clusterInventory.labelSelector }}
             - "-cluster-inventory-label-selector={{ . }}"
+            {{- end }}
+            {{- if and (has "*" $clusterInventoryNamespaces) (gt (len $clusterInventoryNamespaces) 1) }}
+            {{- fail "config.clusterInventory.namespaces: \"*\" must be used on its own" }}
+            {{- end }}
+            {{- with $clusterInventoryNamespaces }}
+            - "-cluster-inventory-namespaces={{ join "," . }}"
             {{- end }}
             {{- with $clusterInventory.rootReconcileInterval }}
             - "-cluster-inventory-root-reconcile-interval={{ . }}"
