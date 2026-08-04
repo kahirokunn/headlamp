@@ -83,7 +83,7 @@ func newTestRunner(t *testing.T, opts Options) *Runner {
 		opts.Store = kubeconfig.NewContextStore()
 	}
 
-	if opts.ProviderFile == "" {
+	if opts.ProviderFile == "" && opts.AuthType != AuthTypeOIDC {
 		opts.ProviderFile = writeProviderFile(t)
 	}
 
@@ -91,6 +91,15 @@ func newTestRunner(t *testing.T, opts Options) *Runner {
 	require.NoError(t, err)
 
 	return runner
+}
+
+func testOIDCOptions() *kubeconfig.OidcConfig {
+	return &kubeconfig.OidcConfig{
+		ClientID:     "headlamp",
+		ClientSecret: "secret",
+		IdpIssuerURL: "https://idp.example.com",
+		Scopes:       []string{"profile", "email"},
+	}
 }
 
 func clusterProfile(name, providerName, server string) *apisv1alpha1.ClusterProfile {
@@ -304,6 +313,163 @@ func TestNewRunnerValidatesProviderFile(t *testing.T) {
 		Namespaces:   "team-a,*",
 	})
 	require.ErrorContains(t, err, `"*" must be used on its own`)
+}
+
+func TestNewRunnerOIDCValidatesOptions(t *testing.T) {
+	store := kubeconfig.NewContextStore()
+
+	tests := []struct {
+		name    string
+		opts    Options
+		wantErr string
+	}{
+		{
+			name:    "unknown auth type",
+			opts:    Options{Store: store, AuthType: "bogus"},
+			wantErr: `invalid cluster inventory auth type "bogus"`,
+		},
+		{
+			name:    "oidc requires config",
+			opts:    Options{Store: store, AuthType: AuthTypeOIDC},
+			wantErr: "cluster inventory OIDC auth requires",
+		},
+		{
+			name: "oidc requires client id",
+			opts: Options{Store: store, AuthType: AuthTypeOIDC, OIDC: &kubeconfig.OidcConfig{
+				IdpIssuerURL: "https://idp.example.com",
+				Scopes:       []string{"profile"},
+			}},
+			wantErr: "cluster inventory OIDC auth requires",
+		},
+		{
+			name: "oidc requires issuer url",
+			opts: Options{Store: store, AuthType: AuthTypeOIDC, OIDC: &kubeconfig.OidcConfig{
+				ClientID: "headlamp",
+				Scopes:   []string{"profile"},
+			}},
+			wantErr: "cluster inventory OIDC auth requires",
+		},
+		{
+			name: "oidc requires scopes",
+			opts: Options{Store: store, AuthType: AuthTypeOIDC, OIDC: &kubeconfig.OidcConfig{
+				ClientID:     "headlamp",
+				IdpIssuerURL: "https://idp.example.com",
+			}},
+			wantErr: "cluster inventory OIDC auth requires",
+		},
+		{
+			name: "oidc does not require a provider file",
+			opts: Options{Store: store, AuthType: AuthTypeOIDC, OIDC: testOIDCOptions()},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewRunner(tt.opts)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+
+				return
+			}
+
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestNewRunnerOIDCRejectsBlankScopes(t *testing.T) {
+	store := kubeconfig.NewContextStore()
+
+	for _, scopes := range [][]string{{""}, {" ", "\t"}} {
+		_, err := NewRunner(Options{
+			Store:    store,
+			AuthType: AuthTypeOIDC,
+			OIDC: &kubeconfig.OidcConfig{
+				ClientID:     "headlamp",
+				IdpIssuerURL: "https://idp.example.com",
+				Scopes:       scopes,
+			},
+		})
+		require.ErrorContains(t, err, "cluster inventory OIDC auth requires")
+	}
+}
+
+func TestOIDCContextFromClusterProfile(t *testing.T) {
+	oidcConf := testOIDCOptions()
+
+	cp := clusterProfile("spoke-a", "unmatched-provider", "")
+	cp.Status.AccessProviders = append(cp.Status.AccessProviders, apisv1alpha1.AccessProvider{
+		Name: "with-server",
+		Cluster: clientcmdv1.Cluster{
+			Server:                   "https://spoke-a.example.com",
+			CertificateAuthorityData: []byte("ca-spoke-a"),
+		},
+	})
+
+	headlampContext, err := oidcContextFromClusterProfile(cp, "ctx-name", "in-cluster/default/spoke-a", oidcConf)
+	require.NoError(t, err)
+
+	assert.Equal(t, "ctx-name", headlampContext.Name)
+	assert.Equal(t, "https://spoke-a.example.com", headlampContext.Cluster.Server)
+	assert.Equal(t, []byte("ca-spoke-a"), headlampContext.Cluster.CertificateAuthorityData)
+	assert.Equal(t, kubeconfig.ClusterInventory, headlampContext.Source)
+	assert.Equal(t, "cluster-inventory/in-cluster/default/spoke-a", headlampContext.ClusterID)
+	assert.Nil(t, headlampContext.AuthInfo.Exec)
+	assert.Equal(t, "oidc", headlampContext.AuthType())
+
+	require.NotNil(t, headlampContext.OidcConf)
+	assert.Equal(t, oidcConf.ClientID, headlampContext.OidcConf.ClientID)
+	assert.Equal(t, oidcConf.IdpIssuerURL, headlampContext.OidcConf.IdpIssuerURL)
+	assert.Equal(t, oidcConf.Scopes, headlampContext.OidcConf.Scopes)
+
+	// The context owns a deep copy of the shared OIDC config.
+	headlampContext.OidcConf.ClientID = "mutated"
+	headlampContext.OidcConf.Scopes[0] = "mutated"
+
+	assert.Equal(t, "headlamp", oidcConf.ClientID)
+	assert.Equal(t, "profile", oidcConf.Scopes[0])
+
+	_, err = oidcContextFromClusterProfile(
+		clusterProfile("no-server", "unmatched-provider", ""),
+		"ctx-name", "in-cluster/default/no-server", oidcConf)
+	require.ErrorContains(t, err, "no access provider carries a server URL")
+}
+
+func TestInformerSyncOIDCMode(t *testing.T) {
+	store := kubeconfig.NewContextStore()
+	runner := newTestRunner(t, Options{
+		Store:     store,
+		AuthType:  AuthTypeOIDC,
+		OIDC:      testOIDCOptions(),
+		HubConfig: &rest.Config{Host: "https://hub.example.com"},
+	})
+
+	client := ciafake.NewSimpleClientset(
+		// The provider name does not need to match any provider file in OIDC mode.
+		clusterProfile("spoke-a", "unmatched-provider", "https://spoke-a.example.com"),
+		clusterProfile("no-access", "", "https://no-access.example.com"),
+	)
+	runner.clientForConfig = func(*rest.Config) (ciaclient.Interface, error) {
+		return client, nil
+	}
+
+	ctx := testRunnerContext(t, runner)
+	reconcileAndWaitForRoot(t, ctx, runner, inClusterRootID)
+
+	headlampContext := requireProfileContextEventually(t, store, "in-cluster/default/spoke-a")
+	assert.Equal(t, "oidc", headlampContext.AuthType())
+	assert.Nil(t, headlampContext.AuthInfo.Exec)
+	require.NotNil(t, headlampContext.OidcConf)
+	assert.Equal(t, "headlamp", headlampContext.OidcConf.ClientID)
+	require.NotNil(t, headlampContext.ClusterInventory)
+
+	requireNoProfileContextEventually(t, store, "in-cluster/default/no-access")
+
+	err := client.ApisV1alpha1().ClusterProfiles("default").Delete(
+		context.Background(), "spoke-a", metav1.DeleteOptions{})
+	require.NoError(t, err)
+
+	requireNoProfileContextEventually(t, store, "in-cluster/default/spoke-a")
 }
 
 func TestNormalizeNamespaces(t *testing.T) {

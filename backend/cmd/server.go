@@ -107,6 +107,7 @@ func buildHeadlampCFG(conf *config.Config, kubeConfigStore kubeconfig.ContextSto
 
 			return strings.Split(conf.ProxyURLs, ",")
 		}(),
+		ClusterInventoryAuthType:              conf.ClusterInventoryAuthType,
 		ClusterInventoryProviderFile:          conf.ClusterInventoryProviderFile,
 		ClusterInventoryLabelSelector:         conf.ClusterInventoryLabelSelector,
 		ClusterInventoryNamespaces:            conf.ClusterInventoryNamespaces,

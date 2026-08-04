@@ -84,6 +84,7 @@ type HeadlampCFG struct {
 	ServiceAccountTokenPath      string
 
 	EnableClusterInventory                bool
+	ClusterInventoryAuthType              string
 	ClusterInventoryProviderFile          string
 	ClusterInventoryLabelSelector         string
 	ClusterInventoryNamespaces            string
