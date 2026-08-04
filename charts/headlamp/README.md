@@ -139,7 +139,8 @@ config:
 | config.nodeShellImage | string | `""`               | Default image to use when creating node shell pods                         |
 | config.nodeShellNamespace | string | `""`            | Default namespace to use when creating node shell pods                      |
 | config.clusterInventory.enabled | bool | `false` | Enable experimental/alpha Cluster Inventory discovery |
-| config.clusterInventory.accessProvidersConfig | object | `{}` | Experimental/alpha Cluster Inventory access providers config. Required when Cluster Inventory is enabled |
+| config.clusterInventory.authType | string | `"access-provider"` | How users authenticate to discovered clusters: `"access-provider"` uses the exec-plugin providers with controller credentials; `"oidc"` makes each user log in via Headlamp's global OIDC settings (`config.oidc`) with only their own permissions |
+| config.clusterInventory.accessProvidersConfig | object | `{}` | Experimental/alpha Cluster Inventory access providers config. Required when Cluster Inventory is enabled and `authType` is `"access-provider"` |
 | config.clusterInventory.plugins | list | `[]` | Kubernetes image volumes that provide experimental/alpha Cluster Inventory access provider binaries |
 | config.clusterInventory.labelSelector | string | `"!headlamp.dev/ignore"` | Kubernetes label selector used to filter experimental/alpha ClusterProfile resources |
 | config.clusterInventory.namespaces | list | `[]` | Namespaces watched for experimental/alpha ClusterProfile resources. Empty uses the Headlamp pod namespace for in-cluster roots and the kubeconfig context namespace for kubeconfig roots; `["*"]` watches all and requires equivalent cluster-wide RBAC permissions |
@@ -210,9 +211,11 @@ config:
 > default. The upstream Cluster Inventory API is currently `v1alpha1` and this
 > integration uses the `v0.1.x` API, so fields and behavior may change.
 
-When `config.clusterInventory.enabled` is true, the chart creates a provider
-ConfigMap, makes it available read-only at `/etc/cluster-inventory/config.json`,
-and adds the Headlamp Cluster Inventory flags automatically.
+When `config.clusterInventory.enabled` is true, the chart adds the Headlamp
+Cluster Inventory flags automatically. With the default
+`authType: access-provider` it also creates a provider ConfigMap and makes it
+available read-only at `/etc/cluster-inventory/config.json`; with
+`authType: oidc` no provider config file is created or mounted.
 
 ```yaml
 config:
@@ -246,6 +249,27 @@ plugins. Each entry renders as a Kubernetes `image` volume and is mounted
 read-only into the Headlamp container. If an access provider `execConfig.command`
 is configured, the command must be under one of the absolute
 `plugins[].mountPath` values.
+
+With the default `authType: access-provider`, the access providers run with
+controller-level credentials, so every Headlamp user sees discovered clusters
+with the same permissions. For multi-tenant setups, set `authType: oidc` so
+each user signs in to discovered clusters with Headlamp's global OIDC settings
+(`config.oidc`) and only their own RBAC applies. In OIDC mode no
+`accessProvidersConfig`, provider ConfigMap, or `plugins[]` volumes are needed;
+the discovered clusters' API servers must trust the same OIDC issuer and
+client as Headlamp.
+
+```yaml
+config:
+  oidc:
+    clientID: "headlamp"
+    clientSecret: "..."
+    issuerURL: "https://idp.example.com"
+    scopes: "profile,email,offline_access"
+  clusterInventory:
+    enabled: true
+    authType: oidc
+```
 
 ### Deployment Configuration
 

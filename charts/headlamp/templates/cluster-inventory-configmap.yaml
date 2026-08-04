@@ -1,8 +1,8 @@
 {{- $clusterInventory := .Values.config.clusterInventory | default dict }}
 {{- $clusterInventoryProviderConfigPath := "config.json" }}
-{{- if $clusterInventory.enabled }}
+{{- if and $clusterInventory.enabled (ne ($clusterInventory.authType | default "access-provider") "oidc") }}
 {{- if not $clusterInventory.accessProvidersConfig }}
-{{-   fail "config.clusterInventory.enabled is true but config.clusterInventory.accessProvidersConfig is empty; either provide an access providers config or disable Cluster Inventory" }}
+{{-   fail "config.clusterInventory.enabled is true but config.clusterInventory.accessProvidersConfig is empty; either provide an access providers config, use authType \"oidc\", or disable Cluster Inventory" }}
 {{- end }}
 {{- $mountPaths := list }}
 {{- range $index, $plugin := ($clusterInventory.plugins | default list) }}

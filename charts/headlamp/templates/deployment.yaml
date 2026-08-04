@@ -19,6 +19,11 @@
 {{- $meUserInfoURL := "" }}
 {{- $clusterInventory := .Values.config.clusterInventory | default dict }}
 {{- $clusterInventoryEnabled := $clusterInventory.enabled | default false }}
+{{- $clusterInventoryAuthType := $clusterInventory.authType | default "access-provider" }}
+{{- if and $clusterInventoryEnabled (not (has $clusterInventoryAuthType (list "access-provider" "oidc"))) }}
+{{-   fail (printf "config.clusterInventory.authType must be \"access-provider\" or \"oidc\", got %q" $clusterInventoryAuthType) }}
+{{- end }}
+{{- $clusterInventoryUsesProviderFile := and $clusterInventoryEnabled (eq $clusterInventoryAuthType "access-provider") }}
 {{- $clusterInventoryProviderFile := "/etc/cluster-inventory/config.json" }}
 {{- $clusterInventoryProviderMountDir := "/etc/cluster-inventory" }}
 {{- $clusterInventoryProviderConfigPath := "config.json" }}
@@ -66,6 +71,12 @@
   {{- if eq .name "ME_USER_INFO_URL" }}
     {{- $meUserInfoURL = .value | toString }}
   {{- end }}
+{{- end }}
+
+{{- $oidcClientConfigured := or (ne $oidc.clientID "") (ne $clientID "") }}
+{{- $oidcIssuerConfigured := or (ne $oidc.issuerURL "") (ne $issuerURL "") }}
+{{- if and $clusterInventoryEnabled (eq $clusterInventoryAuthType "oidc") (not (or $oidc.externalSecret.enabled (and $oidcClientConfigured $oidcIssuerConfigured))) }}
+{{-   fail "config.clusterInventory.authType is \"oidc\" but the OIDC client ID and issuer URL are not configured; set config.oidc (or OIDC env vars / externalSecret)" }}
 {{- end }}
 
 apiVersion: apps/v1
@@ -299,7 +310,11 @@ spec:
             {{- end }}
             {{- if $clusterInventoryEnabled }}
             - "-enable-cluster-inventory"
+            {{- if $clusterInventoryUsesProviderFile }}
             - "-cluster-inventory-provider-file={{ $clusterInventoryProviderFile }}"
+            {{- else }}
+            - "-cluster-inventory-auth-type={{ $clusterInventoryAuthType }}"
+            {{- end }}
             {{- with $clusterInventory.labelSelector }}
             - "-cluster-inventory-label-selector={{ . }}"
             {{- end }}
@@ -421,13 +436,13 @@ spec:
             failureThreshold: {{ .Values.probes.readinessProbe.failureThreshold | default 3 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if or .Values.pluginsManager.enabled $clusterInventoryEnabled .Values.volumeMounts $tmpCtx.addMount }}
+          {{- if or .Values.pluginsManager.enabled $clusterInventoryUsesProviderFile .Values.volumeMounts $tmpCtx.addMount }}
           volumeMounts:
             {{- if .Values.pluginsManager.enabled }}
             - name: plugins-dir
               mountPath: {{ .Values.config.pluginsDir }}
             {{- end }}
-            {{- if $clusterInventoryEnabled }}
+            {{- if $clusterInventoryUsesProviderFile }}
             - name: cluster-inventory-config
               mountPath: {{ $clusterInventoryProviderMountDir }}
               readOnly: true
@@ -526,7 +541,7 @@ spec:
       {{- with .Values.priorityClassName }}
       priorityClassName: {{ . | quote }}
       {{- end }}
-      {{- if or .Values.pluginsManager.enabled $clusterInventoryEnabled .Values.volumes $tmpCtx.addVolume $pluginsTmpCtx.addVolume }}
+      {{- if or .Values.pluginsManager.enabled $clusterInventoryUsesProviderFile .Values.volumes $tmpCtx.addVolume $pluginsTmpCtx.addVolume }}
       volumes:
         {{- if .Values.pluginsManager.enabled }}
         - name: plugins-dir
@@ -539,7 +554,7 @@ spec:
           emptyDir: {}
         {{- end }}
         {{- end }}
-        {{- if $clusterInventoryEnabled }}
+        {{- if $clusterInventoryUsesProviderFile }}
         - name: cluster-inventory-config
           configMap:
             name: {{ include "headlamp.fullname" . }}-cluster-inventory

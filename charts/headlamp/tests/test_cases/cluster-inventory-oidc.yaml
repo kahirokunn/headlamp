@@ -1,0 +1,16 @@
+# Cluster Inventory in OIDC auth mode: discovered clusters authenticate each user
+# via Headlamp's global OIDC settings, so no access providers config, provider-file
+# ConfigMap, or plugin volumes are rendered.
+config:
+  oidc:
+    secret:
+      create: false
+    clientID: "testClientId"
+    clientSecret: "testClientSecret"
+    issuerURL: "testIssuerURL"
+    scopes: "testScope"
+  clusterInventory:
+    enabled: true
+    authType: oidc
+    namespaces:
+      - inventory-e2e

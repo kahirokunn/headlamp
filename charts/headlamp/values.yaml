@@ -143,7 +143,9 @@ config:
   clusterInventory:
     # -- Enable experimental/alpha Cluster Inventory discovery.
     enabled: false
-    # -- Experimental/alpha Cluster Inventory access providers config. Required when enabled.
+    # -- How users authenticate to discovered clusters: "access-provider" uses the exec-plugin providers in accessProvidersConfig with controller credentials; "oidc" makes each user log in via Headlamp's global OIDC settings (config.oidc) with only their own permissions.
+    authType: "access-provider"
+    # -- Experimental/alpha Cluster Inventory access providers config. Required when enabled and authType is "access-provider".
     accessProvidersConfig: {}
     # accessProvidersConfig:
     #   providers:

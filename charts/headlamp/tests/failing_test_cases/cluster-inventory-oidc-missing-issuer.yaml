@@ -1,0 +1,9 @@
+# authType "oidc" requires the OIDC issuer URL in addition to the client ID.
+config:
+  oidc:
+    secret:
+      create: false
+    clientID: "testClientId"
+  clusterInventory:
+    enabled: true
+    authType: oidc
