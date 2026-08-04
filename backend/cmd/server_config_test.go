@@ -39,6 +39,7 @@ func TestBuildHeadlampCFG(t *testing.T) {
 			WatchPluginsChanges:        false,
 			BaseURL:                    "/headlamp",
 			ProxyURLs:                  "http://proxy1,http://proxy2",
+			ClusterInventoryAuthType:   "oidc",
 			ClusterInventoryNamespaces: "team-a,team-b",
 		}
 
@@ -55,6 +56,7 @@ func TestBuildHeadlampCFG(t *testing.T) {
 		assert.Equal(t, "/headlamp", headlampCFG.BaseURL)
 		assert.Equal(t, []string{"http://proxy1", "http://proxy2"}, headlampCFG.ProxyURLs)
 		assert.Equal(t, store, headlampCFG.KubeConfigStore)
+		assert.Equal(t, "oidc", headlampCFG.ClusterInventoryAuthType)
 		assert.Equal(t, "team-a,team-b", headlampCFG.ClusterInventoryNamespaces)
 	})
 
@@ -65,4 +67,12 @@ func TestBuildHeadlampCFG(t *testing.T) {
 
 		assert.Empty(t, headlampCFG.ProxyURLs)
 	})
+}
+
+func TestSplitOIDCScopes(t *testing.T) {
+	assert.Equal(t,
+		[]string{"profile", "email", "offline_access"},
+		splitOIDCScopes("profile, email, , offline_access"),
+	)
+	assert.Empty(t, splitOIDCScopes(" ,\t"))
 }

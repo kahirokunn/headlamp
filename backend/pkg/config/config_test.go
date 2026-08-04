@@ -291,9 +291,10 @@ func TestParseErrors(t *testing.T) {
 		errorContains string
 	}{
 		{
-			name:          "oidc_settings_without_incluster",
-			args:          []string{"go run ./cmd", "-oidc-client-id=noClient"},
-			errorContains: "flags are only meant to be used in inCluster mode or with --oidc-use-cookie",
+			name: "oidc_settings_without_incluster",
+			args: []string{"go run ./cmd", "-oidc-client-id=noClient"},
+			errorContains: "flags are only meant to be used in inCluster mode, with --oidc-use-cookie, " +
+				"or with --enable-cluster-inventory and --cluster-inventory-auth-type=oidc",
 		},
 		{
 			name:          "unsafe_use_service_account_token_without_incluster",
@@ -599,6 +600,102 @@ func TestClusterInventoryRejectsInvalidLabelSelector(t *testing.T) {
 	require.Error(t, err)
 	require.Nil(t, conf)
 	assert.Contains(t, err.Error(), "invalid cluster-inventory-label-selector")
+}
+
+func TestClusterInventoryAuthTypeDefault(t *testing.T) {
+	providerFile := writeClusterInventoryProviderFile(t)
+
+	conf, err := config.Parse([]string{
+		"go run ./cmd",
+		"--enable-cluster-inventory",
+		"--cluster-inventory-provider-file=" + providerFile,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, clusterinventory.AuthTypeAccessProvider, conf.ClusterInventoryAuthType)
+}
+
+func TestClusterInventoryOIDCAuthValidation(t *testing.T) {
+	t.Run("oidc auth allows global oidc flags without in-cluster", func(t *testing.T) {
+		conf, err := config.Parse([]string{
+			"go run ./cmd",
+			"--enable-cluster-inventory",
+			"--cluster-inventory-auth-type=oidc",
+			"--oidc-client-id=headlamp",
+			"--oidc-idp-issuer-url=https://idp.example.com",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, clusterinventory.AuthTypeOIDC, conf.ClusterInventoryAuthType)
+		assert.Empty(t, conf.ClusterInventoryProviderFile)
+	})
+
+	t.Run("oidc auth requires oidc identity flags", func(t *testing.T) {
+		conf, err := config.Parse([]string{
+			"go run ./cmd",
+			"--enable-cluster-inventory",
+			"--cluster-inventory-auth-type=oidc",
+			"--oidc-idp-issuer-url=https://idp.example.com",
+		})
+		require.Error(t, err)
+		require.Nil(t, conf)
+		assert.Contains(t, err.Error(), "cluster-inventory-auth-type=oidc requires")
+	})
+
+	t.Run("oidc auth rejects blank scopes", func(t *testing.T) {
+		conf, err := config.Parse([]string{
+			"go run ./cmd",
+			"--enable-cluster-inventory",
+			"--cluster-inventory-auth-type=oidc",
+			"--oidc-client-id=headlamp",
+			"--oidc-idp-issuer-url=https://idp.example.com",
+			"--oidc-scopes=, ,\t",
+		})
+		require.Error(t, err)
+		require.Nil(t, conf)
+		assert.Contains(t, err.Error(), "cluster-inventory-auth-type=oidc requires")
+	})
+
+	t.Run("rejects unknown auth type", func(t *testing.T) {
+		conf, err := config.Parse([]string{
+			"go run ./cmd",
+			"--enable-cluster-inventory",
+			"--cluster-inventory-auth-type=bogus",
+		})
+		require.Error(t, err)
+		require.Nil(t, conf)
+		assert.Contains(t, err.Error(), "invalid cluster-inventory-auth-type")
+	})
+}
+
+func TestOIDCFlagsStillRejectedWithoutClusterInventoryOIDC(t *testing.T) {
+	t.Run("cluster inventory disabled", func(t *testing.T) {
+		conf, err := config.Parse([]string{
+			"go run ./cmd",
+			"--cluster-inventory-auth-type=oidc",
+			"--oidc-client-id=headlamp",
+			"--oidc-idp-issuer-url=https://idp.example.com",
+		})
+		require.Error(t, err)
+		require.Nil(t, conf)
+		assert.Contains(t, err.Error(),
+			"flags are only meant to be used in inCluster mode, with --oidc-use-cookie, "+
+				"or with --enable-cluster-inventory and --cluster-inventory-auth-type=oidc")
+	})
+
+	t.Run("access-provider mode", func(t *testing.T) {
+		providerFile := writeClusterInventoryProviderFile(t)
+
+		conf, err := config.Parse([]string{
+			"go run ./cmd",
+			"--enable-cluster-inventory",
+			"--cluster-inventory-provider-file=" + providerFile,
+			"--oidc-client-id=headlamp",
+		})
+		require.Error(t, err)
+		require.Nil(t, conf)
+		assert.Contains(t, err.Error(),
+			"flags are only meant to be used in inCluster mode, with --oidc-use-cookie, "+
+				"or with --enable-cluster-inventory and --cluster-inventory-auth-type=oidc")
+	})
 }
 
 func TestOIDCTLSValidation(t *testing.T) {

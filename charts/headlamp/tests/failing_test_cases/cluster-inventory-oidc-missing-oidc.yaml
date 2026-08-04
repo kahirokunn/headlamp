@@ -1,0 +1,6 @@
+# authType "oidc" requires an OIDC client configuration (config.oidc, OIDC env
+# vars, or an external secret).
+config:
+  clusterInventory:
+    enabled: true
+    authType: oidc

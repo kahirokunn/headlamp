@@ -1,0 +1,8 @@
+# authType only accepts "access-provider" or "oidc".
+config:
+  clusterInventory:
+    enabled: true
+    authType: bogus
+    accessProvidersConfig:
+      providers:
+        - name: static-provider

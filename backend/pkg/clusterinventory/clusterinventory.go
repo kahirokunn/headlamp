@@ -67,6 +67,14 @@ const (
 	clusterExecConfigExtensionKey = "client.authentication.k8s.io/exec"
 )
 
+// Auth types control how users authenticate to discovered clusters.
+const (
+	// AuthTypeAccessProvider authenticates to discovered clusters with access-provider exec plugins.
+	AuthTypeAccessProvider = "access-provider"
+	// AuthTypeOIDC makes each user authenticate to discovered clusters with their own OIDC token.
+	AuthTypeOIDC = "oidc"
+)
+
 // Structured-log field names that recur across many log sites.
 const (
 	logFieldRoot           = "root"
@@ -79,7 +87,13 @@ const (
 type Options struct {
 	// Store is the Headlamp context store that receives discovered contexts.
 	Store kubeconfig.ContextStore
+	// AuthType selects how users authenticate to discovered clusters:
+	// AuthTypeAccessProvider (default when empty) or AuthTypeOIDC.
+	AuthType string
+	// OIDC carries Headlamp's global OIDC settings; required when AuthType is AuthTypeOIDC.
+	OIDC *kubeconfig.OidcConfig
 	// ProviderFile is the Cluster Inventory access provider configuration file.
+	// Required when AuthType is AuthTypeAccessProvider; ignored otherwise.
 	ProviderFile string
 	// LabelSelector filters ClusterProfile resources before they are synced.
 	LabelSelector string
@@ -103,6 +117,8 @@ type Options struct {
 // Runner watches ClusterProfile resources and syncs them into Headlamp's context store.
 type Runner struct {
 	store                 kubeconfig.ContextStore
+	authType              string
+	oidcConfig            *kubeconfig.OidcConfig
 	accessConfig          *access.Config
 	rootReconcileInterval time.Duration
 	noCRDCacheTTL         time.Duration
@@ -149,19 +165,55 @@ type profileState struct {
 	contextName string
 }
 
+func hasUsableOIDCScope(scopes []string) bool {
+	return slices.ContainsFunc(scopes, func(scope string) bool {
+		return strings.TrimSpace(scope) != ""
+	})
+}
+
+// resolveAuthConfig validates the auth-type options and loads the access config
+// used by the access-provider mode.
+func resolveAuthConfig(opts Options) (string, *access.Config, error) {
+	authType := opts.AuthType
+	if authType == "" {
+		authType = AuthTypeAccessProvider
+	}
+
+	switch authType {
+	case AuthTypeAccessProvider:
+		if opts.ProviderFile == "" {
+			return "", nil, errors.New("cluster inventory provider file is required")
+		}
+
+		accessConfig, err := access.NewFromFile(opts.ProviderFile)
+		if err != nil {
+			return "", nil, fmt.Errorf("load cluster inventory provider file: %w", err)
+		}
+
+		return authType, accessConfig, nil
+	case AuthTypeOIDC:
+		if opts.OIDC == nil || opts.OIDC.ClientID == "" || opts.OIDC.IdpIssuerURL == "" ||
+			!hasUsableOIDCScope(opts.OIDC.Scopes) {
+			return "", nil, errors.New(
+				"cluster inventory OIDC auth requires oidc-client-id, oidc-idp-issuer-url and oidc-scopes")
+		}
+
+		return authType, nil, nil
+	default:
+		return "", nil, fmt.Errorf("invalid cluster inventory auth type %q (valid values: %q, %q)",
+			opts.AuthType, AuthTypeAccessProvider, AuthTypeOIDC)
+	}
+}
+
 // NewRunner validates options, parses the provider file, and returns a discovery runner.
 func NewRunner(opts Options) (*Runner, error) {
 	if opts.Store == nil {
 		return nil, errors.New("context store is required")
 	}
 
-	if opts.ProviderFile == "" {
-		return nil, errors.New("cluster inventory provider file is required")
-	}
-
-	accessConfig, err := access.NewFromFile(opts.ProviderFile)
+	authType, accessConfig, err := resolveAuthConfig(opts)
 	if err != nil {
-		return nil, fmt.Errorf("load cluster inventory provider file: %w", err)
+		return nil, err
 	}
 
 	labelSelector, err := normalizeLabelSelector(opts.LabelSelector)
@@ -186,6 +238,8 @@ func NewRunner(opts Options) (*Runner, error) {
 
 	return &Runner{
 		store:                 opts.Store,
+		authType:              authType,
+		oidcConfig:            copyOidcConfig(opts.OIDC),
 		accessConfig:          accessConfig,
 		rootReconcileInterval: rootReconcileInterval,
 		noCRDCacheTTL:         noCRDCacheTTL,
@@ -591,22 +645,36 @@ func (r *Runner) contextFromClusterProfile(
 		return nil, false
 	}
 
-	restConfig, err := copyAccessConfig(r.accessConfig).BuildConfigFromCP(accessOnlyClusterProfile(cp))
-	if err != nil {
-		logger.Log(logger.LevelWarn, map[string]string{logFieldClusterProfile: profileKey}, err,
-			"cluster-inventory: failed to build rest config")
-
-		return nil, false
-	}
-
 	contextName := contextNameFromProfileKey(profileKey)
 
-	headlampContext, err := restConfigToContext(restConfig, contextName, profileKey)
-	if err != nil {
-		logger.Log(logger.LevelWarn, map[string]string{logFieldClusterProfile: profileKey}, err,
-			"cluster-inventory: failed to convert rest config")
+	var headlampContext *kubeconfig.Context
 
-		return nil, false
+	var err error
+
+	if r.authType == AuthTypeOIDC {
+		headlampContext, err = oidcContextFromClusterProfile(cp, contextName, profileKey, r.oidcConfig)
+		if err != nil {
+			logger.Log(logger.LevelWarn, map[string]string{logFieldClusterProfile: profileKey}, err,
+				"cluster-inventory: failed to build OIDC context")
+
+			return nil, false
+		}
+	} else {
+		restConfig, buildErr := copyAccessConfig(r.accessConfig).BuildConfigFromCP(accessOnlyClusterProfile(cp))
+		if buildErr != nil {
+			logger.Log(logger.LevelWarn, map[string]string{logFieldClusterProfile: profileKey}, buildErr,
+				"cluster-inventory: failed to build rest config")
+
+			return nil, false
+		}
+
+		headlampContext, err = restConfigToContext(restConfig, contextName, profileKey)
+		if err != nil {
+			logger.Log(logger.LevelWarn, map[string]string{logFieldClusterProfile: profileKey}, err,
+				"cluster-inventory: failed to convert rest config")
+
+			return nil, false
+		}
 	}
 
 	if err := headlampContext.SetupProxy(); err != nil {
@@ -1309,4 +1377,82 @@ func restConfigToContext(restConfig *rest.Config, contextName, profileKey string
 		KubeConfigPath: "",
 		ClusterID:      clusterInventoryIDPrefix + profileKey,
 	}, nil
+}
+
+// oidcContextFromClusterProfile builds an OIDC-authenticated Headlamp context from the
+// first access-provider entry that carries a server URL. AuthInfo stays empty so the
+// proxy transport carries no credentials and only each user's own bearer token reaches
+// the cluster.
+func oidcContextFromClusterProfile(
+	cp *apisv1alpha1.ClusterProfile,
+	contextName, profileKey string,
+	oidcConf *kubeconfig.OidcConfig,
+) (*kubeconfig.Context, error) {
+	cluster, ok := clusterFromAccessProviders(cp.Status.AccessProviders)
+	if !ok {
+		return nil, errors.New("no access provider carries a server URL")
+	}
+
+	return &kubeconfig.Context{
+		Name: contextName,
+		KubeContext: &api.Context{
+			Cluster:  contextName,
+			AuthInfo: contextName,
+		},
+		Cluster:        cluster,
+		AuthInfo:       &api.AuthInfo{},
+		Source:         kubeconfig.ClusterInventory,
+		OidcConf:       copyOidcConfig(oidcConf),
+		KubeConfigPath: "",
+		ClusterID:      clusterInventoryIDPrefix + profileKey,
+	}, nil
+}
+
+// clusterFromAccessProviders returns connection details from the first entry with a
+// non-empty server URL.
+func clusterFromAccessProviders(providers []apisv1alpha1.AccessProvider) (*api.Cluster, bool) {
+	for i := range providers {
+		provider := &providers[i].Cluster
+		if provider.Server == "" {
+			continue
+		}
+
+		return &api.Cluster{
+			Server:                   provider.Server,
+			TLSServerName:            provider.TLSServerName,
+			InsecureSkipTLSVerify:    provider.InsecureSkipTLSVerify,
+			CertificateAuthority:     provider.CertificateAuthority,
+			CertificateAuthorityData: append([]byte(nil), provider.CertificateAuthorityData...),
+			ProxyURL:                 provider.ProxyURL,
+			DisableCompression:       provider.DisableCompression,
+		}, true
+	}
+
+	return nil, false
+}
+
+// copyOidcConfig deep-copies an OIDC config so each stored context owns its own copy.
+func copyOidcConfig(in *kubeconfig.OidcConfig) *kubeconfig.OidcConfig {
+	if in == nil {
+		return nil
+	}
+
+	out := &kubeconfig.OidcConfig{
+		ClientID:     in.ClientID,
+		ClientSecret: in.ClientSecret,
+		IdpIssuerURL: in.IdpIssuerURL,
+		Scopes:       append([]string(nil), in.Scopes...),
+	}
+
+	if in.SkipTLSVerify != nil {
+		skipTLSVerify := *in.SkipTLSVerify
+		out.SkipTLSVerify = &skipTLSVerify
+	}
+
+	if in.CACert != nil {
+		caCert := *in.CACert
+		out.CACert = &caCert
+	}
+
+	return out
 }

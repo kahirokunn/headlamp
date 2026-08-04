@@ -291,6 +291,12 @@
               "description": "Enable experimental/alpha Cluster Inventory discovery",
               "default": false
             },
+            "authType": {
+              "type": "string",
+              "enum": ["access-provider", "oidc"],
+              "description": "How users authenticate to discovered clusters: \"access-provider\" uses the exec-plugin providers with controller credentials; \"oidc\" makes each user log in via Headlamp's global OIDC settings",
+              "default": "access-provider"
+            },
             "accessProvidersConfig": {
               "type": "object",
               "description": "Experimental/alpha Cluster Inventory access providers config",

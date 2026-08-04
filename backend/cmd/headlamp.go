@@ -523,8 +523,15 @@ func startClusterInventory(ctx context.Context, config *HeadlampConfig) error {
 		}
 	}
 
+	var oidcConf *kubeconfig.OidcConfig
+	if config.ClusterInventoryAuthType == clusterinventory.AuthTypeOIDC {
+		oidcConf = globalOidcConfig(config)
+	}
+
 	runner, err := clusterinventory.NewRunner(clusterinventory.Options{
 		Store:                 config.KubeConfigStore,
+		AuthType:              config.ClusterInventoryAuthType,
+		OIDC:                  oidcConf,
 		ProviderFile:          config.ClusterInventoryProviderFile,
 		LabelSelector:         config.ClusterInventoryLabelSelector,
 		Namespaces:            config.ClusterInventoryNamespaces,
@@ -541,6 +548,28 @@ func startClusterInventory(ctx context.Context, config *HeadlampConfig) error {
 	go runner.Run(ctx)
 
 	return nil
+}
+
+// globalOidcConfig assembles Headlamp's global OIDC settings for discovered clusters.
+// Cluster discovery runners (Cluster Inventory today, Cluster API in the future) share it.
+func globalOidcConfig(config *HeadlampConfig) *kubeconfig.OidcConfig {
+	skipTLSVerify := config.OidcSkipTLSVerify
+
+	var caCert *string
+
+	if config.OidcCACert != "" {
+		oidcCACert := config.OidcCACert
+		caCert = &oidcCACert
+	}
+
+	return &kubeconfig.OidcConfig{
+		ClientID:      config.OidcClientID,
+		ClientSecret:  config.OidcClientSecret,
+		IdpIssuerURL:  config.OidcIdpIssuerURL,
+		Scopes:        append([]string(nil), config.OidcScopes...),
+		SkipTLSVerify: &skipTLSVerify,
+		CACert:        caCert,
+	}
 }
 
 func setupInClusterContext(config *HeadlampConfig) {

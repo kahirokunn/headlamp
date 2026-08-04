@@ -66,6 +66,7 @@ type Config struct {
 	NodeShellNamespace     string `koanf:"node-shell-namespace"`
 	ProxyURLs              string `koanf:"proxy-urls"`
 
+	ClusterInventoryAuthType              string        `koanf:"cluster-inventory-auth-type"`
 	ClusterInventoryProviderFile          string        `koanf:"cluster-inventory-provider-file"`
 	ClusterInventoryLabelSelector         string        `koanf:"cluster-inventory-label-selector"`
 	ClusterInventoryNamespaces            string        `koanf:"cluster-inventory-namespaces"`
@@ -123,11 +124,13 @@ func (c *Config) warnRedundantThemeDefaults() {
 }
 
 func (c *Config) Validate() error {
-	if !c.InCluster && !c.OidcUseCookie && (c.OidcClientID != "" || c.OidcClientSecret != "" || c.OidcIdpIssuerURL != "" ||
-		c.OidcValidatorClientID != "" || c.OidcValidatorIdpIssuerURL != "") {
+	if !c.InCluster && !c.OidcUseCookie && !c.usesDiscoveryOIDC() &&
+		(c.OidcClientID != "" || c.OidcClientSecret != "" || c.OidcIdpIssuerURL != "" ||
+			c.OidcValidatorClientID != "" || c.OidcValidatorIdpIssuerURL != "") {
 		return errors.New("oidc-client-id, oidc-client-secret, oidc-idp-issuer-url, " +
 			"oidc-validator-client-id, oidc-validator-idp-issuer-url, flags are only " +
-			"meant to be used in inCluster mode or with --oidc-use-cookie")
+			"meant to be used in inCluster mode, with --oidc-use-cookie, or with " +
+			"--enable-cluster-inventory and --cluster-inventory-auth-type=oidc")
 	}
 
 	// Extracted to keep Validate's cognitive complexity within the linter limit.
@@ -202,11 +205,59 @@ func (c *Config) validateOIDCCAFile() error {
 	return nil
 }
 
+// usesDiscoveryOIDC reports whether discovered clusters authenticate users via OIDC.
+func (c *Config) usesDiscoveryOIDC() bool {
+	return c.EnableClusterInventory && c.ClusterInventoryAuthType == clusterinventory.AuthTypeOIDC
+}
+
+func hasUsableOIDCScope(scopes string) bool {
+	for _, scope := range strings.Split(scopes, ",") {
+		if strings.TrimSpace(scope) != "" {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (c *Config) validateClusterInventory() error {
 	if !c.EnableClusterInventory {
 		return nil
 	}
 
+	switch c.ClusterInventoryAuthType {
+	case "", clusterinventory.AuthTypeAccessProvider:
+		if err := c.validateClusterInventoryProviderFile(); err != nil {
+			return err
+		}
+	case clusterinventory.AuthTypeOIDC:
+		if c.OidcClientID == "" || c.OidcIdpIssuerURL == "" || !hasUsableOIDCScope(c.OidcScopes) {
+			return errors.New("cluster-inventory-auth-type=oidc requires " +
+				"oidc-client-id, oidc-idp-issuer-url and oidc-scopes")
+		}
+
+		if c.ClusterInventoryProviderFile != "" {
+			logger.Log(logger.LevelWarn, nil, nil,
+				"cluster-inventory-provider-file is ignored when cluster-inventory-auth-type=oidc")
+		}
+	default:
+		return fmt.Errorf("invalid cluster-inventory-auth-type %q (valid values: %q, %q)",
+			c.ClusterInventoryAuthType, clusterinventory.AuthTypeAccessProvider, clusterinventory.AuthTypeOIDC)
+	}
+
+	labelSelector := strings.TrimSpace(c.ClusterInventoryLabelSelector)
+	if labelSelector != "" {
+		if _, err := labels.Parse(labelSelector); err != nil {
+			return fmt.Errorf("invalid cluster-inventory-label-selector: %w", err)
+		}
+	}
+
+	c.ClusterInventoryLabelSelector = labelSelector
+
+	return nil
+}
+
+func (c *Config) validateClusterInventoryProviderFile() error {
 	if c.ClusterInventoryProviderFile == "" {
 		return errors.New("cluster-inventory-provider-file is required when cluster inventory is enabled")
 	}
@@ -223,15 +274,6 @@ func (c *Config) validateClusterInventory() error {
 	if _, err := access.NewFromFile(c.ClusterInventoryProviderFile); err != nil {
 		return fmt.Errorf("invalid cluster-inventory-provider-file: %w", err)
 	}
-
-	labelSelector := strings.TrimSpace(c.ClusterInventoryLabelSelector)
-	if labelSelector != "" {
-		if _, err := labels.Parse(labelSelector); err != nil {
-			return fmt.Errorf("invalid cluster-inventory-label-selector: %w", err)
-		}
-	}
-
-	c.ClusterInventoryLabelSelector = labelSelector
 
 	return nil
 }
@@ -575,6 +617,11 @@ func addGeneralFlags(f *flag.FlagSet) {
 	f.Bool("enable-helm", false, "Enable Helm operations")
 	f.Bool("enable-cluster-inventory", false,
 		"Enable experimental/alpha automatic discovery of clusters from ClusterProfile resources")
+	f.String("cluster-inventory-auth-type", clusterinventory.AuthTypeAccessProvider,
+		"How users authenticate to experimental/alpha Cluster Inventory clusters: "+
+			"\"access-provider\" uses the provider-file exec plugins with controller credentials; "+
+			"\"oidc\" makes each user log in with the global OIDC settings "+
+			"(oidc-client-id, oidc-idp-issuer-url, oidc-scopes)")
 	f.String("cluster-inventory-provider-file", "",
 		"Path to the JSON configuration file for experimental/alpha Cluster Inventory access providers")
 	f.String("cluster-inventory-label-selector", "",
