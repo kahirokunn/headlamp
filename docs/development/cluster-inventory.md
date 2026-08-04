@@ -69,6 +69,43 @@ kubecontext namespace (or `default`) for roots seeded from the kubeconfig.
 Pass a comma-separated list to watch more than one namespace. Use `*` on its
 own to watch all namespaces.
 
+## OIDC auth mode
+
+By default (`--cluster-inventory-auth-type=access-provider`), Headlamp
+authenticates to discovered clusters with the access-provider exec plugins from
+the provider file. Those are controller-level credentials: every Headlamp user
+sees the discovered clusters with the same permissions, which does not fit
+multi-tenant setups.
+
+With `--cluster-inventory-auth-type=oidc`, discovered clusters instead require
+each user to sign in with Headlamp's global OIDC settings (`--oidc-client-id`,
+`--oidc-idp-issuer-url`, `--oidc-scopes`), so the Kubernetes API servers of the
+discovered clusters apply each user's own RBAC. In this mode:
+
+- No provider file is needed; `--cluster-inventory-provider-file` is ignored
+  with a warning.
+- The cluster endpoint and certificate authority still come from
+  `ClusterProfile.status.accessProviders[].cluster` — the first entry with a
+  non-empty `server` is used, and profiles without one are skipped.
+- Every discovered cluster's API server must trust the same OIDC issuer and
+  client. Include the `offline_access` scope if the identity provider requires
+  it for refresh tokens.
+
+Development-mode example (no `--in-cluster` needed; the OIDC flags are accepted
+because cluster inventory runs in OIDC mode):
+
+```bash
+KUBECONFIG="$WORK/hub.kubeconfig" \
+./backend/headlamp-server -dev -listen-addr=localhost \
+  --enable-cluster-inventory \
+  --cluster-inventory-auth-type=oidc \
+  --cluster-inventory-namespaces=inventory-e2e \
+  --oidc-client-id=headlamp \
+  --oidc-client-secret=... \
+  --oidc-idp-issuer-url=https://idp.example.com \
+  --oidc-scopes=profile,email,offline_access
+```
+
 In another terminal:
 
 ```bash

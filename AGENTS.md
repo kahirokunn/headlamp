@@ -91,6 +91,29 @@ should NOT unless explicitly requested or strictly necessary for the change
 
 ---
 
+### Cluster discovery auth policy
+
+Headlamp discovers clusters from external sources (currently the Cluster
+Inventory API; `backend/pkg/clusterinventory`). Each discovery source selects
+its user-auth mode with a per-source flag:
+
+- **Controller-credential mode** (e.g. `-cluster-inventory-auth-type=access-provider`):
+  Headlamp connects with credentials owned by the controller/deployment. All
+  users share those permissions — fine for single-tenant setups.
+- **OIDC mode** (e.g. `-cluster-inventory-auth-type=oidc`): each user signs in
+  to discovered clusters with Headlamp's global OIDC settings and only their
+  own RBAC applies. Recommended for large or multi-tenant environments.
+
+A Cluster API (`cluster.x-k8s.io`) discovery source is planned as a sibling of
+Cluster Inventory, following the same Runner pattern with a symmetric flag
+scheme (`-cluster-api-auth-type=kubeconfig-secret|oidc`). Keep discovery code
+source-agnostic: do not assume Cluster Inventory is the only source, and keep
+naming, validation, and helpers (e.g. `usesDiscoveryOIDC` in
+`backend/pkg/config`, `globalOidcConfig` in `backend/cmd`) symmetric so new
+sources can plug in.
+
+---
+
 ### Primary entry points (exact commands from repository)
 
 #### Build commands (from `/package.json` and `/docs/development/index.md`):

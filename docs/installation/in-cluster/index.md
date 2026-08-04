@@ -33,8 +33,10 @@ helm install my-headlamp headlamp/headlamp --namespace kube-system --set replica
 
 Headlamp can discover clusters from Cluster Inventory API `ClusterProfile`
 resources when Cluster Inventory is enabled. The Helm chart configures the
-backend flags from `config.clusterInventory` and mounts an access provider
-config file.
+backend flags from `config.clusterInventory`. With the default
+`authType: access-provider` it also mounts an access provider config file;
+`authType: oidc` skips that file and uses Headlamp's global OIDC settings
+instead.
 
 Create `cluster-inventory-values.yaml`:
 
@@ -95,6 +97,33 @@ Each selected namespace requires permission to get, list, and watch
 ClusterProfiles. Set `namespaces` to `["*"]` to watch all namespaces. `*`
 cannot be combined with named namespaces, and all-namespace discovery requires
 equivalent cluster-wide access.
+
+#### OIDC auth mode for discovered clusters
+
+The default `authType: access-provider` connects to discovered clusters with
+the access-provider exec plugins, which are controller-level credentials: every
+Headlamp user sees the discovered clusters with the same permissions. For
+multi-tenant setups, set `authType: oidc` so each user signs in to discovered
+clusters with Headlamp's global OIDC settings and only their own RBAC applies:
+
+```yaml
+config:
+  oidc:
+    clientID: "headlamp"
+    clientSecret: "..."
+    issuerURL: "https://idp.example.com"
+    scopes: "profile,email,offline_access"
+  clusterInventory:
+    enabled: true
+    authType: oidc
+```
+
+In OIDC mode no `accessProvidersConfig` or `plugins` are needed. The cluster
+endpoint and certificate authority still come from
+`ClusterProfile.status.accessProviders[].cluster`. All discovered clusters'
+API servers must trust the same OIDC issuer and client as Headlamp, and the
+`offline_access` scope enables token refresh where the identity provider
+requires it.
 
 ## Using simple yaml
 
