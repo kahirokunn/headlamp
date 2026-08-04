@@ -66,3 +66,11 @@ func TestBuildHeadlampCFG(t *testing.T) {
 		assert.Empty(t, headlampCFG.ProxyURLs)
 	})
 }
+
+func TestSplitOIDCScopes(t *testing.T) {
+	assert.Equal(t,
+		[]string{"profile", "email", "offline_access"},
+		splitOIDCScopes("profile, email, , offline_access"),
+	)
+	assert.Empty(t, splitOIDCScopes(" ,\t"))
+}
