@@ -59,6 +59,7 @@ import {
   PluginManager,
   setAppConfigDirName,
 } from './plugin-management';
+import { findProtocolUrl, isProtocolUrl, readProtocolScheme } from './protocol';
 import {
   addRunCmdConsent,
   environmentOverrides,
@@ -66,8 +67,10 @@ import {
   runScript,
   setupRunCmdHandlers,
 } from './runCmd';
+import { setupSecureStorageHandlers } from './secureStorage';
 import { loadSettings, SETTINGS_PATH } from './settings';
 import { getShellEnv } from './shellEnv';
+import { shouldCheckForAppUpdates } from './shouldCheckForAppUpdates';
 import {
   cleanupHeadlampTray,
   createHeadlampTray,
@@ -200,10 +203,11 @@ let actualPort = defaultPort; // Will be updated when backend starts
 const MAX_PORT_ATTEMPTS = Math.abs(Number(process.env.HEADLAMP_MAX_PORT_ATTEMPTS) || 100); // Maximum number of ports to try
 
 const useExternalServer = process.env.EXTERNAL_SERVER || false;
-const shouldCheckForUpdates = process.env.HEADLAMP_CHECK_FOR_UPDATES !== 'false';
 const legalDocumentsResourcePath = getLegalDocumentsResourcePath(isDev, process.resourcesPath);
 const appBuildManifestPath = path.join(legalDocumentsResourcePath, 'app-build-manifest.json');
 const legalDocuments = loadLegalDocuments(appBuildManifestPath);
+const protocolScheme = readProtocolScheme(appBuildManifestPath);
+const shouldCheckForUpdates = shouldCheckForAppUpdates(appBuildManifestPath);
 
 // make it global so that it doesn't get garbage collected
 let mainWindow: BrowserWindow | null;
@@ -729,7 +733,12 @@ async function startServer(flags: string[] = []): Promise<ChildProcessWithoutNul
 
   actualPort = await findAvailablePort(defaultPort);
 
-  let serverArgs: string[] = ['--listen-addr=localhost', `--port=${actualPort}`];
+  let serverArgs: string[] = [
+    '--listen-addr=localhost',
+    `--port=${actualPort}`,
+    '--app-name',
+    app.getName(),
+  ];
   if (!!args.kubeconfig) {
     serverArgs = serverArgs.concat(['--kubeconfig', args.kubeconfig]);
   }
@@ -1395,6 +1404,78 @@ ipcMain.on('route-changed', () => {
 function startElectron() {
   console.info('App starting...');
 
+  let isMainWindowReady = false;
+  const pendingProtocolUrls: string[] = [];
+
+  function routeProtocolUrl(protocolUrl: string) {
+    let urlObj: URL;
+    try {
+      urlObj = new URL(protocolUrl);
+    } catch {
+      dialog.showErrorBox(
+        i18n.t('Invalid URL'),
+        i18n.t('Application opened with an invalid URL: {{ url }}', { url: protocolUrl })
+      );
+      return;
+    }
+
+    if (!isProtocolUrl(protocolUrl, protocolScheme)) {
+      dialog.showErrorBox(
+        i18n.t('Invalid URL'),
+        i18n.t('Application opened with an invalid URL: {{ url }}', { url: protocolUrl })
+      );
+      return;
+    }
+
+    if (!mainWindow || !isMainWindowReady) {
+      pendingProtocolUrls.push(protocolUrl);
+      return;
+    }
+
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore();
+    }
+    mainWindow.focus();
+
+    const baseUrl = startUrl.endsWith('/') ? startUrl.slice(0, -1) : startUrl;
+    mainWindow.loadURL(baseUrl + '#' + urlObj.hostname + urlObj.search);
+  }
+
+  function routeProtocolUrlFromCommandLine(commandLine: readonly string[]) {
+    const protocolUrl = findProtocolUrl(commandLine, protocolScheme);
+    if (protocolUrl) {
+      routeProtocolUrl(protocolUrl);
+    }
+  }
+
+  const gotTheLock = app.requestSingleInstanceLock();
+  if (!gotTheLock) {
+    app.quit();
+    return;
+  }
+
+  app.on('open-url', (event, protocolUrl) => {
+    event.preventDefault();
+    routeProtocolUrl(protocolUrl);
+  });
+
+  app.on('second-instance', (_event, commandLine) => {
+    const protocolUrl = findProtocolUrl(commandLine, protocolScheme);
+    if (protocolUrl) {
+      routeProtocolUrl(protocolUrl);
+      return;
+    }
+
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
+      mainWindow.focus();
+    }
+  });
+
+  routeProtocolUrlFromCommandLine(process.argv);
+
   // Increase max listeners to prevent false positive warnings
   // The app legitimately needs multiple IPC listeners (currently 11)
   // Default is 10, setting to 20 provides headroom for future additions
@@ -1561,6 +1642,8 @@ function startElectron() {
     const withMargin = await isWSL();
     const { width, height } = windowSize(screen.getPrimaryDisplay().workAreaSize, withMargin);
 
+    isMainWindowReady = false;
+
     // Flush any pending debounced zoom save before reading so reopening the
     // window immediately after a zoom change reads the latest factor.
     flushZoomFactorSave();
@@ -1614,6 +1697,11 @@ function startElectron() {
       scheduleApplyZoom(true);
       // Inject the backend port into the window object
       mainWindow?.webContents.executeJavaScript(`window.headlampBackendPort = ${actualPort};`);
+
+      isMainWindowReady = true;
+      for (const protocolUrl of pendingProtocolUrls.splice(0)) {
+        routeProtocolUrl(protocolUrl);
+      }
     });
 
     mainWindow.webContents.on('did-frame-finish-load', (_event, isMainFrame) => {
@@ -1656,6 +1744,7 @@ function startElectron() {
     });
 
     mainWindow.on('closed', () => {
+      isMainWindowReady = false;
       mainWindow = null;
     });
 
@@ -1677,21 +1766,6 @@ function startElectron() {
       }
     });
 
-    // Force Single Instance Application
-    const gotTheLock = app.requestSingleInstanceLock();
-    if (gotTheLock) {
-      app.on('second-instance', () => {
-        // Someone tried to run a second instance, we should focus our window.
-        if (mainWindow) {
-          if (mainWindow.isMinimized()) mainWindow.restore();
-          mainWindow.focus();
-        }
-      });
-    } else {
-      app.quit();
-      return;
-    }
-
     /*
     if a library is trying to open a url other than app url in electron take it
     to the default browser
@@ -1705,29 +1779,6 @@ function startElectron() {
       shell.openExternal(url);
     });
 
-    app.on('open-url', (event, url) => {
-      mainWindow?.focus();
-      let urlObj;
-      try {
-        urlObj = new URL(url);
-      } catch (e) {
-        dialog.showErrorBox(
-          i18n.t('Invalid URL'),
-          i18n.t('Application opened with an invalid URL: {{ url }}', { url })
-        );
-        return;
-      }
-
-      const urlParam = urlObj.hostname;
-      let baseUrl = startUrl;
-      // this check helps us to avoid adding multiple / to the startUrl when appending the incoming url to it
-      if (baseUrl.endsWith('/')) {
-        baseUrl = baseUrl.slice(0, startUrl.length - 1);
-      }
-      // load the index.html from build and route to the hostname received in the protocol handler url
-      mainWindow?.loadURL(baseUrl + '#' + urlParam + urlObj.search);
-    });
-
     i18n.on('languageChanged', () => {
       updateMenuLabels(currentMenu);
       setMenu(mainWindow, currentMenu);
@@ -1737,6 +1788,7 @@ function startElectron() {
       mainWindow?.webContents.send('appConfig', {
         checkForUpdates: shouldCheckForUpdates,
         appVersion,
+        protocolScheme,
       });
     });
 
@@ -1798,6 +1850,7 @@ function startElectron() {
     });
 
     setupRunCmdHandlers(mainWindow, ipcMain);
+    setupSecureStorageHandlers(mainWindow, startUrl);
 
     new PluginManagerEventListeners().setupEventHandlers();
 
