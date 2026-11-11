@@ -227,7 +227,7 @@ func NewMultiplexer(kubeConfigStore kubeconfig.ContextStore, unsafeUseServiceAcc
 // readServiceAccountToken reads the service account token from path, caching the value
 // per path and refreshing it when the file's mtime changes (e.g. kubelet token rotation).
 func (m *Multiplexer) readServiceAccountToken(path string) (string, error) {
-	stat, err := os.Stat(path) //nolint:gosec
+	stat, err := os.Stat(path) //nolint:gosec // Service account token file path from cluster config
 	if err != nil {
 		return "", fmt.Errorf("stat service account token file: %w", err)
 	}
@@ -240,7 +240,7 @@ func (m *Multiplexer) readServiceAccountToken(path string) (string, error) {
 		return entry.token, nil
 	}
 
-	tokenBytes, err := os.ReadFile(path) //nolint:gosec
+	tokenBytes, err := os.ReadFile(path) //nolint:gosec // Service account token file path from cluster config
 	if err != nil {
 		return "", fmt.Errorf("reading service account token file: %w", err)
 	}
@@ -470,6 +470,11 @@ func (m *Multiplexer) clusterConnectionToken(
 	clusterContext *kubeconfig.Context,
 	requestToken *string,
 ) (*string, error) {
+	if clusterContext.RequiresUserAuthentication() &&
+		(requestToken == nil || strings.TrimSpace(*requestToken) == "") {
+		return nil, errUserAuthRequired
+	}
+
 	if !m.unsafeUseServiceAccountToken || !clusterContext.UsesInClusterServiceAccountToken() {
 		return requestToken, nil
 	}
@@ -767,6 +772,13 @@ func (m *Multiplexer) readClientMessage(clientConn *websocket.Conn) (Message, bo
 // getOrCreateConnection gets an existing connection or creates a new one if it doesn't exist.
 // If a connection exists and a new token is provided, it updates the token to ensure it's fresh.
 func (m *Multiplexer) getOrCreateConnection(msg Message, clientConn *WSConnLock, token *string) (*Connection, error) {
+	if token == nil || strings.TrimSpace(*token) == "" {
+		clusterContext, err := m.kubeConfigStore.GetContext(msg.ClusterID)
+		if err == nil && clusterContext.RequiresUserAuthentication() {
+			return nil, errUserAuthRequired
+		}
+	}
+
 	connKey := m.createConnectionKey(msg.ClusterID, msg.Path, msg.UserID)
 
 	m.mutex.RLock()

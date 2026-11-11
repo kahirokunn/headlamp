@@ -2,10 +2,11 @@ package headlampconfig
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
-	"time"
 
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/clusterdiscovery"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/config"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/telemetry"
@@ -46,6 +47,7 @@ type HeadlampConfig struct {
 	ProxyAuthEmailHeader      string
 	ProxyAuthTokenHeader      string
 	ServerCtx                 context.Context
+	AdminSettings             json.RawMessage
 }
 
 type HeadlampCFG struct {
@@ -88,10 +90,5 @@ type HeadlampCFG struct {
 	UnsafeUseServiceAccountToken bool
 	ServiceAccountTokenPath      string
 
-	EnableClusterInventory                bool
-	ClusterInventoryProviderFile          string
-	ClusterInventoryLabelSelector         string
-	ClusterInventoryNamespaces            string
-	ClusterInventoryRootReconcileInterval time.Duration
-	ClusterInventoryNoCRDCacheTTL         time.Duration
+	DiscoverySources map[string]clusterdiscovery.Settings
 }

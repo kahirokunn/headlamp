@@ -38,6 +38,22 @@ describe('configSlice', () => {
     expect(nextState.clusters).toEqual(clusters);
   });
 
+  it('updates source definitions independently and keeps them on partial config updates', () => {
+    const clusterSources = [
+      { id: 'fleet', label: 'Fleet', nameLabel: 'Cluster', configured: true },
+    ];
+    const updated = configReducer(initialState, setConfig({ clusters: {}, clusterSources }));
+    expect(updated.clusterSources).toEqual(clusterSources);
+    const partial = configReducer(
+      updated,
+      setConfig({ clusters: { legacy: { name: 'legacy', auth_type: '' } } })
+    );
+    expect(partial.clusterSources).toEqual(clusterSources);
+    expect(
+      configReducer(partial, setConfig({ clusters: {}, clusterSources: [] })).clusterSources
+    ).toEqual([]);
+  });
+
   it('should handle setConfig with isDynamicClusterEnabled', () => {
     const clusters: ConfigState['clusters'] = {
       'cluster-1': { name: 'cluster-1' } as Cluster,
@@ -197,7 +213,8 @@ describe('configSlice', () => {
 
       const storedSettings = JSON.parse(localStorage.getItem('settings') || '{}');
       expect(storedSettings.tableRowsPerPageOptions).toEqual(defaultTableRowsPerPageOptions);
-      expect(storedSettings.timezone).toEqual(initialState.settings.timezone);
+      expect(storedSettings).not.toHaveProperty('timezone');
+      expect(nextState.userSettings).toEqual(settings);
     });
 
     it('should handle setAppSettings with expandLargeGraph and update localStorage', () => {

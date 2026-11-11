@@ -97,6 +97,8 @@ export type TableProps<RowItem extends Record<string, any>> = Omit<
    * Message to show when the table is empty
    */
   emptyMessage?: ReactNode;
+  /** Collapse the bottom toolbar when it has no pagination, status, or actions. */
+  hideEmptyBottomToolbar?: boolean;
   /**
    * Error message to show instead of the table
    */
@@ -386,6 +388,7 @@ export default function Table<RowItem extends Record<string, any>>({
   filterFunction,
   errorMessage,
   loading,
+  hideEmptyBottomToolbar = false,
   ...tableProps
 }: TableProps<RowItem>) {
   const shouldReflectInURL = reflectInURL !== undefined && reflectInURL !== false;
@@ -526,11 +529,19 @@ export default function Table<RowItem extends Record<string, any>>({
 
   const mergedColumnVisibility = useMemo(
     () => ({
-      ...(tableProps.state?.columnVisibility ?? {}),
-      ...columnVisibility,
+      // A change callback keeps local visibility at its initial value, so the caller's map
+      // is the complete value and local visibility only stands in while it is absent.
+      ...(tableProps.onColumnVisibilityChange
+        ? tableProps.state?.columnVisibility ?? columnVisibility
+        : { ...tableProps.state?.columnVisibility, ...columnVisibility }),
       ...responsiveHidden,
     }),
-    [tableProps.state?.columnVisibility, columnVisibility, responsiveHidden]
+    [
+      tableProps.onColumnVisibilityChange,
+      tableProps.state?.columnVisibility,
+      columnVisibility,
+      responsiveHidden,
+    ]
   );
 
   // With faceting on, MRT installs TanStack's own implementation for every column, so ours
@@ -614,7 +625,7 @@ export default function Table<RowItem extends Record<string, any>>({
       }
     },
     onGlobalFilterChange: setGlobalFilter,
-    onColumnVisibilityChange: setColumnVisibility,
+    onColumnVisibilityChange: tableProps.onColumnVisibilityChange ?? setColumnVisibility,
     renderToolbarInternalActions: ({ table: tbl }) => {
       const isSomeRowsSelected =
         tableProps.enableRowSelection && tbl.getSelectedRowModel().rows.length !== 0;
@@ -702,7 +713,7 @@ export default function Table<RowItem extends Record<string, any>>({
         minWidth: 'unset',
       },
     },
-    muiTopToolbarProps: {
+    muiTopToolbarProps: tableProps.muiTopToolbarProps ?? {
       sx: {
         height: '3.5rem',
         backgroundColor: undefined,
@@ -912,7 +923,18 @@ export default function Table<RowItem extends Record<string, any>>({
             ))}
           </StyledBody>
         </MuiTable>
-        <MRT_BottomToolbar table={table} />
+        {(!hideEmptyBottomToolbar ||
+          table.options.enablePagination ||
+          table.options.renderBottomToolbarCustomActions ||
+          table.getState().isLoading ||
+          table.getState().isSaving ||
+          table.getState().showProgressBars ||
+          table.getState().showAlertBanner ||
+          table.getState().showToolbarDropZone ||
+          table.getState().grouping?.length ||
+          Object.values(table.getState().rowSelection ?? {}).some(Boolean)) && (
+          <MRT_BottomToolbar table={table} />
+        )}
       </>
     );
   }
@@ -952,6 +974,7 @@ const MemoHeadCell = memo(
   },
   (a, b) =>
     a.header.column.id === b.header.column.id &&
+    a.header.column.columnDef.header === b.header.column.columnDef.header &&
     a.sorting === b.sorting &&
     a.isFiltered === b.isFiltered &&
     a.showColumnFilters === b.showColumnFilters &&
@@ -1019,6 +1042,8 @@ const MemoCell = memo(
   },
   (a, b) =>
     a.cell.getValue() === b.cell.getValue() &&
+    a.cell.row.original === b.cell.row.original &&
+    a.cell.column.columnDef.Cell === b.cell.column.columnDef.Cell &&
     (a.cell.column.id === 'mrt-row-select' && b.cell.column.id === 'mrt-row-select'
       ? a.canSelect === b.canSelect && a.isRowSelected === b.isRowSelected
       : true)

@@ -88,6 +88,7 @@ vi.mock('material-react-table', () => ({
     const rows = options.data.map((item: Record<string, unknown>, index: number) => {
       const row: any = {
         id: String(index),
+        original: item,
         getCanSelect: () => true,
         getIsSelected: () => false,
       };
@@ -103,6 +104,7 @@ vi.mock('material-react-table', () => ({
     });
 
     return {
+      options,
       getHeaderGroups: () => [
         {
           headers: [
@@ -110,6 +112,7 @@ vi.mock('material-react-table', () => ({
               id: 'selection',
               column: {
                 id: 'selection',
+                columnDef: options.columns[0],
                 getFilterValue: () => undefined,
                 getIsFiltered: () => false,
                 getIsSorted: () => false,
@@ -121,6 +124,7 @@ vi.mock('material-react-table', () => ({
       getRowModel: () => ({ rows }),
       getSelectedRowModel: () => ({ flatRows: [], rows: [] }),
       getState: () => ({
+        ...options.state,
         columnVisibility: tableMocks.columnVisibility,
         showColumnFilters: false,
       }),
@@ -160,6 +164,56 @@ function renderTable(props: Partial<TableProps<TestRow>> = {}) {
   );
 }
 
+describe('empty bottom toolbar spacing', () => {
+  it('preserves caller toolbar spacing and retains native defaults otherwise', () => {
+    const toolbar = { sx: { mb: 2, height: '3.5rem' } };
+    const { unmount } = renderTable({ muiTopToolbarProps: toolbar });
+    expect(tableMocks.options.muiTopToolbarProps).toBe(toolbar);
+    unmount();
+    renderTable();
+    expect(tableMocks.options.muiTopToolbarProps.sx.height).toBe('3.5rem');
+  });
+
+  it('preserves the toolbar by default', () => {
+    renderTable();
+    expect(screen.getByTestId('bottom-toolbar')).toBeTruthy();
+  });
+
+  it('collapses an empty toolbar only when opted in', () => {
+    renderTable({ hideEmptyBottomToolbar: true });
+    expect(screen.queryByTestId('bottom-toolbar')).toBeNull();
+  });
+
+  it('retains pagination for larger lists', () => {
+    renderTable({
+      hideEmptyBottomToolbar: true,
+      data: Array.from({ length: 11 }, () => ({ selected: false })),
+    });
+    expect(screen.getByTestId('bottom-toolbar')).toBeTruthy();
+  });
+
+  it.each([
+    { isLoading: true },
+    { isSaving: true },
+    { showProgressBars: true },
+    { showAlertBanner: true },
+    { showToolbarDropZone: true },
+    { grouping: ['selected'] },
+    { rowSelection: { '0': true } },
+  ])('retains footer status for %j', state => {
+    renderTable({ hideEmptyBottomToolbar: true, state });
+    expect(screen.getByTestId('bottom-toolbar')).toBeTruthy();
+  });
+
+  it('retains custom footer actions', () => {
+    renderTable({
+      hideEmptyBottomToolbar: true,
+      renderBottomToolbarCustomActions: () => <button>Footer action</button>,
+    });
+    expect(screen.getByTestId('bottom-toolbar')).toBeTruthy();
+  });
+});
+
 function toolbarTable(selectedRows: object[] = []) {
   return {
     getSelectedRowModel: () => ({ rows: selectedRows }),
@@ -186,6 +240,80 @@ describe('Table toolbar and selection props', () => {
     renderTable(props);
 
     expect(screen.getByTestId('top-toolbar')).toBeVisible();
+  });
+
+  it('forwards visibility changes so a caller can save and restore its columns', () => {
+    const onColumnVisibilityChange = vi.fn();
+    renderTable({ state: { columnVisibility: { detail: false } }, onColumnVisibilityChange });
+    tableMocks.options.onColumnVisibilityChange({ detail: true });
+    expect(onColumnVisibilityChange).toHaveBeenCalledWith({ detail: true });
+    expect(tableMocks.options.state.columnVisibility.detail).toBe(false);
+  });
+
+  it('lets local visibility toggles override caller defaults without a change callback', () => {
+    renderTable({ state: { columnVisibility: { cluster: true } } });
+    expect(tableMocks.options.state.columnVisibility.cluster).toBe(true);
+
+    act(() => tableMocks.options.onColumnVisibilityChange({ cluster: false }));
+    expect(tableMocks.options.state.columnVisibility.cluster).toBe(false);
+
+    act(() => {
+      tableMocks.options.onColumnVisibilityChange((previous: Record<string, boolean>) => ({
+        ...previous,
+        cluster: true,
+      }));
+    });
+    expect(tableMocks.options.state.columnVisibility.cluster).toBe(true);
+  });
+
+  it('uses updated caller visibility over initial visibility with a change callback', () => {
+    const onColumnVisibilityChange = vi.fn();
+    const props = {
+      columns: [{ accessorKey: 'selected', header: 'Selection' }],
+      data: [{ selected: false }],
+      initialState: { columnVisibility: { detail: true } },
+      onColumnVisibilityChange,
+    };
+    const { rerender } = renderTable({
+      ...props,
+      state: { columnVisibility: { detail: false } },
+    });
+    expect(tableMocks.options.state.columnVisibility.detail).toBe(false);
+
+    rerender(
+      <ThemeProvider theme={theme}>
+        <Table {...props} state={{ columnVisibility: { detail: true } }} />
+      </ThemeProvider>
+    );
+    expect(tableMocks.options.state.columnVisibility.detail).toBe(true);
+  });
+
+  it('treats caller visibility as the complete map with a change callback', () => {
+    const props = {
+      columns: [{ accessorKey: 'selected', header: 'Selection' }],
+      data: [{ selected: false }],
+      initialState: { columnVisibility: { detail: false } },
+      onColumnVisibilityChange: vi.fn(),
+    };
+    const { rerender } = renderTable({
+      ...props,
+      state: { columnVisibility: { detail: false } },
+    });
+    expect(tableMocks.options.state.columnVisibility).toEqual({ detail: false });
+
+    rerender(
+      <ThemeProvider theme={theme}>
+        <Table {...props} state={{ columnVisibility: {} }} />
+      </ThemeProvider>
+    );
+    expect(tableMocks.options.state.columnVisibility).toEqual({});
+
+    rerender(
+      <ThemeProvider theme={theme}>
+        <Table {...props} />
+      </ThemeProvider>
+    );
+    expect(tableMocks.options.state.columnVisibility).toEqual({ detail: false });
   });
 
   it('hides the top toolbar when disabled', () => {

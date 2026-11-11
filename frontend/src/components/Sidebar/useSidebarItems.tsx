@@ -20,7 +20,9 @@ import _ from 'lodash';
 import React, { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { getClusterAppearanceFromMeta } from '../../helpers/clusterAppearance';
+import { hasConfiguredClusterSources } from '../../helpers/clusterPresentation';
 import { isElectron } from '../../helpers/isElectron';
+import { useClusterPresentation } from '../../helpers/useClusterPresentation';
 import { useClustersConf, useSelectedClusters } from '../../lib/k8s';
 import CompositePodGroup from '../../lib/k8s/compositePodGroup';
 import CRD from '../../lib/k8s/crd';
@@ -30,6 +32,7 @@ import PodGroup from '../../lib/k8s/podGroup';
 import { useIsResourceServed } from '../../lib/k8s/resourceAvailability';
 import { createRouteURL } from '../../lib/router/createRouteURL';
 import { useTypedSelector } from '../../redux/hooks';
+import { selectEffectiveSettings } from '../../settings/useAdminSettings';
 import { DefaultSidebars, SidebarEntryProps, SidebarItemProps } from '.';
 import ClusterBadge from './ClusterBadge';
 
@@ -60,11 +63,13 @@ const sortSidebarItems = (items: SidebarItemProps[]): SidebarItemProps[] => {
 
 export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER) => {
   const clusters = useTypedSelector(state => state.config.clusters) ?? {};
-  const settings = useTypedSelector(state => state.config.settings);
+  const settings = useTypedSelector(selectEffectiveSettings);
   const customSidebarEntries = useTypedSelector(state => state.sidebar.entries);
   const customSidebarFilters = useTypedSelector(state => state.sidebar.filters);
   const customHomeSidebarFilters = useTypedSelector(state => state.sidebar.homeFilters);
-  const shouldShowHomeItem = isElectron() || Object.keys(clusters).length !== 1;
+  const { getLabel, sources } = useClusterPresentation();
+  const shouldShowHomeItem =
+    isElectron() || Object.keys(clusters).length !== 1 || hasConfiguredClusterSources(sources);
   const selectedClusters = useSelectedClusters();
   const allClustersConf = useClustersConf();
   const { t } = useTranslation();
@@ -177,7 +182,8 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
             return (
               <ClusterBadge
                 key={clusterName}
-                name={clusterName}
+                name={getLabel(clusterName).name}
+                secondary={getLabel(clusterName).secondary}
                 accentColor={
                   appearance.accentColor ||
                   theme.palette.getContrastText(theme.palette.text.primary)
@@ -664,6 +670,8 @@ export const useSidebarItems = (sidebarName: string = DefaultSidebars.IN_CLUSTER
     // eslint-disable-next-line react-hooks/exhaustive-deps
     selectedClusters.join(','),
     allClustersConf,
+    sources,
+    getLabel,
     crdsSidebarEntries,
     gatewayKinds,
     devicesEnabled,
