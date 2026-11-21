@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
-import { renderHook } from '@testing-library/react';
+import { renderHook, waitFor } from '@testing-library/react';
+import React from 'react';
+import { MemoryRouter } from 'react-router-dom';
 import { vi } from 'vitest';
 
 vi.mock('../cluster', () => ({
@@ -34,12 +36,13 @@ vi.mock('./api/v1/factories', () => ({
   apiFactory: vi.fn(),
   apiFactoryWithNamespace: vi.fn(),
 }));
-vi.mock('./api/v1/hooks', () => ({
-  useConnectApi: vi.fn(),
+vi.mock('./api/v1/hooks', async importOriginal => ({
+  ...(await importOriginal<typeof import('./api/v1/hooks')>()),
   useSelectedClusters: vi.fn(),
 }));
 vi.mock('./api/v2/discoveredConnectionRevisions', () => ({
   getDiscoveredConnectionRevision: vi.fn(),
+  useDiscoveredConnectionRevisions: vi.fn(),
 }));
 vi.mock('./api/v2/hooks', () => ({ useKubeObject: vi.fn() }));
 vi.mock('./api/v2/useKubeObjectList', () => ({
@@ -55,9 +58,12 @@ import { getCombinedAllowedNamespaces } from '../../helpers/clusterSettings';
 import { getCluster } from '../cluster';
 import { post } from './api/v1/clusterRequests';
 import { ApiClient, ApiWithNamespaceClient } from './api/v1/factories';
-import { useConnectApi, useSelectedClusters } from './api/v1/hooks';
+import { useSelectedClusters } from './api/v1/hooks';
 import { ScaleApi } from './api/v1/scaleApi';
-import { getDiscoveredConnectionRevision } from './api/v2/discoveredConnectionRevisions';
+import {
+  getDiscoveredConnectionRevision,
+  useDiscoveredConnectionRevisions,
+} from './api/v2/discoveredConnectionRevisions';
 import {
   getResourceDiscoveryConnection,
   recordDiscoveryConnection,
@@ -93,10 +99,13 @@ describe('KubeObject', () => {
       spec: { replicas: 1 },
     };
     let endpoint: ApiWithNamespaceClient<KubeObjectInterface>;
+    const wrapper = ({ children }: React.PropsWithChildren) =>
+      React.createElement(MemoryRouter, null, children);
 
     beforeEach(() => {
       vi.resetAllMocks();
       vi.mocked(getCluster).mockReturnValue('selected');
+      vi.mocked(useDiscoveredConnectionRevisions).mockReturnValue(new Map());
       endpoint = {
         isNamespaced: true,
         apiInfo: [
@@ -141,9 +150,7 @@ describe('KubeObject', () => {
     it('uses allowed namespaces when a namespaced list has no explicit namespace', async () => {
       vi.mocked(getCombinedAllowedNamespaces).mockReturnValue(['permitted']);
       vi.mocked(endpoint.list).mockResolvedValue(vi.fn());
-      renderHook(() => Widget.useApiList(vi.fn(), undefined, { cluster: 'selected' }));
-
-      await vi.mocked(useConnectApi).mock.calls[0][0]();
+      renderHook(() => Widget.useApiList(vi.fn(), undefined, { cluster: 'selected' }), { wrapper });
 
       expect(getCombinedAllowedNamespaces).toHaveBeenCalledWith('selected');
       expect(endpoint.list).toHaveBeenCalledWith(
@@ -159,40 +166,38 @@ describe('KubeObject', () => {
       const cancel = vi.fn();
       const onError = vi.fn();
       vi.mocked(endpoint.list).mockResolvedValue(cancel);
-      renderHook(() =>
-        Widget.useApiList(vi.fn(), onError, {
-          namespace: ['one', 'two'],
-          labelSelector: 'app=example',
-          fieldSelector: 'metadata.name=sample',
-          limit: 5,
-          cluster: 'east',
-        })
+      const { unmount } = renderHook(
+        () =>
+          Widget.useApiList(vi.fn(), onError, {
+            namespace: ['one', 'two'],
+            labelSelector: 'app=example',
+            fieldSelector: 'metadata.name=sample',
+            limit: 5,
+            cluster: 'east',
+          }),
+        { wrapper }
       );
-
-      for (const request of vi.mocked(useConnectApi).mock.calls[0]) {
-        const stop = await request();
-        stop();
-      }
-
       expect(getCombinedAllowedNamespaces).not.toHaveBeenCalled();
-      expect(cancel).toHaveBeenCalledTimes(2);
       for (const namespace of ['one', 'two']) {
         expect(endpoint.list).toHaveBeenCalledWith(
           namespace,
           expect.any(Function),
-          onError,
+          expect.any(Function),
           { labelSelector: 'app=example', fieldSelector: 'metadata.name=sample', limit: 5 },
           'east'
         );
       }
+      const error = new Error('List failed');
+      vi.mocked(endpoint.list).mock.calls[0][2]?.(error, cancel);
+      expect(onError).toHaveBeenCalledWith(error, cancel);
+      unmount();
+      await waitFor(() => expect(cancel).toHaveBeenCalledTimes(2));
     });
 
     it('uses an all-namespace request when no cluster or restriction is selected', async () => {
       vi.mocked(getCluster).mockReturnValue(null);
       vi.mocked(endpoint.list).mockResolvedValue(vi.fn());
-      renderHook(() => Widget.useApiList(vi.fn()));
-
-      await vi.mocked(useConnectApi).mock.calls[0][0]();
+      renderHook(() => Widget.useApiList(vi.fn()), { wrapper });
 
       expect(endpoint.list).toHaveBeenCalledWith(
         '',
@@ -249,18 +254,77 @@ describe('KubeObject', () => {
         return cancel;
       });
       const onGet = vi.fn();
-      renderHook(() => Widget.useApiGet(onGet, 'sample', 'apps', onError, { cluster: 'east' }));
-
-      expect(await vi.mocked(useConnectApi).mock.calls[0][0]()).toBe(cancel);
+      const { unmount } = renderHook(
+        () => Widget.useApiGet(onGet, 'sample', 'apps', onError, { cluster: 'east' }),
+        { wrapper }
+      );
       expect(endpoint.get).toHaveBeenCalledWith(
         'apps',
         'sample',
         expect.any(Function),
-        onError,
+        expect.any(Function),
         undefined,
         'east'
       );
       expect(onGet).toHaveBeenCalledWith(expect.objectContaining({ jsonData: data }));
+      const error = new Error('Get failed');
+      vi.mocked(endpoint.get).mock.calls[0][3]?.(error, cancel);
+      expect(onError).toHaveBeenCalledWith(error, cancel);
+      unmount();
+      await waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+    });
+
+    it('clears and restarts legacy reads when their explicit cluster is replaced', async () => {
+      const select = (revision: string) => {
+        vi.mocked(getDiscoveredConnectionRevision).mockImplementation(cluster =>
+          cluster === 'east' ? revision : undefined
+        );
+        vi.mocked(useDiscoveredConnectionRevisions).mockReturnValue(new Map([['east', revision]]));
+      };
+      const cancel = vi.fn();
+      const onError = vi.fn();
+      vi.mocked(endpoint.list).mockResolvedValue(cancel);
+      vi.mocked(endpoint.get).mockResolvedValue(cancel);
+      const onGet = vi.fn();
+      const onList = vi.fn();
+      select('original:1');
+      const options = { cluster: 'east' };
+      const { rerender } = renderHook(
+        () => {
+          Widget.useApiGet(onGet, 'sample', 'apps', onError, options);
+          Widget.useApiList(onList, onError, { ...options, namespace: ['one', 'two'] });
+        },
+        { wrapper }
+      );
+      const getCalls = vi.mocked(endpoint.get).mock.calls;
+      const listCalls = vi.mocked(endpoint.list).mock.calls;
+      getCalls[0][2](data);
+      const sendList = (index: number, items: KubeObjectInterface[]) => {
+        (listCalls[index][1] as unknown as (items: KubeObjectInterface[]) => void)(items);
+      };
+      sendList(0, [data]);
+      sendList(1, [data]);
+      expect(onList.mock.lastCall?.[0]).toHaveLength(2);
+
+      select('replacement:2');
+      rerender();
+      expect(onList.mock.lastCall?.[0]).toEqual([]);
+      expect(onGet.mock.lastCall?.[0]).toBeNull();
+      expect(getCalls[1][4]).toEqual({ __headlamp_connection_revision: 'replacement' });
+      expect(listCalls[2][3]).toEqual({ __headlamp_connection_revision: 'replacement' });
+      expect(listCalls[3][3]).toEqual({ __headlamp_connection_revision: 'replacement' });
+
+      getCalls[0][2](data);
+      getCalls[0][3]?.(new Error('Old GET failed'), cancel);
+      sendList(1, [data]);
+      expect(onList.mock.lastCall?.[0]).toEqual([]);
+      expect(onGet.mock.lastCall?.[0]).toBeNull();
+      expect(onError).not.toHaveBeenCalled();
+      getCalls[1][2](data);
+      sendList(2, [data]);
+      expect(onGet.mock.lastCall?.[0]).toBeInstanceOf(Widget);
+      expect(onList.mock.lastCall?.[0]).toHaveLength(1);
+      await waitFor(() => expect(cancel).toHaveBeenCalledTimes(3));
     });
 
     it('keeps the connection selected when an implicit GET starts', async () => {
