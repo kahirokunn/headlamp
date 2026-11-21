@@ -18,6 +18,7 @@ import Button from '@mui/material/Button';
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import React from 'react';
 import { prepareApply } from '../../../lib/k8s/api/v1/apply';
+import { recordDiscoveryConnection } from '../../../lib/k8s/api/v2/discoveryConnection';
 import store from '../../../redux/stores/store';
 import { TestContext } from '../../../test';
 import { ActivitiesRenderer, Activity } from '../../activity/Activity';
@@ -847,6 +848,55 @@ describe('EditorDialog', () => {
     );
     expect(onClose).toHaveBeenCalled();
   });
+
+  it.each([/dry run/i, /save & apply/i])(
+    'uses the editing connection for %s until Undo accepts the new baseline',
+    async actionName => {
+      const initialItem = {
+        apiVersion: 'v1',
+        kind: 'ConfigMap',
+        metadata: { name: 'settings', resourceVersion: '1' },
+        data: { key: 'original' },
+      };
+      const replacementItem = { ...initialItem, data: { key: 'replacement' } };
+      recordDiscoveryConnection(initialItem, 'discovered', 'original:1');
+      recordDiscoveryConnection(replacementItem, 'discovered', 'replacement:2');
+      const onBaselineAccepted = vi.fn();
+      const content = (item: typeof initialItem) => (
+        <TestContext>
+          <EditorDialog
+            open
+            keepMounted
+            noDialog
+            item={item}
+            onClose={vi.fn()}
+            onBaselineAccepted={onBaselineAccepted}
+          />
+        </TestContext>
+      );
+      const { rerender } = render(content(initialItem));
+      const edit = () => {
+        fireEvent.change(screen.getByRole('textbox', { name: /code/i }), {
+          target: { value: 'valid yaml' },
+        });
+        act(() => vi.advanceTimersByTime(500));
+      };
+
+      edit();
+      rerender(content(replacementItem));
+      expect(screen.getByRole('textbox', { name: /code/i })).toHaveValue('valid yaml');
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: actionName }));
+      expect(vi.mocked(prepareApply).mock.lastCall?.[0]).toBe('discovered');
+      expect(vi.mocked(prepareApply).mock.lastCall?.[1]).toBe(initialItem);
+
+      fireEvent.click(screen.getByRole('button', { name: /undo/i }));
+      expect(onBaselineAccepted).toHaveBeenCalledWith(replacementItem);
+      edit();
+      fireEvent.click(screen.getByRole('button', { name: actionName }));
+      expect(vi.mocked(prepareApply).mock.lastCall?.[1]).toBe(replacementItem);
+    }
+  );
 
   it('uses fallback resource labels and an empty cluster for dry runs', async () => {
     mockLoadAll.mockReturnValueOnce([

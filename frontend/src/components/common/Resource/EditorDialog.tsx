@@ -34,6 +34,7 @@ import { useTranslation } from 'react-i18next';
 import { useDispatch } from 'react-redux';
 import { getCluster } from '../../../lib/cluster';
 import { ApplyOptions, prepareApply } from '../../../lib/k8s/api/v1/apply';
+import { getResourceDiscoveryConnection } from '../../../lib/k8s/api/v2/discoveryConnection';
 import { KubeObjectInterface } from '../../../lib/k8s/KubeObject';
 import { useId } from '../../../lib/util';
 import { clusterAction } from '../../../redux/clusterActionSlice';
@@ -128,6 +129,7 @@ export default function EditorDialog(props: EditorDialogProps) {
   };
   const initialCode = typeof item === 'string' ? item : yaml.dump(item || {});
   const originalCodeRef = React.useRef({ code: initialCode, format: item ? 'yaml' : '' });
+  const applySourceRef = React.useRef(item && typeof item === 'object' ? item : undefined);
   const [code, setCode] = React.useState(originalCodeRef.current);
   const codeRef = React.useRef(code);
   const lastCodeCheckHandler = React.useRef(0);
@@ -137,7 +139,10 @@ export default function EditorDialog(props: EditorDialogProps) {
   // The server object `originalCodeRef` was last rebased onto, so Undo can hand the
   // same version to the save-baseline owner (see `onBaselineAccepted`). Only Undo
   // consumes this — plain edits never rebase the save baseline while they're unsaved.
-  const pendingBaselineItemRef = React.useRef<KubeObjectInterface | null>(null);
+  const pendingBaselineRef = React.useRef<{
+    item: KubeObjectInterface;
+    source: object;
+  } | null>(null);
   const [error, setError] = React.useState('');
   const [resourceModifiedWarning, setResourceModifiedWarning] = React.useState(false);
   const [docSpecs, setDocSpecs] = React.useState<
@@ -205,10 +210,13 @@ export default function EditorDialog(props: EditorDialogProps) {
 
   // Update the code when the item changes, but only if the code hasn't been touched.
   React.useEffect(() => {
+    const source = item && typeof item === 'object' ? item : undefined;
     const clonedItem = _.cloneDeep(item);
     if (!item || Object.keys(item || {}).length === 0) {
       const defaultCode = '# Enter your YAML or JSON here';
       originalCodeRef.current = { code: defaultCode, format: 'yaml' };
+      applySourceRef.current = source;
+      pendingBaselineRef.current = null;
       setCode({ code: defaultCode, format: 'yaml' });
       return;
     }
@@ -228,25 +236,37 @@ export default function EditorDialog(props: EditorDialogProps) {
     if (isKubeObjectIsh(item) && item.metadata) {
       const newVersion = item.metadata!.resourceVersion || '';
       const resourceVersionsDiffer = (previousVersionRef.current || '') !== newVersion;
+      const currentSource = applySourceRef.current;
+      const currentConnection = currentSource && getResourceDiscoveryConnection(currentSource);
+      const incomingConnection = getResourceDiscoveryConnection(item);
+      const connectionChanged =
+        currentConnection?.cluster !== incomingConnection?.cluster ||
+        currentConnection?.revision !== incomingConnection?.revision;
+      const hasPendingBaseline = !!pendingBaselineRef.current;
       // We use the codeRef in this effect instead of the code, because we need to access
       // the current state of the code but we don't want to trigger a re-render here.
       const userHasEdits = codeRef.current.code !== originalCodeRef.current.code;
 
-      if (resourceVersionsDiffer && userHasEdits && !treatItemChangesAsEdits && onSave !== null) {
+      if (
+        (resourceVersionsDiffer || connectionChanged || hasPendingBaseline) &&
+        (userHasEdits || (connectionChanged && hasPendingBaseline)) &&
+        !treatItemChangesAsEdits &&
+        onSave !== null
+      ) {
         // Resource was externally modified (server-side) while the user has unsaved edits —
         // warn them and return early to preserve their work. Skipped when treatItemChangesAsEdits
         // is true because in that mode item changes come from the user's own form, not the server.
         // Update the baseline so "Undo Changes" restores to the latest server
         // version rather than the stale version the editor was opened with.
         originalCodeRef.current = { code: itemCode, format };
-        pendingBaselineItemRef.current = clonedItem as KubeObjectInterface;
+        pendingBaselineRef.current = { item: clonedItem as KubeObjectInterface, source: item };
         if (newVersion !== '') {
           previousVersionRef.current = newVersion;
         }
         // The server's change may coincidentally match what the user already has in the
         // editor (e.g. once rebased onto the baseline above) — only warn and preserve the
         // early return when there is still a real difference from the latest version.
-        if (codeRef.current.code !== itemCode) {
+        if (connectionChanged || codeRef.current.code !== itemCode) {
           setResourceModifiedWarning(true);
           return;
         }
@@ -259,6 +279,8 @@ export default function EditorDialog(props: EditorDialogProps) {
       // stuck on screen.
       setResourceModifiedWarning(false);
     }
+
+    if (!treatItemChangesAsEdits) applySourceRef.current = source;
 
     // Update the code if the item representation has changed.
     // When treatItemChangesAsEdits is true, originalCodeRef is intentionally
@@ -494,9 +516,10 @@ export default function EditorDialog(props: EditorDialogProps) {
     // The user is discarding their edits in favour of whatever server version
     // originalCodeRef was last rebased onto — let the save-baseline owner rebase too,
     // so a subsequent edit + save diffs against this version rather than the stale one.
-    if (pendingBaselineItemRef.current) {
-      onBaselineAccepted?.(pendingBaselineItemRef.current);
-      pendingBaselineItemRef.current = null;
+    if (pendingBaselineRef.current) {
+      applySourceRef.current = pendingBaselineRef.current.source;
+      onBaselineAccepted?.(pendingBaselineRef.current.item);
+      pendingBaselineRef.current = null;
     }
   }
 
@@ -555,13 +578,16 @@ export default function EditorDialog(props: EditorDialogProps) {
     }
 
     const newItemDefs = obj!;
-    const source = item && typeof item === 'object' ? item : undefined;
+    const source =
+      treatItemChangesAsEdits && item && typeof item === 'object' ? item : applySourceRef.current;
+    const sourceCluster = source && getResourceDiscoveryConnection(source)?.cluster;
+    const clusterName =
+      cluster || sourceCluster || (source as KubeObjectIsh)?.cluster || getCluster() || '';
 
     if (mode === 'dryRun') {
       const resourceNames = newItemDefs.map(
         newItemDef => newItemDef.metadata?.name || newItemDef.kind || t('translation|resource')
       );
-      const clusterName = cluster || (item as KubeObjectIsh)?.cluster || getCluster() || '';
       const applyToCluster = prepareApply(clusterName, source);
 
       setError('');
@@ -588,7 +614,6 @@ export default function EditorDialog(props: EditorDialogProps) {
       const resourceNames = newItemDefs.map(
         newItemDef => newItemDef.metadata?.name || newItemDef.kind || t('translation|resource')
       );
-      const clusterName = cluster || (item as KubeObjectIsh)?.cluster || getCluster() || '';
       const applyToCluster = prepareApply(clusterName, source);
 
       setError('');
@@ -866,7 +891,7 @@ export default function EditorDialog(props: EditorDialogProps) {
       <DialogActions>
         {!isReadOnly() && (
           <ConfirmButton
-            disabled={originalCodeRef.current.code === code.code}
+            disabled={originalCodeRef.current.code === code.code && !resourceModifiedWarning}
             color="secondary"
             variant="contained"
             aria-label={t('translation|Undo')}
