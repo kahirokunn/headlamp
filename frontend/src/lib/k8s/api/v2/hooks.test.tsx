@@ -747,6 +747,7 @@ describe('useKubeObject watch wiring', () => {
       expect(new URL(resumed.url).searchParams.has('resourceVersion')).toBe(false);
 
       await waitFor(() => expect(result.current.error?.status).toBe(503));
+      expect(result.current.data?.metadata.resourceVersion).toBe('1');
       expect(mockUseWebSockets.mock.lastCall?.[0].enabled).toBe(true);
       await waitFor(() => expect(result.current.error?.status).toBe(404), { timeout: 4000 });
       expect(mockUseWebSockets.mock.lastCall?.[0].enabled).toBe(false);
@@ -756,6 +757,26 @@ describe('useKubeObject watch wiring', () => {
       cleanup();
     }
   }, 10000);
+
+  it('hides cached data after a reconnect reports a replaced connection', async () => {
+    mockClusterFetch
+      .mockResolvedValueOnce(mockJsonResponse(pod('1')))
+      .mockRejectedValueOnce(
+        new ApiError('Discovered cluster connection changed', { status: 409 })
+      );
+    const { result, server, cleanup } = await renderDiscoveredPodWatch();
+
+    try {
+      const socket = await server.connected;
+      await waitFor(() => expect(result.current.data?.metadata.resourceVersion).toBe('1'));
+      socket.close();
+      await waitFor(() => expect(result.current.error?.status).toBe(409), { timeout: 4000 });
+      expect(result.current.data).toBeNull();
+      expect(mockUseWebSockets.mock.lastCall?.[0].enabled).toBe(false);
+    } finally {
+      cleanup();
+    }
+  }, 6500);
 
   it.each([false, true])(
     'hides an unverified object while reconnecting (watch authorized: %s)',

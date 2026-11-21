@@ -25,7 +25,11 @@ import {
   useDiscoveredConnectionRevisions,
   withDiscoveryConnectionRevision,
 } from './discoveredConnectionRevisions';
-import { getResourceDiscoveryConnection, recordDiscoveryConnection } from './discoveryConnection';
+import {
+  getResourceDiscoveryConnection,
+  isDiscoveryConnectionChanged,
+  recordDiscoveryConnection,
+} from './discoveryConnection';
 import { clusterFetch } from './fetch';
 import type { KubeListUpdateEvent } from './KubeList';
 import { KubeObjectEndpoint } from './KubeObjectEndpoint';
@@ -40,6 +44,10 @@ const OBJECT_WATCH_RETRY_INTERVAL_MS = 3000;
 
 function isTerminalWatchStatus(status?: number) {
   return status === 401 || status === 403 || status === 404;
+}
+
+function isObjectUnavailable(error?: ApiError | null) {
+  return isTerminalWatchStatus(error?.status) || isDiscoveryConnectionChanged(error);
 }
 
 // A name-filtered watch can be authorized independently of GET and LIST.
@@ -224,7 +232,7 @@ export function useKubeObject<K extends KubeObject>({
       !multiplexerEnabled &&
       state.data !== undefined &&
       state.error &&
-      !isTerminalWatchStatus(state.error.status)
+      !isObjectUnavailable(state.error)
         ? OBJECT_WATCH_RETRY_INTERVAL_MS
         : false,
     queryKey,
@@ -296,8 +304,9 @@ export function useKubeObject<K extends KubeObject>({
     setSeededInitialData(currentSeed);
   }, [client, endpoint, currentSeed, queryKey, cluster, connectionRevision]);
 
-  const queryData: Instance | null = query.error ? null : query.data ?? null;
-  const data = currentSeed && seededInitialData !== currentSeed ? currentSeed : queryData;
+  const data = isObjectUnavailable(query.error)
+    ? null
+    : (currentSeed && seededInitialData !== currentSeed ? currentSeed : query.data) ?? null;
 
   const cacheWatchedObject = useCallback(
     (object: KubeObjectInterface, watchOnly = false) => {
@@ -392,7 +401,7 @@ export function useKubeObject<K extends KubeObject>({
         onClose() {
           const resource = cacheEntry?.state.data;
           if (!cacheEntry || !resource || !watchOnlyObjects.delete(resource)) return;
-          if (cacheEntry.state.error) return;
+          if (isObjectUnavailable(cacheEntry.state.error)) return;
           cacheEntry.setState({
             error: new ObjectWatchRequired(
               new ApiError('Unable to verify the resource', { cluster, namespace })
@@ -406,12 +415,14 @@ export function useKubeObject<K extends KubeObject>({
             const status = update.object?.code;
             if (status === 410) {
               refreshing = refreshObject(update);
-            } else if (isTerminalWatchStatus(status)) {
-              void client.cancelQueries({ queryKey, exact: true });
+            } else {
               const error = new ApiError(update.object?.message ?? 'The resource watch stopped', {
                 status,
               });
-              cacheEntry?.setState({ error, errorUpdatedAt: Date.now(), status: 'error' });
+              if (isObjectUnavailable(error)) {
+                void client.cancelQueries({ queryKey, exact: true });
+                cacheEntry?.setState({ error, errorUpdatedAt: Date.now(), status: 'error' });
+              }
             }
             return;
           }
@@ -463,7 +474,7 @@ export function useKubeObject<K extends KubeObject>({
       !!endpoint &&
       (query.error instanceof ObjectWatchRequired ||
         ((!!data || client.getQueryState(queryKey)?.data !== undefined) &&
-          !isTerminalWatchStatus(query.error?.status))),
+          !isObjectUnavailable(query.error))),
     connections: connectionsRequests,
   });
 
