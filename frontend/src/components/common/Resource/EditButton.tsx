@@ -254,11 +254,7 @@ export default function EditButton(props: EditButtonProps) {
     return null;
   }
 
-  if (isReadOnly) {
-    return <ViewButton item={item} />;
-  }
-
-  return (
+  const editButton = (
     <AuthVisible
       item={item}
       authVerb="update"
@@ -336,5 +332,12 @@ export default function EditButton(props: EditButtonProps) {
         icon="mdi:pencil"
       />
     </AuthVisible>
+  );
+
+  return (
+    <>
+      {editButton}
+      {isReadOnly && <ViewButton item={item} />}
+    </>
   );
 }
