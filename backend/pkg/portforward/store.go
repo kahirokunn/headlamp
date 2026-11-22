@@ -21,8 +21,10 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/logger"
 )
 
@@ -42,16 +44,20 @@ func storeKeyClusterPrefix(clusterKey string) string {
 	return storeKeyPrefix + url.QueryEscape(clusterKey) + storeKeySeparator
 }
 
+type forwardConnection struct {
+	cache           cache.Cache[interface{}]
+	contextStoreKey string
+}
+
+var (
+	forwardStoreMu     sync.Mutex
+	connectionForwards = make(map[forwardConnection]map[string]portForward)
+)
+
 // portforwardKeyGenerator generates a unique key
 // based on the cluster name, id,service name, and pod name.
 func portforwardKeyGenerator(p portForward) string {
-	clusterKey := p.cacheKey
-	if clusterKey == "" {
-		// Fallback for entries created before the cacheKey field existed
-		// (cacheKey unset), where the cache key was derived from Cluster.
-		clusterKey = p.Cluster
-	}
-
+	clusterKey := p.contextKey()
 	if p.ID != "" {
 		return storeKeyClusterPrefix(clusterKey) + p.ID
 	}
@@ -67,14 +73,153 @@ func portforwardKeyGenerator(p portForward) string {
 	return key
 }
 
+func (p portForward) contextKey() string {
+	if p.cacheKey != "" {
+		return p.cacheKey
+	}
+
+	return p.Cluster
+}
+
 // portforwardstore stores a port forward in the cache.
-func portforwardstore(cache cache.Cache[interface{}], p portForward) {
+func portforwardstore(forwardCache cache.Cache[interface{}], p portForward) {
+	storeForwardSnapshot(forwardCache, p, false)
+}
+
+func storeForwardSnapshot(forwardCache cache.Cache[interface{}], p portForward, starting bool) bool {
+	forwardStoreMu.Lock()
+	defer forwardStoreMu.Unlock()
+
+	if session := p.session; session != nil {
+		if session.removed || (session.Err() != nil && p.Status != STOPPED) {
+			return false
+		}
+
+		if session.connectionCurrent != nil && !session.connectionCurrent() {
+			session.cancel()
+			return false
+		}
+	}
+
 	key := portforwardKeyGenerator(p)
 
-	err := cache.Set(context.Background(), key, p)
+	current, getErr := forwardCache.Get(context.Background(), key)
+
+	saved, exists := current.(portForward)
+	if p.session != nil && !starting && (getErr != nil || !exists || saved.session != p.session) {
+		return false
+	}
+
+	if getErr == nil && exists && saved.session != p.session && (!starting || saved.Status != STOPPED) {
+		return false
+	}
+
+	err := forwardCache.Set(context.Background(), key, p)
 	if err != nil {
 		logger.Log(logger.LevelError, nil, err, "storing portforward")
+		return false
 	}
+
+	if p.session == nil || p.session.connectionCurrent == nil {
+		untrackConnectionForward(forwardCache, key, p.session)
+		return true
+	}
+
+	group := forwardConnection{forwardCache, p.session.contextStoreKey}
+	if connectionForwards[group] == nil {
+		connectionForwards[group] = make(map[string]portForward)
+	}
+
+	connectionForwards[group][key] = p
+
+	return true
+}
+
+func untrackConnectionForward(forwardCache cache.Cache[interface{}], key string, session *forwardSession) {
+	if session == nil {
+		return
+	}
+
+	group := forwardConnection{forwardCache, session.contextStoreKey}
+	if forward := connectionForwards[group][key]; forward.session == session {
+		delete(connectionForwards[group], key)
+
+		if len(connectionForwards[group]) == 0 {
+			delete(connectionForwards, group)
+		}
+	}
+}
+
+func connectionForwardsSnapshot(group forwardConnection) []portForward {
+	forwardStoreMu.Lock()
+	defer forwardStoreMu.Unlock()
+
+	forwards := make([]portForward, 0, len(connectionForwards[group]))
+	for _, forward := range connectionForwards[group] {
+		forwards = append(forwards, forward)
+	}
+
+	return forwards
+}
+
+// Publish the session before the listener starts so a concurrent removal
+// can cancel both a running and a starting forward.
+func publishStartingForward(forwardCache cache.Cache[interface{}], forward *portForward) bool {
+	snapshot := *forward
+
+	snapshot.Status = RECONNECTING
+	if !storeForwardSnapshot(forwardCache, snapshot, true) {
+		return false
+	}
+
+	if forward.session.connectionCurrent == nil || forward.session.connectionCurrent() {
+		return true
+	}
+
+	_ = deleteForward(forwardCache, snapshot)
+
+	return false
+}
+
+// WatchConnections closes forwarders whose selected connection is no longer present.
+func WatchConnections(store kubeconfig.ContextStore, forwardCache cache.Cache[interface{}]) {
+	store.AddContextKeyListener(func(key string) {
+		for _, forward := range connectionForwardsSnapshot(forwardConnection{forwardCache, key}) {
+			if !forward.session.connectionCurrent() {
+				_ = deleteForward(forwardCache, forward)
+			}
+		}
+	})
+}
+
+func stopForward(forward portForward) {
+	if forward.session != nil {
+		forward.session.cancel()
+	}
+
+	safeCloseChan(forward.closeChan)
+}
+
+func deleteForward(forwardCache cache.Cache[interface{}], forward portForward) error {
+	forwardStoreMu.Lock()
+	defer forwardStoreMu.Unlock()
+
+	if session := forward.session; session != nil {
+		session.removed = true
+	}
+
+	stopForward(forward)
+
+	key := portforwardKeyGenerator(forward)
+	untrackConnectionForward(forwardCache, key, forward.session)
+
+	if current, err := forwardCache.Get(context.Background(), key); err == nil {
+		if entry, ok := current.(portForward); ok && entry.session != forward.session {
+			return nil
+		}
+	}
+
+	return forwardCache.Delete(context.Background(), key)
 }
 
 // stopOrDeletePortForward stops or deletes a port forward by its cluster and id.
@@ -84,29 +229,19 @@ func portforwardstore(cache cache.Cache[interface{}], p portForward) {
 func stopOrDeletePortForward(cache cache.Cache[interface{}], cluster string, id string, isStopRequest bool) error {
 	portforward, err := getPortForwardByID(cache, cluster, id)
 	if err != nil {
-		//nolint:goconst // Repeated log message keys are clearer inline than as package constants
 		logger.Log(logger.LevelError, map[string]string{"cluster": cluster, "id": id},
 			err, "getting portforward")
 
 		return err
 	}
 
-	// Always signal the portforward to stop, whether it's a stop or delete request.
-	// This prevents orphaned goroutines and leaked ports.
-	safeCloseChan(portforward.closeChan)
-
-	if isStopRequest {
-		portforward.Status = STOPPED
-		portforwardstore(cache, portforward)
-	} else {
-		err := cache.Delete(context.Background(), portforwardKeyGenerator(portforward))
-		if err != nil {
-			logger.Log(logger.LevelError, map[string]string{"cluster": cluster, "id": id},
-				err, "deleting portforward")
-
-			return err
-		}
+	if !isStopRequest {
+		return deleteForward(cache, portforward)
 	}
+
+	stopForward(portforward)
+	portforward.Status = STOPPED
+	portforwardstore(cache, portforward)
 
 	return nil
 }
@@ -124,8 +259,11 @@ func getPortForwardList(cache cache.Cache[interface{}], cluster string) []portFo
 	}
 
 	portForwards := []portForward{}
+
 	for _, v := range portforwards {
-		portForwards = append(portForwards, v.(portForward))
+		if forward, ok := v.(portForward); ok && forward.contextKey() == cluster {
+			portForwards = append(portForwards, forward)
+		}
 	}
 
 	return portForwards

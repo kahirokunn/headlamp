@@ -175,7 +175,7 @@ func TestMonitorPodAndManagePortForwardCloseChan(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		monitorPodAndManagePortForward(cs, cache.New[interface{}](), pf)
+		monitorPodAndManagePortForward(cs, cache.New[interface{}](), pf, nil)
 		close(done)
 	}()
 
@@ -364,7 +364,7 @@ func TestStoredPortForwardReconnect(t *testing.T) {
 				`[{"endpoints":[{"conditions":{"ready":true},"targetRef":{"kind":"Pod","name":"pod-1","namespace":"ns-1"}}]}]}`
 			_, _ = w.Write([]byte(body))
 		})
-		podName, podNS, err := resolveServicePod(csReady, "default", "svc1")
+		podName, podNS, err := resolveServicePod(t.Context(), csReady, "default", "svc1")
 		require.NoError(t, err)
 		assert.Equal(t, "pod-1", podName)
 		assert.Equal(t, "ns-1", podNS)
@@ -378,13 +378,13 @@ func TestStartPortForwardAndRequestHandlerErrors(t *testing.T) {
 			KubeContext: &api.Context{Cluster: "c1", AuthInfo: "u1"},
 			Cluster:     &api.Cluster{Server: ""},
 		}
-		err := startPortForward(kCtx, cache.New[interface{}](), portForwardRequest{
+		err := startPortForward(t.Context(), kCtx, cache.New[interface{}](), portForwardRequest{
 			ID:         "pf1",
 			Namespace:  "default",
 			Pod:        "pod1",
 			Port:       "8080",
 			TargetPort: "80",
-		}, "", "c1", "c1")
+		}, "", "c1", "c1", nil, nil)
 		require.Error(t, err)
 	})
 
@@ -422,7 +422,7 @@ func TestStartPortForwardForOwnerErrors(t *testing.T) {
 			"/portforward",
 			bytes.NewBufferString(body),
 		)
-		startPortForwardForOwner(kCtx, cache.New[interface{}](), false, "c1", "c1", recDup, reqDup)
+		startPortForwardForOwner(kCtx, cache.New[interface{}](), false, "c1", "c1", nil, nil, recDup, reqDup)
 		assert.Equal(t, http.StatusConflict, recDup.Code)
 		inFlightPortForwards.Delete("c1\x00dup-id")
 
@@ -433,7 +433,7 @@ func TestStartPortForwardForOwnerErrors(t *testing.T) {
 			"/portforward",
 			bytes.NewBufferString(body),
 		)
-		startPortForwardForOwner(kCtx, cache.New[interface{}](), false, "c1", "c1", recRBAC, reqRBAC)
+		startPortForwardForOwner(kCtx, cache.New[interface{}](), false, "c1", "c1", nil, nil, recRBAC, reqRBAC)
 		assert.Equal(t, http.StatusInternalServerError, recRBAC.Code)
 
 		recUnauth := httptest.NewRecorder()
@@ -444,7 +444,7 @@ func TestStartPortForwardForOwnerErrors(t *testing.T) {
 			bytes.NewBufferString(body),
 		)
 		reqUnauth.Header.Set("Authorization", "Bearer ")
-		startPortForwardForOwner(kCtx, cache.New[interface{}](), false, "c1", "c1", recUnauth, reqUnauth)
+		startPortForwardForOwner(kCtx, cache.New[interface{}](), false, "c1", "c1", nil, nil, recUnauth, reqUnauth)
 		assert.Equal(t, http.StatusUnauthorized, recUnauth.Code)
 	})
 }

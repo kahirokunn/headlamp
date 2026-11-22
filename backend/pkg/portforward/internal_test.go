@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -206,7 +207,206 @@ func TestStopOrDeletePortForward(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestGetPortForwardList tests getPortForwardList function.
+type forwardCacheWithoutScan struct {
+	cache.Cache[interface{}]
+	scans int
+}
+
+func (c *forwardCacheWithoutScan) GetAll(ctx context.Context, filter cache.Matcher) (map[string]interface{}, error) {
+	c.scans++
+
+	return c.Cache.GetAll(ctx, filter)
+}
+
+func TestCanceledStartAfterReadinessReleasesForwardID(t *testing.T) {
+	forwardCache := cache.New[interface{}]()
+	session, err := newForwardSession(nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(session.cancel)
+
+	forward := portForward{ID: "retry", Cluster: "workload", session: session}
+	require.True(t, publishStartingForward(forwardCache, &forward))
+	handlePortForwardSuccess(forwardCache, &forward, nil)
+
+	request, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	var listenerConfig net.ListenConfig
+
+	listener, err := listenerConfig.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	worker, finished := context.WithCancel(t.Context())
+	defer finished()
+
+	result := make(chan error, 1)
+	go func() {
+		result <- session.finishStartup(request, forwardCache, &forward, worker, nil)
+	}()
+
+	<-session.Done()
+
+	cached, err := getPortForwardByID(forwardCache, forward.Cluster, forward.ID)
+	require.NoError(t, err)
+	assert.Equal(t, RUNNING, cached.Status)
+
+	select {
+	case <-result:
+		t.Fatal("canceled start returned while its local port was still bound")
+	default:
+	}
+
+	require.NoError(t, listener.Close())
+	finished()
+	require.ErrorIs(t, <-result, context.Canceled)
+	replacement, err := listenerConfig.Listen(t.Context(), "tcp", listener.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = replacement.Close() })
+
+	cached, err = getPortForwardByID(forwardCache, forward.Cluster, forward.ID)
+	require.NoError(t, err)
+	require.Equal(t, STOPPED, cached.Status)
+
+	retry, err := newForwardSession(nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(retry.cancel)
+
+	restarted := portForward{ID: forward.ID, Cluster: forward.Cluster, session: retry}
+	require.True(t, publishStartingForward(forwardCache, &restarted))
+}
+
+func TestDelayedStopDoesNotOverwriteRestartedForward(t *testing.T) {
+	forwardCache := cache.New[interface{}]()
+	first, err := newForwardSession(nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(first.cancel)
+
+	second, err := newForwardSession(nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(second.cancel)
+
+	original := portForward{ID: "same-id", Cluster: "workload", session: first, Status: RUNNING}
+	require.True(t, publishStartingForward(forwardCache, &original))
+	portforwardstore(forwardCache, original)
+	require.NoError(t, stopOrDeletePortForward(forwardCache, original.Cluster, original.ID, true))
+
+	restarted := original
+	restarted.session = second
+	require.True(t, publishStartingForward(forwardCache, &restarted))
+	portforwardstore(forwardCache, restarted)
+
+	original.Status = RECONNECTING
+	portforwardstore(forwardCache, original)
+	original.Status = STOPPED
+	portforwardstore(forwardCache, original)
+
+	current, err := getPortForwardByID(forwardCache, restarted.Cluster, restarted.ID)
+	require.NoError(t, err)
+	require.Equal(t, RUNNING, current.Status)
+	require.Same(t, second, current.session)
+	require.NoError(t, second.Err())
+	require.NoError(t, deleteForward(forwardCache, restarted))
+	portforwardstore(forwardCache, original)
+	_, err = getPortForwardByID(forwardCache, original.Cluster, original.ID)
+	require.Error(t, err)
+}
+
+func TestConnectionChangeClosesAndRemovesTheOldForward(t *testing.T) {
+	for _, remove := range []bool{false, true} {
+		t.Run(fmt.Sprintf("remove=%t", remove), func(t *testing.T) {
+			store := kubeconfig.NewContextStore()
+			forwardCache := &forwardCacheWithoutScan{Cache: cache.New[interface{}]()}
+			WatchConnections(store, forwardCache)
+
+			const cluster, revision = "workload", "original"
+
+			original := &kubeconfig.Context{
+				Name: cluster, Discovery: &kubeconfig.DiscoveryOrigin{ConnectionRevision: revision},
+			}
+			require.NoError(t, store.AddContext(original))
+
+			ctx, cancel := context.WithCancel(t.Context())
+			t.Cleanup(cancel)
+
+			checks := 0
+			forward := portForward{
+				Cluster: cluster, ID: "forward", ConnectionRevision: revision,
+				cacheKey: ConnectionCacheKey(cluster, original), Status: RUNNING,
+				closeChan: make(chan struct{}),
+				session: &forwardSession{Context: ctx, cancel: cancel, contextStoreKey: cluster, connectionCurrent: func() bool {
+					checks++
+					current, err := store.GetContext(cluster)
+
+					return err == nil && current.RoutingRevision() == revision
+				}},
+			}
+			require.True(t, publishStartingForward(forwardCache, &forward))
+			portforwardstore(forwardCache, forward)
+
+			before := checks
+
+			require.NoError(t, store.AddContext(&kubeconfig.Context{Name: "unrelated"}))
+			require.Equal(t, before, checks)
+
+			require.NoError(t, store.AddContext(original.Copy()))
+			require.NoError(t, ctx.Err())
+
+			if remove {
+				require.NoError(t, store.RemoveContext(cluster))
+			} else {
+				replacement := original.Copy()
+				replacement.Discovery.ConnectionRevision = "replacement"
+				require.NoError(t, store.AddContext(replacement))
+			}
+
+			require.ErrorIs(t, ctx.Err(), context.Canceled)
+			require.Zero(t, forwardCache.scans)
+
+			select {
+			case <-forward.closeChan:
+			case <-time.After(time.Second):
+				t.Fatal("retired forward remained open")
+			}
+
+			portforwardstore(forwardCache, forward)
+			require.Empty(t, getPortForwardList(forwardCache, forward.cacheKey))
+		})
+	}
+}
+
+func TestPortForwardsWithTheSameIDStayOnTheirConnection(t *testing.T) {
+	const cluster, id = "workload", "shared-id"
+
+	forwardCache := cache.New[interface{}]()
+	keyFor := func(revision string) string {
+		return ConnectionCacheKey(cluster, &kubeconfig.Context{
+			Discovery: &kubeconfig.DiscoveryOrigin{ConnectionRevision: revision},
+		})
+	}
+	originalKey := keyFor("original")
+	replacementKey := keyFor("replacement")
+	original := portForward{
+		ID: id, Cluster: cluster, ConnectionRevision: "original", cacheKey: originalKey,
+		closeChan: make(chan struct{}), Status: RUNNING, Port: "8000",
+	}
+	replacement := portForward{
+		ID: id, Cluster: cluster, ConnectionRevision: "replacement", cacheKey: replacementKey,
+		closeChan: make(chan struct{}), Status: RUNNING, Port: "8001",
+	}
+
+	portforwardstore(forwardCache, original)
+	portforwardstore(forwardCache, replacement)
+
+	require.Equal(t, []portForward{original}, getPortForwardList(forwardCache, originalKey))
+	require.Equal(t, []portForward{replacement}, getPortForwardList(forwardCache, replacementKey))
+	require.Empty(t, getPortForwardList(forwardCache, cluster))
+	require.NoError(t, stopOrDeletePortForward(forwardCache, originalKey, id, false))
+	require.Empty(t, getPortForwardList(forwardCache, originalKey))
+	require.Equal(t, []portForward{replacement}, getPortForwardList(forwardCache, replacementKey))
+	require.NoError(t, stopOrDeletePortForward(forwardCache, replacementKey, id, true))
+}
+
 func TestGetPortForwardList(t *testing.T) {
 	p1 := portForward{ID: "id1", Cluster: "cluster1"}
 	p2 := portForward{ID: "id2", Cluster: "cluster1"}
@@ -874,7 +1074,7 @@ func TestStartPortForward_DuplicateIDConflict(t *testing.T) {
 	r.Header.Set("X-HEADLAMP-USER-ID", "user")
 	r = mux.SetURLVars(r, map[string]string{"clusterName": clusterName})
 
-	startPortForwardForOwner(kContext, c, false, contextKey, contextKey, w, r)
+	startPortForwardForOwner(kContext, c, false, contextKey, contextKey, nil, nil, w, r)
 
 	res := w.Result()
 
@@ -924,7 +1124,7 @@ func TestStartPortForward_ConcurrentRequests(t *testing.T) {
 		r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/portforward", bytes.NewReader(body))
 		r = mux.SetURLVars(r, map[string]string{"clusterName": "test-cluster"})
 
-		startPortForwardForOwner(kContext.Copy(), c, false, "test-cluster", "test-cluster", w, r)
+		startPortForwardForOwner(kContext.Copy(), c, false, "test-cluster", "test-cluster", nil, nil, w, r)
 
 		return w
 	}
@@ -1064,7 +1264,7 @@ func TestCheckPortForwardPermission(t *testing.T) {
 				_, _ = w.Write([]byte(tc.body))
 			})
 
-			if err := checkPortForwardPermission(cs, "default", "web-0"); tc.wantErr == "" {
+			if err := checkPortForwardPermission(t.Context(), cs, "default", "web-0"); tc.wantErr == "" {
 				assert.NoError(t, err)
 			} else {
 				require.ErrorContains(t, err, tc.wantErr)
@@ -1142,7 +1342,7 @@ func TestCheckIfPodIsRunning(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(tc.pod)
 			})
 
-			err := checkIfPodIsRunning(cs, "default", "web-0")
+			err := checkIfPodIsRunning(t.Context(), cs, "default", "web-0")
 			if tc.wantErr == "" {
 				assert.NoError(t, err)
 			} else {
@@ -1154,7 +1354,7 @@ func TestCheckIfPodIsRunning(t *testing.T) {
 
 func TestInitPortForwarder(t *testing.T) {
 	fwd, stopChan, readyChan, errOut, err := initPortForwarder(
-		&rest.Config{Host: "https://127.0.0.1:6443"}, "default", "web-0", "8080:80", "80",
+		t.Context(), &rest.Config{Host: "https://127.0.0.1:6443"}, "default", "web-0", "8080:80", "80",
 	)
 	require.NoError(t, err)
 	assert.NotNil(t, fwd)
@@ -1163,7 +1363,7 @@ func TestInitPortForwarder(t *testing.T) {
 	assert.NotNil(t, errOut)
 
 	fwd, stopChan, readyChan, errOut, err = initPortForwarder(
-		&rest.Config{Host: "://bad"}, "default", "web-0", "8080:80", "80",
+		t.Context(), &rest.Config{Host: "://bad"}, "default", "web-0", "8080:80", "80",
 	)
 	require.Error(t, err)
 	assert.Nil(t, fwd)
@@ -1396,7 +1596,7 @@ func TestResolveServicePod_ReturnsReadyPod(t *testing.T) {
 
 	clientset := fake.NewClientset(slice)
 
-	podName, podNamespace, err := resolveServicePod(clientset, "default", "my-service")
+	podName, podNamespace, err := resolveServicePod(t.Context(), clientset, "default", "my-service")
 	require.NoError(t, err)
 	assert.Equal(t, "my-pod-abc", podName)
 	assert.Equal(t, "default", podNamespace)
@@ -1426,7 +1626,7 @@ func TestResolveServicePod_NoReadyEndpoints(t *testing.T) {
 
 	clientset := fake.NewClientset(slice)
 
-	_, _, err := resolveServicePod(clientset, "default", "my-service")
+	_, _, err := resolveServicePod(t.Context(), clientset, "default", "my-service")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "no ready endpoints")
 }
@@ -1436,7 +1636,7 @@ func TestResolveServicePod_ServiceNotFound(t *testing.T) {
 
 	clientset := fake.NewClientset()
 
-	_, _, err := resolveServicePod(clientset, "default", "nonexistent-service")
+	_, _, err := resolveServicePod(t.Context(), clientset, "default", "nonexistent-service")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "no ready endpoints")
 }
@@ -1464,7 +1664,7 @@ func TestResolveServicePod_SkipsNonPodTargetRef(t *testing.T) {
 
 	clientset := fake.NewClientset(slice)
 
-	_, _, err := resolveServicePod(clientset, "default", "my-service")
+	_, _, err := resolveServicePod(t.Context(), clientset, "default", "my-service")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "no ready endpoints")
 }
@@ -1507,7 +1707,7 @@ func TestResolveServicePod_MultipleSlices(t *testing.T) {
 
 	clientset := fake.NewClientset(slice1, slice2)
 
-	podName, podNamespace, err := resolveServicePod(clientset, "production", "my-service")
+	podName, podNamespace, err := resolveServicePod(t.Context(), clientset, "production", "my-service")
 	require.NoError(t, err)
 	assert.Equal(t, "backend-pod-xyz", podName)
 	assert.Equal(t, "production", podNamespace)
@@ -1553,4 +1753,43 @@ func TestStartPortForward_OpenChunkedBodyTimeout(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestPortForwardAuthenticationWrappersReceiveUpgradeRejections(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "credential expired", http.StatusUnauthorized)
+	}))
+	t.Cleanup(server.Close)
+
+	for _, path := range []string{"/api/v1/portforward", "/proxy/api/v1/portforward"} {
+		t.Run(path, func(t *testing.T) {
+			var statuses []int
+
+			config := &rest.Config{Host: server.URL}
+			config.Wrap(func(next http.RoundTripper) http.RoundTripper {
+				return upgradeRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					resp, err := next.RoundTrip(req)
+					if resp != nil {
+						statuses = append(statuses, resp.StatusCode)
+					}
+
+					return resp, err
+				})
+			})
+			transport, upgrader, err := newPortForwardSPDYTransport(config)
+			require.NoError(t, err)
+
+			endpoint, err := url.Parse(server.URL + path)
+			require.NoError(t, err)
+			_, _, err = buildPortForwardDialer(config, endpoint, upgrader, transport).Dial("portforward.k8s.io")
+			require.ErrorContains(t, err, "401")
+
+			expected := []int{http.StatusUnauthorized}
+			if path == "/proxy/api/v1/portforward" {
+				expected = append(expected, http.StatusUnauthorized)
+			}
+
+			require.Equal(t, expected, statuses)
+		})
+	}
 }

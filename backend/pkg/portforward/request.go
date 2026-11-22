@@ -66,6 +66,16 @@ func RequestHandler(store kubeconfig.ContextStore, sessions cache.Cache[interfac
 		return
 	}
 
+	RequestHandlerForStoredContext(kContext, store, sessions, unsafeUseServiceAccountToken,
+		allowUploadedCredentials, contextKey, w, r)
+}
+
+// RequestHandlerForStoredContext authenticates operations against the selected
+// store entry and keeps started forwards bound to its connection revision.
+func RequestHandlerForStoredContext(kContext *kubeconfig.Context, store kubeconfig.ContextStore,
+	sessions cache.Cache[interface{}], unsafeUseServiceAccountToken, allowUploadedCredentials bool,
+	contextKey string, w http.ResponseWriter, r *http.Request,
+) {
 	trustedSource := allowUploadedCredentials
 
 	switch kContext.Source {
@@ -74,7 +84,7 @@ func RequestHandler(store kubeconfig.ContextStore, sessions cache.Cache[interfac
 	}
 
 	trustedContext := !kContext.Internal && trustedSource
-	handleRequestContext(kContext, sessions, unsafeUseServiceAccountToken, contextKey,
+	handleRequestContext(kContext, store, sessions, unsafeUseServiceAccountToken, contextKey,
 		trustedContext, trustedContext, w, r)
 }
 
@@ -85,7 +95,7 @@ func RequestHandler(store kubeconfig.ContextStore, sessions cache.Cache[interfac
 func RequestHandlerWithContext(kContext *kubeconfig.Context, sessions cache.Cache[interface{}],
 	unsafeUseServiceAccountToken, allowLocalCredentials bool, contextKey string, w http.ResponseWriter, r *http.Request,
 ) {
-	handleRequestContext(kContext, sessions, unsafeUseServiceAccountToken, contextKey,
+	handleRequestContext(kContext, nil, sessions, unsafeUseServiceAccountToken, contextKey,
 		true, allowLocalCredentials, w, r)
 }
 
@@ -189,11 +199,11 @@ func preparePortForwardTrust(kContext *kubeconfig.Context, token string, allowFi
 }
 
 //nolint:funlen // Authentication must complete before dispatching any local session operation.
-func handleRequestContext(kContext *kubeconfig.Context, sessions cache.Cache[interface{}],
+func handleRequestContext(connection *kubeconfig.Context, store kubeconfig.ContextStore, sessions cache.Cache[interface{}],
 	unsafeUseServiceAccountToken bool, contextKey string, allowContextCredentials, allowLocalCredentials bool,
 	w http.ResponseWriter, r *http.Request,
 ) {
-	kContext = kContext.Copy()
+	kContext := connection.Copy()
 
 	token, err := requestToken(r)
 	if err != nil {
@@ -273,11 +283,13 @@ func handleRequestContext(kContext *kubeconfig.Context, sessions cache.Cache[int
 		return
 	}
 
-	cacheKey := portForwardOwnerKey(contextKey, authority, user)
+	cacheKey := portForwardOwnerKey(ConnectionCacheKey(contextKey, connection), authority, user)
 
 	switch r.Method {
 	case http.MethodPost:
-		startPortForwardForOwner(kContext, sessions, unsafeUseServiceAccountToken, contextKey, cacheKey, w, r)
+		connectionCurrent, retainConnection := forwardConnectionLifecycle(store, contextKey, connection)
+		startPortForwardForOwner(kContext, sessions, unsafeUseServiceAccountToken, contextKey, cacheKey,
+			connectionCurrent, retainConnection, w, r)
 	case http.MethodDelete:
 		StopOrDeletePortForward(sessions, cacheKey, w, r)
 	case http.MethodGet:
@@ -290,4 +302,27 @@ func handleRequestContext(kContext *kubeconfig.Context, sessions cache.Cache[int
 		w.Header().Set("Allow", "GET, POST, DELETE")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func forwardConnectionLifecycle(store kubeconfig.ContextStore, contextKey string, connection *kubeconfig.Context,
+) (func() bool, retainConnectionFunc) {
+	revision := connection.RoutingRevision()
+	if store == nil || revision == "" {
+		return nil, nil
+	}
+
+	var idleTTL time.Duration
+	if connection.ImportRevision != "" {
+		idleTTL = kubeconfig.ImportedContextIdleTTL
+	}
+
+	current := func() bool {
+		stored, err := store.GetContext(contextKey)
+		return err == nil && stored.RoutingRevision() == revision
+	}
+	retain := func() (context.Context, func(), error) {
+		return store.RetainContext(contextKey, connection, idleTTL)
+	}
+
+	return current, retain
 }
