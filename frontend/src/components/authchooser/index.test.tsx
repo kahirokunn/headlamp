@@ -16,7 +16,8 @@
 
 import { ThemeProvider } from '@mui/material/styles';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
+import { useMemo } from 'react';
 import { Provider } from 'react-redux';
 import { MemoryRouter, Route } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -38,7 +39,10 @@ vi.mock('../../lib/cluster', () => ({
 
 vi.mock('../../lib/k8s', () => ({
   useCluster: vi.fn(() => null),
-  useClustersConf: vi.fn(() => store.getState().config.clusters),
+  useClustersConf: vi.fn(() => {
+    const clusters = store.getState().config.clusters;
+    return useMemo(() => structuredClone(clusters), [clusters]);
+  }),
   useClustersVersion: vi.fn(() => ({})),
   useConnectApi: vi.fn(),
   useSelectedClusters: vi.fn(() => []),
@@ -113,6 +117,58 @@ describe('AuthChooser component', () => {
   });
 
   const theme = createMuiTheme({ name: 'light', base: 'light' });
+
+  it.each(['oidc', 'token'])(
+    'ignores a delayed %s auth failure after replacement',
+    async authType => {
+      const original = Promise.withResolvers<unknown>();
+      const replacement = Promise.withResolvers<unknown>();
+      vi.mocked(testAuth).mockImplementationOnce(
+        () => original.promise as ReturnType<typeof testAuth>
+      );
+      vi.mocked(testAuth).mockImplementationOnce(
+        () => replacement.promise as ReturnType<typeof testAuth>
+      );
+
+      const setConnection = (revision: string) => {
+        store.dispatch(
+          setConfig({
+            clusters: {
+              'test-cluster': {
+                name: 'test-cluster',
+                auth_type: authType,
+                meta_data: { discoveryOrigin: {}, discoveryConnectionRevision: revision },
+              } as any,
+            },
+            oidcAutoLogin: true,
+          })
+        );
+      };
+      setConnection('original');
+      render(
+        <Provider store={store}>
+          <ThemeProvider theme={theme}>
+            <QueryClientProvider client={queryClient}>
+              <MemoryRouter initialEntries={['/auth']}>
+                <AuthChooser />
+              </MemoryRouter>
+            </QueryClientProvider>
+          </ThemeProvider>
+        </Provider>
+      );
+      await waitFor(() => expect(testAuth).toHaveBeenCalledTimes(1));
+      act(() => setConnection('replacement'));
+      await waitFor(() => expect(testAuth).toHaveBeenCalledTimes(2));
+
+      await act(async () => {
+        original.reject(Object.assign(new Error('Obsolete auth error'), { status: 409 }));
+      });
+      expect(screen.queryByText(/Obsolete auth error/)).not.toBeInTheDocument();
+      expect(
+        store.getState().config.clusters?.['test-cluster'].meta_data?.discoveryConnectionRevision
+      ).toBe('replacement');
+    }
+  );
 
   it('redirects to IdP when testAuth fails with 401 Unauthorized', async () => {
     const error: any = new Error('Unauthorized');

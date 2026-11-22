@@ -37,6 +37,11 @@ import { getDisplayVersion, getProductName } from '../../helpers/getProductInfo'
 import { logout } from '../../lib/auth';
 import { useCluster, useClustersConf, useSelectedClusters } from '../../lib/k8s';
 import { ClusterUserInfo, getClusterUserInfo } from '../../lib/k8s/api/v1/clusterApi';
+import {
+  getDiscoveredConnectionRevision,
+  useDiscoveredConnectionRevisions,
+} from '../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import { assertCurrentDiscoveryConnection } from '../../lib/k8s/api/v2/discoveryConnection';
 import { canLogoutFromProvider } from '../../lib/k8s/clusterAuthType';
 import { redirectToOIDCLogout } from '../../lib/oidcLogout';
 import { createRouteURL } from '../../lib/router/createRouteURL';
@@ -128,8 +133,13 @@ export default function TopBar({}: TopBarProps) {
         ? [cluster]
         : [];
       const oidcClusterToRedirect = clustersToLogout.find(canLogoutFromProvider);
+      const oidcConnection = {
+        revision: oidcClusterToRedirect && getDiscoveredConnectionRevision(oidcClusterToRedirect),
+      };
       const results = await Promise.allSettled(
-        clustersToLogout.map(clusterName => logout(clusterName, true))
+        clustersToLogout.map(clusterName =>
+          logout(clusterName, true, clusterName === oidcClusterToRedirect)
+        )
       );
 
       const failures = results.flatMap((result, index) =>
@@ -141,12 +151,13 @@ export default function TopBar({}: TopBarProps) {
         throw new AggregateError(failures, 'Failed to clear one or more cluster tokens');
       }
 
+      assertCurrentDiscoveryConnection(oidcClusterToRedirect, oidcConnection.revision);
       handleLogoutPathUpdate(clusterToLogout, history.location.pathname, (path: string) =>
         history.push(path)
       );
 
       if (oidcClusterToRedirect) {
-        await redirectToOIDCLogout(oidcClusterToRedirect);
+        await redirectToOIDCLogout(oidcClusterToRedirect, oidcConnection);
       }
       if (failures.length > 0) {
         throw new AggregateError(failures, 'Failed to clear one or more cluster tokens');
@@ -335,14 +346,18 @@ export const PureTopBar = memo(
 
     const clustersToQuery =
       selectedClusters && selectedClusters.length > 0 ? selectedClusters : cluster ? [cluster] : [];
+    const revisions = useDiscoveredConnectionRevisions();
 
     const userInfoQueries = useQueries({
-      queries: clustersToQuery.map(clusterName => ({
-        queryKey: ['clusterMe', clusterName],
-        queryFn: () => getClusterUserInfo(clusterName),
-        staleTime: 5 * 60 * 1000,
-        retry: 1,
-      })),
+      queries: clustersToQuery.map(clusterName => {
+        const revision = revisions.get(clusterName);
+        return {
+          queryKey: ['clusterMe', clusterName, revision],
+          queryFn: () => getClusterUserInfo(clusterName, { revision }),
+          staleTime: 5 * 60 * 1000,
+          retry: 1,
+        };
+      }),
     });
 
     const clusterUserInfoMap: Record<string, ClusterUserInfo | undefined> = {};

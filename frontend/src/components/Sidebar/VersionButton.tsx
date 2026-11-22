@@ -26,6 +26,7 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import semver from 'semver';
 import { getVersion, useCluster } from '../../lib/k8s';
+import { useDiscoveredConnectionRevisions } from '../../lib/k8s/api/v2/discoveredConnectionRevisions';
 import { StringDict } from '../../lib/k8s/cluster';
 import { useTypedSelector } from '../../redux/hooks';
 import { Dialog } from '../common/Dialog';
@@ -44,6 +45,7 @@ export default function VersionButton() {
   const isSidebarOpen = useTypedSelector(state => state.sidebar.isSidebarOpen);
   const { enqueueSnackbar } = useSnackbar();
   const cluster = useCluster();
+  const revision = useDiscoveredConnectionRevisions().get(cluster ?? '');
   const theme = useTheme();
   const [open, setOpen] = React.useState(false);
   const { t } = useTranslation('glossary');
@@ -79,9 +81,9 @@ export default function VersionButton() {
 
   const { data: clusterVersion } = useQuery<StringDict | null>({
     placeholderData: null,
-    queryKey: ['version', cluster ?? ''],
+    queryKey: ['version', cluster ?? '', revision],
     queryFn: () => {
-      return getVersion()
+      return getVersion(cluster ?? '', { revision })
         .then((results: StringDict) => {
           let versionChange = 0;
           if (clusterVersion && results && results.gitVersion) {

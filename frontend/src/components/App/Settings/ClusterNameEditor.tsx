@@ -21,11 +21,15 @@ import { useDispatch } from 'react-redux';
 import { useHistory } from 'react-router-dom';
 import { ClusterSettings } from '../../../helpers/clusterSettings';
 import { parseKubeConfig, renameCluster } from '../../../lib/k8s/api/v1/clusterApi';
+import { getDiscoveredConnectionRevision } from '../../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import { assertCurrentDiscoveryConnection } from '../../../lib/k8s/api/v2/discoveryConnection';
 import { Cluster } from '../../../lib/k8s/cluster';
 import { setConfig, setStatelessConfig } from '../../../redux/configSlice';
 import store from '../../../redux/stores/store';
 import { mergeStatelessConfigState } from '../../../stateless';
 import { findKubeconfigByClusterName } from '../../../stateless/findKubeconfigByClusterName';
+import { renewRetiredImport } from '../../../stateless/records';
+import { rollbackKubeconfigImport } from '../../../stateless/rollbackKubeconfigImport';
 import { updateStatelessClusterKubeconfig } from '../../../stateless/updateStatelessClusterKubeconfig';
 import { ConfirmButton, ConfirmDialog, NameValueTable } from '../../common';
 import { isValidClusterNameFormat } from './util';
@@ -114,23 +118,60 @@ export function ClusterNameEditor({
   }
 
   const handleUpdateClusterName = (source: string) => {
+    const revision = cluster ? getDiscoveredConnectionRevision(cluster) : undefined;
+    const selected = cluster ? store.getState().config.statelessClusters?.[cluster] : undefined;
+    const recordId = selected?.kubeconfigRecordId;
+    const recoverFailedRename = async (error: unknown): Promise<never> => {
+      if (selected) await rollbackKubeconfigImport(undefined, [selected]);
+      throw error;
+    };
     try {
       renameCluster(cluster || '', newClusterName, source, clusterID)
+        .catch(error => {
+          if (error?.status === 408 || error?.status >= 500) return recoverFailedRename(error);
+          throw error;
+        })
         .then(async config => {
           if (cluster) {
-            const kubeconfig = await findKubeconfigByClusterName(cluster, clusterID);
+            assertCurrentDiscoveryConnection(cluster, revision);
+            const kubeconfig = await findKubeconfigByClusterName(
+              cluster,
+              clusterID,
+              recordId
+            ).catch(recoverFailedRename);
             if (kubeconfig !== null) {
-              await updateStatelessClusterKubeconfig(kubeconfig, newClusterName, cluster);
+              assertCurrentDiscoveryConnection(cluster, revision);
+              await updateStatelessClusterKubeconfig(
+                kubeconfig,
+                newClusterName,
+                cluster,
+                recordId
+              ).catch(recoverFailedRename);
+              await renewRetiredImport(selected);
               // Make another request for updated kubeconfig
-              const updatedKubeconfig = await findKubeconfigByClusterName(cluster, clusterID);
+              let incarnations: Record<string, string> | undefined;
+              const updatedKubeconfig = await findKubeconfigByClusterName(
+                newClusterName,
+                clusterID,
+                recordId,
+                record => {
+                  incarnations = record.incarnations;
+                }
+              );
               if (updatedKubeconfig !== null) {
                 parseKubeConfig({ kubeconfig: updatedKubeconfig })
                   .then((parsedConfig: any) => {
+                    assertCurrentDiscoveryConnection(cluster, revision);
                     storeNewClusterName(newClusterName);
                     const currentStatelessClusters = store.getState().config.statelessClusters;
                     dispatch(
                       setStatelessConfig(
-                        mergeStatelessConfigState(currentStatelessClusters, parsedConfig)
+                        mergeStatelessConfigState(
+                          currentStatelessClusters,
+                          parsedConfig,
+                          recordId === undefined ? undefined : [recordId],
+                          [incarnations]
+                        )
                       )
                     );
                   })
@@ -145,9 +186,10 @@ export function ClusterNameEditor({
           history.push('/');
           window.location.reload();
         })
-        .catch((err: Error) => {
-          console.error('Error updating cluster name:', err.message);
-          setClusterErrorDialogMessage(err.message);
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('Error updating cluster name:', message);
+          setClusterErrorDialogMessage(message);
           setClusterErrorDialogOpen(true);
         });
     } catch (error) {

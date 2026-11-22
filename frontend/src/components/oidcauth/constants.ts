@@ -14,4 +14,21 @@
  * limitations under the License.
  */
 
+import {
+  getRoutingRevision,
+  isUnversionedConnection,
+  UNVERSIONED_DISCOVERY_CONNECTION,
+} from '../../lib/k8s/api/v2/discoveryConnection';
+
 export const AUTH_STATUS_KEY = 'auth_status';
+
+// The backend omits the revision from ordinary OIDC callbacks.
+export function oidcSessionRevision(revision?: string | null) {
+  return isUnversionedConnection(revision) ? undefined : getRoutingRevision(revision ?? undefined);
+}
+
+export function oidcAuthStatusKey(cluster: string | null, revision: string | null) {
+  return cluster && revision && revision !== UNVERSIONED_DISCOVERY_CONNECTION
+    ? `${AUTH_STATUS_KEY}.${encodeURIComponent(cluster)}.${revision}`
+    : AUTH_STATUS_KEY;
+}

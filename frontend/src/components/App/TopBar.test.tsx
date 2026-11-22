@@ -45,6 +45,10 @@ vi.mock('../../lib/k8s', () => ({
 vi.mock('../../lib/k8s/api/v1/clusterApi', () => ({
   getClusterUserInfo: vi.fn(),
 }));
+vi.mock('../../lib/k8s/api/v2/discoveredConnectionRevisions', () => ({
+  getDiscoveredConnectionRevision: vi.fn(),
+  useDiscoveredConnectionRevisions: vi.fn(() => new Map()),
+}));
 vi.mock('../../lib/k8s/clusterAuthType', () => ({
   canLogoutFromProvider: vi.fn(),
 }));
@@ -274,12 +278,14 @@ describe('TopBar logout', () => {
     fireEvent.click(await screen.findByText('Log out from all'));
 
     await waitFor(() => {
-      expect(mockRedirectToOIDCLogout).toHaveBeenCalledWith('first-oidc-cluster');
+      expect(mockRedirectToOIDCLogout).toHaveBeenCalledWith('first-oidc-cluster', {
+        revision: undefined,
+      });
     });
     expect(mockLogout.mock.calls).toEqual([
-      ['token-cluster', true],
-      ['first-oidc-cluster', true],
-      ['second-oidc-cluster', true],
+      ['token-cluster', true, false],
+      ['first-oidc-cluster', true, true],
+      ['second-oidc-cluster', true, false],
     ]);
     expect(mockRedirectToOIDCLogout).toHaveBeenCalledTimes(1);
   });
@@ -304,7 +310,9 @@ describe('TopBar logout', () => {
     fireEvent.click(await screen.findByText('Log out from all'));
 
     await waitFor(() => {
-      expect(mockRedirectToOIDCLogout).toHaveBeenCalledWith('oidc-cluster');
+      expect(mockRedirectToOIDCLogout).toHaveBeenCalledWith('oidc-cluster', {
+        revision: undefined,
+      });
     });
     expect(mockRedirectToOIDCLogout.mock.invocationCallOrder[0]).toBeGreaterThan(
       Math.max(...mockLogout.mock.invocationCallOrder)

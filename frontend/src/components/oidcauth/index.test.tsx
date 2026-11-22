@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import { Provider } from 'react-redux';
 import { MemoryRouter, Route } from 'react-router-dom';
-import { setConfig } from '../../redux/configSlice';
+import { setConfig, setStatelessConfig } from '../../redux/configSlice';
 import store from '../../redux/stores/store';
 import OIDCAuth, { resetHandledAuthUrls } from './index';
 
@@ -30,8 +30,10 @@ vi.mock('react-i18next', async importOriginal => {
 });
 
 describe('OIDCAuth component', () => {
+  afterEach(() => vi.unstubAllGlobals());
   beforeEach(() => {
     resetHandledAuthUrls();
+    store.dispatch(setStatelessConfig({ statelessClusters: null }));
     localStorage.clear();
     sessionStorage.clear();
     store.dispatch(
@@ -68,6 +70,134 @@ describe('OIDCAuth component', () => {
     await waitFor(() => {
       expect(localStorage.getItem('auth_status')).toBe('success');
     });
+  });
+
+  it('does not apply a popup callback from a replaced connection', async () => {
+    store.dispatch(
+      setConfig({
+        clusters: {
+          'test-cluster': {
+            name: 'test-cluster',
+            auth_type: 'oidc',
+            meta_data: { discoveryOrigin: {}, discoveryConnectionRevision: 'replacement' },
+          } as any,
+        },
+      })
+    );
+
+    render(
+      <Provider store={store}>
+        <MemoryRouter
+          initialEntries={[
+            '/auth?cluster=test-cluster&popup=true&__headlamp_connection_revision=obsolete',
+          ]}
+        >
+          <OIDCAuth />
+        </MemoryRouter>
+      </Provider>
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Discovered cluster connection changed'
+    );
+    expect(localStorage.getItem('auth_status')).toBeNull();
+    expect(localStorage.getItem('auth_status.test-cluster.obsolete')).toBeNull();
+    expect(store.getState().config.clusters?.['test-cluster'].useToken).toBeUndefined();
+  });
+
+  it.each(['', '&popup=true'])(
+    'blocks a revision-bearing callback after the cluster is removed (%s)',
+    async popup => {
+      store.dispatch(setConfig({ clusters: {} }));
+      sessionStorage.setItem('oidc_return_url', '/c/test-cluster/workloads');
+      render(
+        <Provider store={store}>
+          <MemoryRouter
+            initialEntries={[
+              `/auth?cluster=test-cluster&__headlamp_connection_revision=removed-revision${popup}`,
+            ]}
+          >
+            <Route path="/c/test-cluster/workloads">Workloads</Route>
+            <Route path="/auth">
+              <OIDCAuth />
+            </Route>
+          </MemoryRouter>
+        </Provider>
+      );
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'Discovered cluster connection changed'
+      );
+      expect(screen.queryByText('Workloads')).not.toBeInTheDocument();
+      expect(localStorage.getItem('auth_status.test-cluster.removed-revision')).toBeNull();
+      expect(sessionStorage.getItem('oidc_return_url')).toBe('/c/test-cluster/workloads');
+    }
+  );
+
+  it('waits for configuration before completing a revision-bearing callback', async () => {
+    store.dispatch(setConfig({ clusters: null }));
+    render(
+      <Provider store={store}>
+        <MemoryRouter
+          initialEntries={[
+            '/auth?cluster=test-cluster&popup=true&__headlamp_connection_revision=current',
+          ]}
+        >
+          <OIDCAuth />
+        </MemoryRouter>
+      </Provider>
+    );
+
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(localStorage.getItem('auth_status.test-cluster.current')).toBeNull();
+    act(() => {
+      store.dispatch(
+        setConfig({
+          clusters: {
+            'test-cluster': {
+              name: 'test-cluster',
+              auth_type: 'oidc',
+              meta_data: { discoveryOrigin: {}, discoveryConnectionRevision: 'current' },
+            } as any,
+          },
+        })
+      );
+    });
+
+    await waitFor(() => {
+      expect(localStorage.getItem('auth_status.test-cluster.current')).toBe('success');
+    });
+  });
+
+  it('checks the effective token mode when an imported cluster is mirrored in the config', async () => {
+    store.dispatch(
+      setConfig({
+        clusters: {
+          'test-cluster': { name: 'test-cluster', auth_type: 'oidc', useToken: false } as any,
+        },
+      })
+    );
+    store.dispatch(
+      setStatelessConfig({
+        statelessClusters: {
+          'test-cluster': { name: 'test-cluster', auth_type: 'oidc', useToken: true } as any,
+        },
+      })
+    );
+
+    try {
+      render(
+        <Provider store={store}>
+          <MemoryRouter initialEntries={['/auth?cluster=test-cluster&popup=true']}>
+            <OIDCAuth />
+          </MemoryRouter>
+        </Provider>
+      );
+
+      expect(store.getState().config.statelessClusters?.['test-cluster'].useToken).toBe(false);
+    } finally {
+      store.dispatch(setStatelessConfig({ statelessClusters: null }));
+    }
   });
 
   it('does not set auth_status in localStorage when cluster is absent in popup mode', () => {
@@ -178,8 +308,10 @@ describe('OIDCAuth component', () => {
   });
 
   it('renders an error and halts navigation when sessionStorage throws in full-page mode', async () => {
-    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
-      throw new Error('QuotaExceededError or SecurityError');
+    vi.stubGlobal('sessionStorage', {
+      setItem() {
+        throw new Error('QuotaExceededError or SecurityError');
+      },
     });
 
     let currentPath = '/auth';

@@ -103,6 +103,29 @@ describe('Layout Backstage readiness and message receiver', () => {
     localStorage.clear();
   });
 
+  it('drops the old token mode when configuration replaces the connection', async () => {
+    const cluster = (revision: string) => ({
+      name: 'workload',
+      server: 'https://api.example.test',
+      auth_type: 'oidc',
+      meta_data: { discoveryConnectionRevision: revision },
+    });
+    store.dispatch(
+      setConfig({
+        clusters: { workload: { ...cluster('original'), useToken: true } },
+      })
+    );
+    mockRequest.mockResolvedValue({ clusters: [cluster('replacement')] });
+
+    await act(async () => {
+      renderLayout();
+    });
+
+    const configured = store.getState().config.clusters?.workload;
+    expect(configured?.meta_data?.discoveryConnectionRevision).toBe('replacement');
+    expect(configured?.useToken).toBeUndefined();
+  });
+
   it('notifies the single configured origin once', async () => {
     vi.stubEnv('REACT_APP_BACKSTAGE_ORIGIN', 'https://backstage.example.com');
 

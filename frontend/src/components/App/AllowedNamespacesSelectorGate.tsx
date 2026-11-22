@@ -19,10 +19,13 @@ import { useTranslation } from 'react-i18next';
 import { loadClusterSettings, loadResolvedAllowedNamespaces } from '../../helpers/clusterSettings';
 import { useAllowedNamespacesFromSelector } from '../../lib/k8s/allowedNamespaces';
 import { AllowedNamespacesResolutionContext } from '../../lib/k8s/allowedNamespacesContext';
+import { useDiscoveredConnectionRevisions } from '../../lib/k8s/api/v2/discoveredConnectionRevisions';
 import { Loader } from '../common';
 
 /** Result state for a single allowed namespace selector. */
 interface SelectorResolution {
+  /** Connection generation when the selector resolved. */
+  revision?: string;
   /** Selector associated with the result. */
   selector: string;
   /** Stable key for the selector result or error. */
@@ -39,24 +42,26 @@ interface SelectorResolution {
  */
 function AllowedNamespacesSelectorResolver({
   cluster,
+  revision,
   onResolved,
 }: {
   cluster: string;
+  revision?: string;
   onResolved: (cluster: string, resolution: SelectorResolution) => void;
 }) {
   const selector = (loadClusterSettings(cluster).allowedNamespacesSelector || '').trim();
   const resolution = useAllowedNamespacesFromSelector(cluster, selector);
   const resultKey = resolution.error
-    ? JSON.stringify([selector, 'error', resolution.error.message])
+    ? JSON.stringify([revision, selector, 'error', resolution.error.message])
     : resolution.isSuccess
-    ? JSON.stringify([selector, 'success', resolution.namespaces])
+    ? JSON.stringify([revision, selector, 'success', resolution.namespaces])
     : '';
 
   useEffect(() => {
     if (selector && resultKey) {
-      onResolved(cluster, { selector, resultKey, isError: Boolean(resolution.error) });
+      onResolved(cluster, { revision, selector, resultKey, isError: Boolean(resolution.error) });
     }
-  }, [cluster, selector, resultKey, resolution.error, onResolved]);
+  }, [cluster, revision, selector, resultKey, resolution.error, onResolved]);
 
   return null;
 }
@@ -75,6 +80,7 @@ export default function AllowedNamespacesSelectorGate({
   children: ReactNode;
 }) {
   const { t } = useTranslation();
+  const revisions = useDiscoveredConnectionRevisions();
   const [resolutions, setResolutions] = useState<Record<string, SelectorResolution>>({});
   const onResolved = useCallback((cluster: string, resolution: SelectorResolution) => {
     setResolutions(current =>
@@ -85,17 +91,24 @@ export default function AllowedNamespacesSelectorGate({
   }, []);
 
   const resolutionKeys = clusters.map(cluster => {
+    const revision = revisions.get(cluster);
     const selector = (loadClusterSettings(cluster).allowedNamespacesSelector || '').trim();
     const cache = selector ? loadResolvedAllowedNamespaces(cluster) : null;
     const cachedResultKey =
-      cache?.selector === selector ? JSON.stringify([selector, 'success', cache.namespaces]) : '';
+      cache?.selector === selector
+        ? JSON.stringify([revision, selector, 'success', cache.namespaces])
+        : '';
     const resolution = resolutions[cluster];
 
     if (!selector || cachedResultKey) {
       return cachedResultKey;
     }
 
-    return resolution?.selector === selector && resolution.isError ? resolution.resultKey : null;
+    return resolution?.selector === selector &&
+      resolution.revision === revision &&
+      resolution.isError
+      ? resolution.resultKey
+      : null;
   });
   const waiting = resolutionKeys.some(key => key === null);
   const resolutionKey = JSON.stringify(resolutionKeys);
@@ -104,8 +117,9 @@ export default function AllowedNamespacesSelectorGate({
     <>
       {clusters.map(cluster => (
         <AllowedNamespacesSelectorResolver
-          key={cluster}
+          key={JSON.stringify([cluster, revisions.get(cluster)])}
           cluster={cluster}
+          revision={revisions.get(cluster)}
           onResolved={onResolved}
         />
       ))}

@@ -26,17 +26,24 @@ import { getAppUrl } from '../../helpers/getAppUrl';
 import { getCluster, getClusterPrefixedPath } from '../../lib/cluster';
 import { useClustersConf } from '../../lib/k8s';
 import { testAuth } from '../../lib/k8s/api/v1/clusterApi';
+import {
+  getDiscoveredConnectionRevision,
+  useDiscoveredConnectionRevisions,
+} from '../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import { withDiscoveryConnectionPath } from '../../lib/k8s/api/v2/discoveryConnection';
+import { prepareOIDCLogin } from '../../lib/oidcLogin';
 import { invalidateClusterUserInfo } from '../../lib/queryClient';
 import { createRouteURL } from '../../lib/router/createRouteURL';
 import { getRoute } from '../../lib/router/getRoute';
 import { getRoutePath } from '../../lib/router/getRoutePath';
-import { setConfig } from '../../redux/configSlice';
+import { setClusterUseToken } from '../../redux/configSlice';
 import { useTypedSelector } from '../../redux/hooks';
 import { ClusterDialog } from '../cluster/Chooser';
 import { DialogTitle } from '../common/Dialog';
 import Empty from '../common/EmptyContent';
 import Link from '../common/Link';
 import Loader from '../common/Loader';
+import { oidcSessionRevision } from '../oidcauth/constants';
 import OauthPopup from '../oidcauth/OauthPopup';
 
 function ColorButton({ children, ...rest }: ComponentProps<typeof Button>) {
@@ -59,7 +66,24 @@ export interface AuthChooserProps {
   children?: React.ReactNode;
 }
 
-function AuthChooser({ children }: AuthChooserProps) {
+function AuthChooser(props: AuthChooserProps) {
+  const clusterName = getCluster() as string;
+  const revision = useDiscoveredConnectionRevisions().get(clusterName);
+  return (
+    <AuthChooserSession
+      {...props}
+      key={JSON.stringify([clusterName, revision])}
+      clusterName={clusterName}
+      revision={revision}
+    />
+  );
+}
+
+function AuthChooserSession({
+  children,
+  clusterName,
+  revision,
+}: AuthChooserProps & { clusterName: string; revision?: string }) {
   const history = useHistory();
   const location = useLocation();
   const clusters = useClustersConf();
@@ -68,11 +92,12 @@ function AuthChooser({ children }: AuthChooserProps) {
   const [error, setError] = React.useState<Error | null>(null);
   const { from = { pathname: createRouteURL('cluster') } } = (location.state ||
     {}) as ReactRouterLocationStateIface;
-  const clusterName = getCluster() as string;
   const oidcAutoLogin = useTypedSelector(state => state.config.oidcAutoLogin);
   const { t } = useTranslation();
   const clustersRef = React.useRef<typeof clusters>(null);
   const cancelledRef = React.useRef(false);
+  const isCurrent = () =>
+    !cancelledRef.current && getDiscoveredConnectionRevision(clusterName) === revision;
 
   let clusterAuthType = '';
   if (clusters && clusters[clusterName]) {
@@ -84,13 +109,67 @@ function AuthChooser({ children }: AuthChooserProps) {
   let oidcTokenRejected = false;
   if (clusterAuthType === 'oidc' && clusterName) {
     try {
-      oidcTokenRejected = sessionStorage.getItem(`oidc-login-attempted.${clusterName}`) === 'true';
+      oidcTokenRejected =
+        sessionStorage.getItem(`oidc-login-attempted.${clusterName}`) ===
+        (oidcSessionRevision(revision) || 'true');
     } catch {
       // sessionStorage unavailable (e.g. private browsing with strict settings).
     }
   }
 
   const numClusters = Object.keys(clusters || {}).length;
+
+  const oauthUrl = withDiscoveryConnectionPath(
+    `${getAppUrl()}oidc?dt=${Date()}&cluster=${encodeURIComponent(clusterName)}&popup=true`,
+    { revision }
+  );
+  const desktopAttempt = React.useRef<AbortController>();
+  function handleOidcAuth() {
+    if (!isCurrent()) return;
+    if (clusterName) {
+      try {
+        sessionStorage.setItem(
+          `oidc-login-attempted.${clusterName}`,
+          oidcSessionRevision(revision) || 'true'
+        );
+      } catch {
+        // sessionStorage unavailable (e.g. private browsing with strict settings).
+      }
+    }
+    // Invalidate every cluster's cached identity, not just this one: the
+    // backend may have broadcast the new token to sibling clusters.
+    invalidateClusterUserInfo();
+    history.replace(from);
+  }
+
+  async function signInOnDesktop(url: string) {
+    desktopAttempt.current?.abort();
+    const attempt = new AbortController();
+    desktopAttempt.current = attempt;
+    try {
+      const provider = await prepareOIDCLogin(url, clusterName, revision);
+      if (attempt.signal.aborted || !isCurrent()) return;
+      const state = new URL(provider).searchParams.get('state');
+      if (!state) throw new Error('Missing OIDC state');
+      attempt.signal.addEventListener('abort', () => window.desktopApi.cancelOidcLogin?.(state), {
+        once: true,
+      });
+      if (
+        (await window.desktopApi.oidcLogin!(provider)) &&
+        !attempt.signal.aborted &&
+        isCurrent()
+      ) {
+        dispatch(setClusterUseToken({ clusterName, useToken: false }));
+        handleOidcAuth();
+      }
+    } catch (error) {
+      if (!attempt.signal.aborted && isCurrent()) {
+        setError(error instanceof Error ? error : new Error(String(error)));
+      }
+    } finally {
+      if (desktopAttempt.current === attempt) desktopAttempt.current = undefined;
+    }
+  }
 
   function runTestAuthAgain() {
     setError(null);
@@ -103,8 +182,6 @@ function AuthChooser({ children }: AuthChooserProps) {
       if (!sameClusters) {
         clustersRef.current = clusters;
       }
-      const clusterName = getCluster();
-
       // Reset the testing auth state just to prevent the early return from this function
       // without actually testing auth, which would cause the auth chooser to never show up.
       setTestingAuth(false);
@@ -125,14 +202,14 @@ function AuthChooser({ children }: AuthChooserProps) {
         if (!isLoggingOut && !oidcTokenRejected) {
           setTestingAuth(true);
 
-          testAuth(clusterName)
+          testAuth(clusterName, undefined, { revision })
             .then(() => {
-              if (!cancelledRef.current) {
+              if (isCurrent()) {
                 history.replace(from);
               }
             })
-            .catch(err => {
-              if (!cancelledRef.current) {
+            .catch(async err => {
+              if (isCurrent()) {
                 // Only redirect for explicit authentication/authorization failures (401 or 403).
                 // For other errors (e.g. 502 Bad Gateway, 504 Gateway Timeout, network errors),
                 // preserve the error state so the user sees the connection/server error UI.
@@ -143,6 +220,10 @@ function AuthChooser({ children }: AuthChooserProps) {
                   return;
                 }
 
+                if (window.desktopApi?.oidcLogin) {
+                  await signInOnDesktop(oauthUrl);
+                  return;
+                }
                 const returnUrl = from.pathname + (from.search || '') + (from.hash || '');
                 if (
                   returnUrl &&
@@ -155,14 +236,19 @@ function AuthChooser({ children }: AuthChooserProps) {
                     console.error('Failed to save OIDC return URL', e);
                   }
                 }
-                const oauthUrl = `${getAppUrl()}oidc?dt=${Date.now()}&cluster=${encodeURIComponent(
-                  clusterName
-                )}`;
-                window.location.href = oauthUrl;
+                const autoLoginUrl = withDiscoveryConnectionPath(
+                  `${getAppUrl()}oidc?dt=${Date.now()}&cluster=${encodeURIComponent(clusterName)}`,
+                  { revision }
+                );
+                const target = await prepareOIDCLogin(autoLoginUrl, clusterName, revision);
+                if (isCurrent()) window.location.href = target;
               }
             })
+            .catch(error => {
+              if (isCurrent()) setError(error instanceof Error ? error : new Error(String(error)));
+            })
             .finally(() => {
-              if (!cancelledRef.current) {
+              if (isCurrent()) {
                 setTestingAuth(false);
               }
             });
@@ -184,13 +270,13 @@ function AuthChooser({ children }: AuthChooserProps) {
 
         console.debug('Testing auth at authchooser');
 
-        testAuth(clusterName)
+        testAuth(clusterName, undefined, { revision })
           .then(() => {
             console.debug('Not requiring token as testing auth succeeded');
             useToken = false;
           })
           .catch(err => {
-            if (!cancelledRef.current) {
+            if (isCurrent()) {
               console.debug(`Requiring token for ${clusterName} as testing auth failed:`, err);
 
               // Ideally we'd only not assign the error if it was 401 or 403 (so we let the logic
@@ -204,7 +290,7 @@ function AuthChooser({ children }: AuthChooserProps) {
             }
           })
           .finally(() => {
-            if (!cancelledRef.current) {
+            if (isCurrent()) {
               setTestingAuth(false);
 
               if (!!errorObj) {
@@ -217,8 +303,7 @@ function AuthChooser({ children }: AuthChooserProps) {
                 setError(null);
               }
 
-              cluster.useToken = useToken;
-              dispatch(setConfig({ clusters: { ...clusters } }));
+              dispatch(setClusterUseToken({ clusterName, useToken }));
               // If we don't require a token, then we just move to the attempted URL or root.
               if (!useToken) {
                 history.replace(from);
@@ -226,7 +311,7 @@ function AuthChooser({ children }: AuthChooserProps) {
 
               // If we reach this point, then we know whether or not we need a token. If we don't,
               // just redirect.
-              if (cluster.useToken === false) {
+              if (!useToken) {
                 history.replace(from);
               } else if (!clusterAuthType) {
                 // we know that it requires token and also doesn't have oidc configured
@@ -254,8 +339,10 @@ function AuthChooser({ children }: AuthChooserProps) {
   // Ensure we have a way to know in the testAuth result whether this component is no longer
   // mounted.
   React.useEffect(() => {
+    cancelledRef.current = false;
     return function cleanup() {
       cancelledRef.current = true;
+      desktopAttempt.current?.abort();
     };
   }, []);
 
@@ -274,23 +361,22 @@ function AuthChooser({ children }: AuthChooserProps) {
           : t('Authentication')
       }
       error={error}
-      oauthUrl={`${getAppUrl()}oidc?dt=${Date()}&cluster=${getCluster()}&popup=true`}
+      oauthUrl={oauthUrl}
+      prepareOidcLogin={
+        clusterName && revision?.startsWith('import-')
+          ? url => prepareOIDCLogin(url, clusterName, revision)
+          : undefined
+      }
+      onOidcError={error => {
+        if (isCurrent()) setError(error);
+      }}
       clusterAuthType={clusterAuthType}
       oidcTokenRejected={oidcTokenRejected}
       handleTryAgain={runTestAuthAgain}
-      handleOidcAuth={() => {
-        if (clusterName) {
-          try {
-            sessionStorage.setItem(`oidc-login-attempted.${clusterName}`, 'true');
-          } catch {
-            // sessionStorage unavailable (e.g. private browsing with strict settings).
-          }
-        }
-        // Invalidate every cluster's cached identity, not just this one: the
-        // backend may have broadcast the new token to sibling clusters.
-        invalidateClusterUserInfo();
-        history.replace(from);
-      }}
+      handleOidcAuth={handleOidcAuth}
+      onDesktopLogin={
+        window.desktopApi?.oidcLogin ? () => void signInOnDesktop(oauthUrl) : undefined
+      }
       handleBackButtonPress={() => {
         numClusters > 1 ? history.goBack() : history.push('/');
       }}
@@ -318,6 +404,9 @@ export interface PureAuthChooserProps {
   testingAuth: boolean;
   error: Error | null;
   oauthUrl: string;
+  onDesktopLogin?: () => void;
+  prepareOidcLogin?: (url: string) => Promise<string>;
+  onOidcError?: (error: Error) => void;
   clusterAuthType: string;
   oidcTokenRejected?: boolean;
   handleOidcAuth: () => void;
@@ -334,6 +423,9 @@ export function PureAuthChooser({
   testingAuth,
   error,
   oauthUrl,
+  onDesktopLogin,
+  prepareOidcLogin,
+  onOidcError,
   clusterAuthType,
   oidcTokenRejected,
   handleOidcAuth,
@@ -376,14 +468,20 @@ export function PureAuthChooser({
               ) : null}
               {clusterAuthType === 'oidc' ? (
                 <Box m={2}>
-                  <OauthPopup
-                    onCode={handleOidcAuth}
-                    url={oauthUrl}
-                    title={t('Headlamp Cluster Authentication')}
-                    button={ColorButton as typeof Button}
-                  >
-                    {t('Sign In') as string}
-                  </OauthPopup>
+                  {onDesktopLogin ? (
+                    <ColorButton onClick={onDesktopLogin}>{t('Sign In')}</ColorButton>
+                  ) : (
+                    <OauthPopup
+                      onCode={handleOidcAuth}
+                      url={oauthUrl}
+                      prepareUrl={prepareOidcLogin}
+                      onError={onOidcError}
+                      title={t('Headlamp Cluster Authentication')}
+                      button={ColorButton as typeof Button}
+                    >
+                      {t('Sign In') as string}
+                    </OauthPopup>
+                  )}
                 </Box>
               ) : null}
               <Box m={2}>

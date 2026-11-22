@@ -19,10 +19,15 @@ import { useEffect, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useDispatch } from 'react-redux';
 import { useHistory, useLocation } from 'react-router-dom';
+import { useDiscoveredConnectionRevisions } from '../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import {
+  DISCOVERY_CONNECTION_CHANGED,
+  DISCOVERY_CONNECTION_REVISION_PARAM,
+} from '../../lib/k8s/api/v2/discoveryConnection';
 import { createRouteURL } from '../../lib/router/createRouteURL';
-import { setConfig } from '../../redux/configSlice';
+import { getEffectiveCluster, setClusterUseToken } from '../../redux/configSlice';
 import { useTypedSelector } from '../../redux/hooks';
-import { AUTH_STATUS_KEY } from './constants';
+import { oidcAuthStatusKey, oidcSessionRevision } from './constants';
 
 const handledAuthUrls = new Set<string>();
 
@@ -35,48 +40,60 @@ function OIDCAuth() {
   const { search } = useLocation();
   const history = useHistory();
   const dispatch = useDispatch();
-  const clusters = useTypedSelector(state => state.config.clusters);
   const params = new URLSearchParams(search);
   const cluster = params.get('cluster');
+  const effectiveCluster = useTypedSelector(state =>
+    getEffectiveCluster(state.config, cluster ?? '')
+  );
+  const revision = params.get(DISCOVERY_CONNECTION_REVISION_PARAM);
+  const configLoaded = useTypedSelector(state => state.config.clusters !== null);
+  const checkingConnection = !!cluster && !!revision && !configLoaded;
+  const currentRevision = oidcSessionRevision(
+    useDiscoveredConnectionRevisions().get(cluster ?? '')
+  );
+  const connectionChanged =
+    !!cluster &&
+    !!(revision || effectiveCluster) &&
+    oidcSessionRevision(revision) !== currentRevision;
+  const statusKey = oidcAuthStatusKey(cluster, revision);
   const { t } = useTranslation();
 
   // Set by the backend when the login was started from OauthPopup. Not derived from
   // window.opener, which an IdP's Cross-Origin-Opener-Policy can sever.
   const isPopup = params.get('popup') === 'true';
   const storageError = useMemo(() => {
-    if (!cluster || isPopup) {
+    if (!cluster || isPopup || checkingConnection || connectionChanged) {
       return null;
     }
     try {
-      sessionStorage.setItem(`oidc-login-attempted.${cluster}`, 'true');
+      sessionStorage.setItem(`oidc-login-attempted.${cluster}`, revision || 'true');
       return null;
     } catch {
       return t(
         'Unable to access browser storage to complete authentication. Please enable cookies and storage in your browser settings and try again.'
       );
     }
-  }, [cluster, isPopup, t]);
+  }, [cluster, checkingConnection, connectionChanged, isPopup, revision, t]);
 
   useEffect(() => {
-    if (storageError || !cluster || handledAuthUrls.has(search)) {
+    if (
+      storageError ||
+      checkingConnection ||
+      connectionChanged ||
+      !cluster ||
+      handledAuthUrls.has(search)
+    ) {
       return;
     }
 
     handledAuthUrls.add(search);
 
     if (isPopup) {
-      localStorage.setItem(AUTH_STATUS_KEY, 'success');
+      localStorage.setItem(statusKey, 'success');
     }
 
-    if (clusters?.[cluster] && clusters[cluster].useToken !== false) {
-      const updatedClusters = {
-        ...clusters,
-        [cluster]: {
-          ...clusters[cluster],
-          useToken: false,
-        },
-      };
-      dispatch(setConfig({ clusters: updatedClusters }));
+    if (effectiveCluster && effectiveCluster.useToken !== false) {
+      dispatch(setClusterUseToken({ clusterName: cluster, useToken: false }));
     }
 
     if (!isPopup) {
@@ -100,12 +117,23 @@ function OIDCAuth() {
 
       history.replace(returnUrl);
     }
-  }, [cluster, clusters, dispatch, history, isPopup, search, storageError]);
+  }, [
+    cluster,
+    effectiveCluster,
+    checkingConnection,
+    connectionChanged,
+    dispatch,
+    history,
+    isPopup,
+    search,
+    statusKey,
+    storageError,
+  ]);
 
-  if (storageError) {
+  if (storageError || (!checkingConnection && connectionChanged)) {
     return (
       <Typography color="error" role="alert">
-        {storageError}
+        {storageError || DISCOVERY_CONNECTION_CHANGED}
       </Typography>
     );
   }

@@ -23,6 +23,7 @@ import { getProductName } from '../../helpers/getProductInfo';
 import { getCluster, getSelectedClusters } from '../../lib/cluster';
 import { useCluster, useClustersConf } from '../../lib/k8s';
 import { testAuth } from '../../lib/k8s/api/v1/clusterApi';
+import { useDiscoveredConnectionRevisions } from '../../lib/k8s/api/v2/discoveredConnectionRevisions';
 import { createRouteURL } from '../../lib/router/createRouteURL';
 import { getDefaultRoutes } from '../../lib/router/getDefaultRoutes';
 import { getRoutePath } from '../../lib/router/getRoutePath';
@@ -160,9 +161,10 @@ function AuthRoute(props: AuthRouteProps) {
 
   useSidebarItem(sidebar, computedMatch);
   const cluster = useCluster();
+  const revision = useDiscoveredConnectionRevisions().get(cluster ?? '');
   const query = useQuery({
-    queryKey: ['auth', cluster],
-    queryFn: () => testAuth(cluster!),
+    queryKey: ['auth', cluster, revision],
+    queryFn: () => testAuth(cluster!, undefined, { revision }),
     enabled: !!cluster && requiresAuth,
     retry: 0,
   });

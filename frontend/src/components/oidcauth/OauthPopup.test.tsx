@@ -15,7 +15,7 @@
  */
 
 import Button from '@mui/material/Button';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
 import { AUTH_STATUS_KEY } from './constants';
 import OauthPopup from './OauthPopup';
@@ -63,6 +63,60 @@ describe('OauthPopup', () => {
 
     expect(removeEventListenerSpy).toHaveBeenCalledWith('storage', storageListener);
     expect(popupWindow.close).toHaveBeenCalled();
+  });
+
+  it.each([false, true])('waits for an import redirect (closed: %s)', async closed => {
+    const replace = vi.fn();
+    const popupWindow = { closed: false, close: vi.fn(), location: { replace } };
+    const open = vi.spyOn(window, 'open').mockReturnValue(popupWindow as unknown as Window);
+    const redirect = Promise.withResolvers<string>();
+    const { unmount } = render(
+      <OauthPopup
+        button={Button}
+        url="https://example.com/oidc?cluster=workload&__headlamp_connection_revision=import-revision"
+        prepareUrl={() => redirect.promise}
+        onCode={vi.fn()}
+      >
+        Sign in
+      </OauthPopup>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    expect(open).toHaveBeenCalledWith('about:blank', expect.any(String), expect.any(String));
+    if (closed) unmount();
+    redirect.resolve('https://provider.example/authorize');
+    if (closed) {
+      await redirect.promise;
+      expect(replace).not.toHaveBeenCalled();
+    } else {
+      await waitFor(() =>
+        expect(replace).toHaveBeenCalledWith('https://provider.example/authorize')
+      );
+    }
+  });
+
+  it('only accepts the authentication result for its selected connection', () => {
+    vi.spyOn(window, 'open').mockReturnValue({ close: vi.fn() } as unknown as Window);
+    const onCode = vi.fn();
+    render(
+      <OauthPopup
+        button={Button}
+        url="https://example.com/oidc?cluster=workload&__headlamp_connection_revision=replacement"
+        title="Auth Popup"
+        onCode={onCode}
+      >
+        Open Auth Popup
+      </OauthPopup>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Open Auth Popup' }));
+    localStorage.setItem('auth_status.workload.original', 'success');
+    fireEvent(window, new Event('storage'));
+    expect(onCode).not.toHaveBeenCalled();
+
+    localStorage.setItem('auth_status.workload.replacement', 'success');
+    fireEvent(window, new Event('storage'));
+    expect(onCode).toHaveBeenCalledExactlyOnceWith('success');
   });
 
   it('removes the storage listener when popup authentication times out', () => {

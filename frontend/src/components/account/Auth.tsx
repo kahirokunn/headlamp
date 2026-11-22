@@ -31,12 +31,28 @@ import { getCluster, getClusterPrefixedPath } from '../../lib/cluster';
 import { useClustersConf } from '../../lib/k8s';
 import { testAuth } from '../../lib/k8s/api/v1/clusterApi';
 import { ApiError } from '../../lib/k8s/api/v2/ApiError';
+import {
+  getDiscoveredConnectionRevision,
+  useDiscoveredConnectionRevisions,
+} from '../../lib/k8s/api/v2/discoveredConnectionRevisions';
 import { ClusterDialog } from '../cluster/Chooser';
 import { DialogTitle } from '../common/Dialog';
 import HeadlampLink from '../common/Link';
 import PasswordForm from '../common/PasswordForm';
 
 export default function AuthToken() {
+  const cluster = getCluster();
+  const revision = useDiscoveredConnectionRevisions().get(cluster ?? '');
+  return (
+    <AuthTokenForm
+      key={JSON.stringify([cluster, revision])}
+      cluster={cluster}
+      revision={revision}
+    />
+  );
+}
+
+function AuthTokenForm({ cluster, revision }: { cluster: string | null; revision?: string }) {
   const history = useHistory();
   const location = useLocation<{ from?: Location }>();
   const clusterConf = useClustersConf();
@@ -45,8 +61,20 @@ export default function AuthToken() {
   const clusters = useClustersConf();
   const { t } = useTranslation();
 
+  const active = React.useRef(true);
+  React.useEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
+
   function onAuthClicked() {
-    loginWithToken(token).then(code => {
+    loginWithToken(token, cluster, revision).then(code => {
+      if (!active.current || (cluster && getDiscoveredConnectionRevision(cluster) !== revision)) {
+        return;
+      }
+
       // If successful, redirect.
       if (code === 200) {
         if (location.state && location.state.from) {
@@ -54,7 +82,7 @@ export default function AuthToken() {
         } else {
           history.replace(
             generatePath(getClusterPrefixedPath(), {
-              cluster: getCluster() as string,
+              cluster: cluster as string,
             })
           );
         }
@@ -67,10 +95,13 @@ export default function AuthToken() {
 
   return (
     <PureAuthToken
-      onCancel={() => history.replace('/')}
+      onCancel={() => {
+        active.current = false;
+        history.replace('/');
+      }}
       title={
         Object.keys(clusterConf || {}).length > 1
-          ? t('Authentication: {{ clusterName }}', { clusterName: getCluster() })
+          ? t('Authentication: {{ clusterName }}', { clusterName: cluster })
           : t('Authentication')
       }
       token={token}
@@ -209,16 +240,15 @@ export function PureAuthToken({
   );
 }
 
-async function loginWithToken(token: string) {
+async function loginWithToken(token: string, cluster: string | null, revision?: string) {
   try {
-    const cluster = getCluster();
     if (!cluster) {
       // Expectation failed.
       return 417;
     }
 
-    await setToken(cluster, token);
-    await testAuth();
+    await setToken(cluster, token, { revision });
+    await testAuth(cluster, undefined, { revision });
 
     return 200;
   } catch (err) {

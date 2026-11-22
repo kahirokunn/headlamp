@@ -92,3 +92,17 @@ export function isAppUrl(url: string, startUrl: string): boolean {
     return false;
   }
 }
+
+/** Allows provider navigation without exposing desktop APIs or opening external protocols. */
+export function isOIDCProviderNavigation(url: URL, backendOrigin: string): boolean {
+  return (
+    !url.username &&
+    !url.password &&
+    (url.protocol === 'https:' ||
+      (url.protocol === 'http:' &&
+        (url.origin === backendOrigin ||
+          url.hostname === 'localhost' ||
+          url.hostname === '[::1]' ||
+          /^127\.\d+\.\d+\.\d+$/.test(url.hostname))))
+  );
+}

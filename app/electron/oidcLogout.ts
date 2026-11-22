@@ -31,30 +31,42 @@
  */
 
 import { BrowserWindow } from 'electron';
-
-/** Allows provider navigation without exposing desktop APIs or opening external protocols. */
-export function isOIDCLogoutNavigation(url: URL, backendOrigin: string): boolean {
-  return (
-    !url.username &&
-    !url.password &&
-    (url.protocol === 'https:' ||
-      (url.protocol === 'http:' &&
-        (url.origin === backendOrigin ||
-          url.hostname === 'localhost' ||
-          url.hostname === '[::1]' ||
-          /^127\.\d+\.\d+\.\d+$/.test(url.hostname))))
-  );
-}
+import { isOIDCProviderNavigation } from './urlSafety';
 
 /** Initiates logout in the backend session and follows redirects in an unprivileged window. */
 export async function openOIDCLogout(
   parent: BrowserWindow,
   backendOrigin: string,
   backendToken: string,
-  cluster: unknown
+  cluster: unknown,
+  routingRevision: unknown = 'unversioned',
+  kubeconfig?: unknown,
+  userId?: unknown,
+  importKey?: unknown
 ): Promise<void> {
   if (typeof cluster !== 'string' || !cluster || cluster.length > 4096) {
     throw new Error('Invalid OIDC logout cluster');
+  }
+  if (typeof routingRevision !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(routingRevision)) {
+    throw new Error('Invalid OIDC logout connection revision');
+  }
+  let importHeaders: Record<string, string> | undefined;
+  if (routingRevision.startsWith('import-')) {
+    if (
+      typeof kubeconfig !== 'string' ||
+      !kubeconfig ||
+      typeof userId !== 'string' ||
+      typeof importKey !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(importKey) ||
+      !userId.endsWith(`--${routingRevision}`)
+    ) {
+      throw new Error('Invalid OIDC logout import');
+    }
+    importHeaders = {
+      KUBECONFIG: kubeconfig,
+      'X-HEADLAMP-USER-ID': userId,
+      'X-Headlamp-Import-Key': importKey,
+    };
   }
   const clusterPath = `/encoded-clusters/${Buffer.from(cluster).toString('base64url')}`;
   const response = await parent.webContents.session.fetch(
@@ -64,6 +76,8 @@ export async function openOIDCLogout(
       headers: {
         'Content-Type': 'application/json',
         'X-HEADLAMP_BACKEND-TOKEN': backendToken,
+        'X-Headlamp-Connection-Revision': routingRevision,
+        ...importHeaders,
       },
       credentials: 'include',
       redirect: 'error',
@@ -82,7 +96,7 @@ export async function openOIDCLogout(
     throw new Error('Invalid OIDC logout redirect');
   }
   const redirect = new URL(result.redirectURL, backendOrigin);
-  if (!isOIDCLogoutNavigation(redirect, backendOrigin)) {
+  if (!isOIDCProviderNavigation(redirect, backendOrigin)) {
     throw new Error('Invalid OIDC logout redirect protocol');
   }
   if (
@@ -106,7 +120,7 @@ export async function openOIDCLogout(
   let returnedToApp = false;
   const validateNavigation = (event: Electron.Event, target: string) => {
     const url = new URL(target);
-    if (!isOIDCLogoutNavigation(url, backendOrigin)) {
+    if (!isOIDCProviderNavigation(url, backendOrigin)) {
       event.preventDefault();
       popup.close();
       return;

@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { useLocation } from 'react-router-dom';
 import { TestContext } from '../../test';
 import AuthToken, { PureAuthToken, PureAuthTokenProps } from './Auth';
 
@@ -205,6 +206,35 @@ describe('AuthToken (stateful)', () => {
     mockSetToken.mockReset();
     mockTestAuth.mockReset();
     mockGetCluster.mockReturnValue('test-cluster');
+  });
+
+  it('does not navigate when the token check returns after the form closes', async () => {
+    const checked = Promise.withResolvers<void>();
+    mockSetToken.mockResolvedValue(undefined);
+    mockTestAuth.mockReturnValue(checked.promise);
+
+    function Location() {
+      return <span>{useLocation().pathname}</span>;
+    }
+
+    const page = (open: boolean) => (
+      <TestContext>
+        <Location />
+        {open && <AuthToken />}
+      </TestContext>
+    );
+    const { rerender } = render(page(true));
+    fireEvent.change(screen.getByLabelText('ID token'), { target: { value: 'token' } });
+    fireEvent.click(screen.getByRole('button', { name: /Authenticate/i }));
+    await waitFor(() => expect(mockTestAuth).toHaveBeenCalledTimes(1));
+
+    rerender(page(false));
+    await act(async () => {
+      checked.resolve();
+    });
+
+    expect(screen.getByText('/')).toBeInTheDocument();
+    expect(screen.queryByText('/c/test-cluster')).not.toBeInTheDocument();
   });
 
   it('shows error snackbar after authentication failure', async () => {

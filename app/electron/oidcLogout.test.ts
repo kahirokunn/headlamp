@@ -32,7 +32,8 @@
 
 import { BrowserWindow } from 'electron';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { isOIDCLogoutNavigation, openOIDCLogout } from './oidcLogout';
+import { openOIDCLogout } from './oidcLogout';
+import { isOIDCProviderNavigation } from './urlSafety';
 
 vi.mock('electron', () => ({ BrowserWindow: vi.fn() }));
 
@@ -71,12 +72,13 @@ describe('desktop OIDC logout', () => {
   });
 
   it('authenticates only backend initiation and follows navigation in an isolated shared-session window', async () => {
-    await openOIDCLogout(parent, origin, 'backend-secret', 'main');
+    await openOIDCLogout(parent, origin, 'backend-secret', 'main', 'original-revision');
     expect(fetch).toHaveBeenCalledWith(`${origin}/encoded-clusters/bWFpbg/oidc-logout`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-HEADLAMP_BACKEND-TOKEN': 'backend-secret',
+        'X-Headlamp-Connection-Revision': 'original-revision',
       },
       credentials: 'include',
       redirect: 'error',
@@ -102,6 +104,32 @@ describe('desktop OIDC logout', () => {
     const windowHandler = setWindowOpenHandler.mock.calls[0][0];
     expect(windowHandler({ url: 'https://provider.example' })).toEqual({ action: 'deny' });
     vi.useRealTimers();
+  });
+
+  it('keeps the selected import in the authenticated logout request', async () => {
+    const revision = 'import-0123456789abcdef0123456789abcdef-1';
+    const userId = `test-user--${revision}`;
+    await openOIDCLogout(
+      parent,
+      origin,
+      'secret',
+      'main',
+      revision,
+      'test-kubeconfig',
+      userId,
+      'a'.repeat(64)
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      `${origin}/encoded-clusters/bWFpbg/oidc-logout`,
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          KUBECONFIG: 'test-kubeconfig',
+          'X-HEADLAMP-USER-ID': userId,
+          'X-Headlamp-Connection-Revision': revision,
+        }),
+      })
+    );
+    expect(loadURL).toHaveBeenCalledWith(transition);
   });
 
   it('resolves backend-relative transitions', async () => {
@@ -169,7 +197,7 @@ describe('desktop OIDC logout', () => {
   it.each(['file:///tmp/a', 'headlamp://danger', 'http://provider.example'])(
     'blocks unsafe redirect protocols %s',
     target => {
-      expect(isOIDCLogoutNavigation(new URL(target), origin)).toBe(false);
+      expect(isOIDCProviderNavigation(new URL(target), origin)).toBe(false);
       vi.useRealTimers();
     }
   );

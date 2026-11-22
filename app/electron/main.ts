@@ -60,6 +60,7 @@ import {
 import { runListPluginsCommand } from './list-plugins';
 import MCPClient from './mcp/MCPClient';
 import { AppMenu, menusToTemplate } from './menu';
+import { openOIDCLogin } from './oidcLogin';
 import { filterUserOwnedPids } from './ownedProcesses';
 import {
   addToPath,
@@ -1853,18 +1854,64 @@ function startElectron() {
       setMenu(mainWindow, currentMenu);
     });
 
-    ipcMain.handle('oidc-logout', async (event, cluster: unknown) => {
-      if (!mainWindow || !isFromMainWindowFrame(event, mainWindow)) {
-        throw new Error('OIDC logout IPC request rejected');
+    let login: { state: string; controller: AbortController } | undefined;
+    ipcMain.on('cancel-oidc-login', (event, state: unknown) => {
+      if (isFromMainWindowFrame(event, mainWindow) && login && login.state === state) {
+        login.controller.abort();
       }
-      const { openOIDCLogout } = await import('./oidcLogout');
-      await openOIDCLogout(
-        mainWindow,
-        `http://${INTERNAL_BACKEND_HOST}:${actualPort}`,
-        backendToken,
-        cluster
-      );
     });
+    ipcMain.handle('oidc-login', async (event, providerUrl: unknown) => {
+      if (
+        !mainWindow ||
+        !isFromMainWindowFrame(event, mainWindow) ||
+        typeof providerUrl !== 'string'
+      ) {
+        throw new Error('OIDC login IPC request rejected');
+      }
+      const provider = new URL(providerUrl);
+      const state = provider.searchParams.get('state');
+      if (!state) throw new Error('Missing OIDC state');
+      login?.controller.abort();
+      const controller = new AbortController();
+      login = { state, controller };
+      try {
+        return await openOIDCLogin(
+          mainWindow,
+          `http://${INTERNAL_BACKEND_HOST}:${actualPort}`,
+          provider,
+          controller.signal
+        );
+      } finally {
+        if (login?.controller === controller) login = undefined;
+      }
+    });
+
+    ipcMain.handle(
+      'oidc-logout',
+      async (
+        event,
+        cluster: unknown,
+        routingRevision: unknown,
+        kubeconfig: unknown,
+        userId: unknown,
+        importKey: unknown
+      ) => {
+        if (!mainWindow || !isFromMainWindowFrame(event, mainWindow)) {
+          throw new Error('OIDC logout IPC request rejected');
+        }
+        const { openOIDCLogout } = await import('./oidcLogout');
+        await openOIDCLogout(
+          mainWindow,
+          `http://${INTERNAL_BACKEND_HOST}:${actualPort}`,
+          backendToken,
+          cluster,
+          routingRevision,
+          kubeconfig,
+          userId,
+          importKey
+        );
+      }
+    );
 
     ipcMain.on('appConfig', event => {
       if (!isFromMainWindowFrame(event, mainWindow)) {

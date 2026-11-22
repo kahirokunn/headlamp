@@ -15,17 +15,30 @@
  */
 
 import { ThemeProvider } from '@mui/material/styles';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import * as yaml from 'js-yaml';
 import { decodeBase64 } from '../../helpers/base64';
-import { setCluster } from '../../lib/k8s/api/v1/clusterApi';
+import { stageClusterImport } from '../../lib/k8s/api/v1/clusterApi';
 import { createMuiTheme } from '../../lib/themes';
+import { setStatelessConfig } from '../../redux/configSlice';
+import store from '../../redux/stores/store';
+import { discardPendingKubeconfigRecord, publishKubeconfigRecord } from '../../stateless/records';
+import { retireImportedConnection } from '../../stateless/retireConnections';
 import { TestContext } from '../../test';
 import KubeConfigLoader, { PureKubeConfigLoader, Step } from './KubeConfigLoader';
 
 vi.mock('../../lib/k8s/api/v1/clusterApi', async importOriginal => ({
   ...(await importOriginal<typeof import('../../lib/k8s/api/v1/clusterApi')>()),
-  setCluster: vi.fn(),
+  stageClusterImport: vi.fn(),
+}));
+
+vi.mock('../../stateless/records', async importOriginal => ({
+  ...(await importOriginal<typeof import('../../stateless/records')>()),
+  discardPendingKubeconfigRecord: vi.fn().mockResolvedValue(undefined),
+  publishKubeconfigRecord: vi.fn(async (_id, _displaced, install) => install?.()),
+}));
+vi.mock('../../stateless/retireConnections', () => ({
+  retireImportedConnection: vi.fn(),
 }));
 
 function config(name: string) {
@@ -56,11 +69,11 @@ function renderLoader() {
 }
 
 function submittedConfig() {
-  const request = vi.mocked(setCluster).mock.lastCall?.[0];
-  if (!request?.kubeconfig) {
+  const request = vi.mocked(stageClusterImport).mock.lastCall?.[0];
+  if (!request) {
     throw new Error('No kubeconfig submitted');
   }
-  return yaml.load(decodeBase64(request.kubeconfig));
+  return yaml.load(decodeBase64(request));
 }
 
 async function importFiles(input: Element, files: File[]) {
@@ -70,8 +83,10 @@ async function importFiles(input: Element, files: File[]) {
 
 describe('KubeConfigLoader', () => {
   beforeEach(() => {
-    vi.mocked(setCluster).mockReset();
-    vi.mocked(setCluster).mockResolvedValue({ clusters: [] });
+    store.dispatch(setStatelessConfig({ statelessClusters: null }));
+    vi.mocked(retireImportedConnection).mockReset().mockResolvedValue(undefined);
+    vi.mocked(stageClusterImport).mockReset();
+    vi.mocked(stageClusterImport).mockResolvedValue({ clusters: [] });
   });
 
   afterEach(() => {
@@ -285,13 +300,70 @@ describe('KubeConfigLoader', () => {
     );
   });
 
-  it('clears a previous configuration error when retrying successfully', async () => {
+  it('discards the staged kubeconfig when retirement fails', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
-    vi.mocked(setCluster).mockRejectedValueOnce(new Error('Server unavailable'));
+    const original = { name: 'shared', auth_type: 'token' as const, kubeconfigRecordId: 40 };
+    store.dispatch(setStatelessConfig({ statelessClusters: { shared: original } }));
+    vi.mocked(stageClusterImport).mockResolvedValueOnce({
+      pendingRecordId: 41,
+      clusters: [{ ...original, kubeconfigRecordId: 41 }],
+    });
+    vi.mocked(retireImportedConnection).mockRejectedValueOnce(new Error('Retirement unavailable'));
+
     const { input } = renderLoader();
     await importFiles(input, [file('valid.yaml', config('valid'))]);
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('Error setting up clusters');
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Retirement unavailable');
+    expect(discardPendingKubeconfigRecord).toHaveBeenCalledWith(41);
+    expect(publishKubeconfigRecord).not.toHaveBeenCalled();
+    expect(store.getState().config.statelessClusters?.shared).toEqual(original);
+  });
+
+  it.each([false, true])('handles a competing selection (same name: %s)', async sameName => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const original = { name: 'shared', auth_type: 'token' as const, kubeconfigRecordId: 50 };
+    const imported = { ...original, kubeconfigRecordId: 51 };
+    store.dispatch(setStatelessConfig({ statelessClusters: { shared: original } }));
+    vi.mocked(stageClusterImport).mockResolvedValueOnce({
+      pendingRecordId: 51,
+      clusters: [imported],
+    });
+    const retirement = Promise.withResolvers<void>();
+    vi.mocked(retireImportedConnection).mockReturnValueOnce(retirement.promise);
+
+    const { input } = renderLoader();
+    await importFiles(input, [file('valid.yaml', config('valid'))]);
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await waitFor(() => expect(retireImportedConnection).toHaveBeenCalled());
+
+    const other = { ...original, name: sameName ? 'shared' : 'other', kubeconfigRecordId: 52 };
+    act(() => {
+      store.dispatch(
+        setStatelessConfig({ statelessClusters: { shared: original, [other.name]: other } })
+      );
+    });
+    retirement.resolve();
+
+    if (sameName) {
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'The selected kubeconfig changed during import'
+      );
+      expect(discardPendingKubeconfigRecord).toHaveBeenCalledWith(51);
+      expect(store.getState().config.statelessClusters?.shared).toEqual(other);
+    } else {
+      await screen.findByText('Clusters successfully set up!');
+      expect(store.getState().config.statelessClusters).toEqual({ shared: imported, other });
+    }
+  });
+
+  it('clears a previous configuration error when retrying successfully', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(stageClusterImport).mockRejectedValueOnce(new Error('Server unavailable'));
+    const { input } = renderLoader();
+    await importFiles(input, [file('valid.yaml', config('valid'))]);
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Server unavailable');
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     await screen.findByText('Clusters successfully set up!');
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();

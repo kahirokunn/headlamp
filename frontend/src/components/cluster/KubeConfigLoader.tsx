@@ -30,14 +30,17 @@ import * as yaml from 'js-yaml';
 import React, { useEffect, useState } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { useTranslation } from 'react-i18next';
-import { useDispatch } from 'react-redux';
 import { useHistory } from 'react-router-dom';
 import { encodeBase64 } from '../../helpers/base64';
 import { useClustersConf } from '../../lib/k8s';
-import { setCluster } from '../../lib/k8s/api/v1/clusterApi';
-import { setStatelessConfig } from '../../redux/configSlice';
+import { stageClusterImport } from '../../lib/k8s/api/v1/clusterApi';
+import type { Cluster as ConfiguredCluster } from '../../lib/k8s/cluster';
 import store from '../../redux/stores/store';
 import { mergeStatelessConfigState } from '../../stateless';
+import { installKubeconfigRecord } from '../../stateless/installKubeconfigRecord';
+import { displacedImport, sameImportedSelection } from '../../stateless/records';
+import { retireImportedConnection } from '../../stateless/retireConnections';
+import { rollbackKubeconfigImport } from '../../stateless/rollbackKubeconfigImport';
 import { DialogTitle } from '../common/Dialog';
 import { DropZoneBox } from '../common/DropZoneBox';
 import Loader from '../common/Loader';
@@ -452,7 +455,6 @@ function KubeConfigLoader() {
   });
   const [selectedClusters, setSelectedClusters] = useState<string[]>([]);
   const configuredClusters = useClustersConf(); // Get already configured clusters
-  const dispatch = useDispatch();
   const { t } = useTranslation(['translation']);
 
   useEffect(() => {
@@ -484,27 +486,59 @@ function KubeConfigLoader() {
       }
     }
     if (state === Step.ConfigureClusters) {
-      function loadClusters() {
+      async function loadClusters() {
         const selectedClusterConfig = configWithSelectedClusters(fileContent, selectedClusters);
-        setCluster({ kubeconfig: encodeBase64(yaml.dump(selectedClusterConfig)) })
-          .then(parsedConfig => {
-            if (parsedConfig?.clusters?.length > 0) {
-              const currentStatelessClusters = store.getState().config.statelessClusters;
-              dispatch(
-                setStatelessConfig(
-                  mergeStatelessConfigState(currentStatelessClusters, parsedConfig)
-                )
-              );
+        let pendingRecordId: number | undefined;
+        let previous: Array<ConfiguredCluster | undefined> = [];
+        let retirementStarted = false;
+        try {
+          const current = store.getState().config.statelessClusters;
+          const parsedConfig = await stageClusterImport(
+            encodeBase64(yaml.dump(selectedClusterConfig))
+          );
+          pendingRecordId = parsedConfig.pendingRecordId;
+          const imported: ConfiguredCluster[] = parsedConfig.clusters;
+          previous = imported.map(cluster => current?.[cluster.name]);
+          const newestSelection = () => {
+            const newest = store.getState().config.statelessClusters;
+            if (
+              imported.some(
+                (cluster, index) =>
+                  !sameImportedSelection(newest?.[cluster.name], previous[index]) &&
+                  (pendingRecordId === undefined ||
+                    newest?.[cluster.name]?.kubeconfigRecordId !== pendingRecordId)
+              )
+            ) {
+              throw new Error('The selected kubeconfig changed during import');
             }
-            setState(Step.Success);
-          })
-          .catch(e => {
-            console.error('Error setting up clusters from kubeconfig:', e);
-            setError(
-              t('translation|Error setting up clusters, please load a valid kubeconfig file')
-            );
-            setState(Step.SelectClusters);
-          });
+            return newest;
+          };
+
+          newestSelection();
+          retirementStarted = true;
+          const retirements = await Promise.allSettled(
+            imported.map((cluster, index) =>
+              retireImportedConnection(previous[index], cluster.importRevision)
+            )
+          );
+          for (const result of retirements) {
+            if (result.status === 'rejected') throw result.reason;
+          }
+          newestSelection();
+          await installKubeconfigRecord(
+            pendingRecordId,
+            previous.map(displacedImport),
+            imported.map(cluster => cluster.name),
+            () => mergeStatelessConfigState(newestSelection(), parsedConfig)
+          );
+          setState(Step.Success);
+        } catch (error) {
+          await rollbackKubeconfigImport(pendingRecordId, retirementStarted ? previous : []);
+          console.error('Error setting up clusters from kubeconfig:', error);
+          setError(t('translation|Error setting up clusters, please load a valid kubeconfig file'));
+          setErrorDetails([error instanceof Error ? error.message : String(error)]);
+          setState(Step.SelectClusters);
+        }
       }
       loadClusters();
     }

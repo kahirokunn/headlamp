@@ -235,6 +235,7 @@ describe('useSidebarItems', () => {
       await waitFor(() =>
         expect(request).toHaveBeenCalledWith('/apis/scheduling.k8s.io/v1alpha2', {
           cluster: 'test-cluster',
+          expectedDiscoveryConnection: { revision: undefined },
         })
       );
       expect(schedulingItems(result.current)).toBeUndefined();

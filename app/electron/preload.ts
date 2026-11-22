@@ -32,7 +32,15 @@ const wrappedListeners = new WeakMap<
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
 contextBridge.exposeInMainWorld('desktopApi', {
-  oidcLogout: (cluster: string) => ipcRenderer.invoke('oidc-logout', cluster),
+  oidcLogin: (providerUrl: string) => ipcRenderer.invoke('oidc-login', providerUrl),
+  cancelOidcLogin: (state: string) => ipcRenderer.send('cancel-oidc-login', state),
+  oidcLogout: (
+    cluster: string,
+    routingRevision?: string,
+    kubeconfig?: string,
+    userId?: string,
+    importKey?: string
+  ) => ipcRenderer.invoke('oidc-logout', cluster, routingRevision, kubeconfig, userId, importKey),
   isDevelopment: Boolean(process.env.ELECTRON_DEV),
   getDevelopmentPluginsEnabled: () => ipcRenderer.invoke('get-development-plugins'),
   send: (channel: string, data: unknown) => {

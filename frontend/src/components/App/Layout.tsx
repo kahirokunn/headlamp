@@ -33,6 +33,7 @@ import {
   setRuntimeBackstageOrigins,
   setupBackstageMessageReceiver,
 } from '../../helpers/backstageMessageReceiver';
+import { hasConfiguredClusterSources } from '../../helpers/clusterPresentation';
 import { isBackstage } from '../../helpers/isBackstage';
 import { getCluster } from '../../lib/cluster';
 import { getSelectedClusters } from '../../lib/cluster';
@@ -41,7 +42,7 @@ import { request } from '../../lib/k8s/api/v1/clusterRequests';
 import { Cluster } from '../../lib/k8s/cluster';
 import { getSavedNamespaces } from '../../lib/storage';
 import { getUserSelectedThemeName } from '../../lib/themes';
-import { setConfig } from '../../redux/configSlice';
+import { getEffectiveCluster, setConfig } from '../../redux/configSlice';
 import { ConfigState } from '../../redux/configSlice';
 import { setNamespaceFilter } from '../../redux/filterSlice';
 import { useTypedSelector } from '../../redux/hooks';
@@ -59,6 +60,7 @@ import AlertNotification from '../common/AlertNotification';
 import DetailsDrawer from '../common/Resource/DetailsDrawer';
 import Sidebar, { NavigationTabs } from '../Sidebar';
 import AllowedNamespacesSelectorGate from './AllowedNamespacesSelectorGate';
+import { watchClusterConfig } from './clusterConfigEvents';
 import ResourceShortcuts from './ResourceShortcuts';
 import RouteSwitcher from './RouteSwitcher';
 import ShortcutsSettings from './Settings/ShortcutsSettings';
@@ -127,12 +129,17 @@ function mergeClusterConfigs(
     });
   }
 
-  // Preserve useToken property
+  // A login decision belongs to the connection that was configured at the time.
   Object.entries(mergedClusters).forEach(([key, cluster]) => {
-    if (currentClusters[key]?.useToken !== undefined) {
+    const previous = currentClusters[key];
+    if (
+      previous?.useToken !== undefined &&
+      previous.meta_data?.discoveryConnectionRevision ===
+        cluster.meta_data?.discoveryConnectionRevision
+    ) {
       mergedClusters[key] = {
         ...cluster,
-        useToken: currentClusters[key].useToken,
+        useToken: previous.useToken,
       };
     }
   });
@@ -150,12 +157,11 @@ declare global {
  * Fetches the cluster config from the backend and updates the redux store
  * if the present stored config is different from the fetched one.
  */
-const fetchConfig = (dispatch: Dispatch<UnknownAction>) => {
-  const clusters = store.getState().config.clusters;
-  const statelessClusters = store.getState().config.statelessClusters;
-  const currentBackstageOrigin = store.getState().config.backstageOrigin ?? '';
-
+const fetchConfig = (dispatch: Dispatch<UnknownAction>, signal: AbortSignal) => {
   return request('/config', { timeout: CONFIG_FETCH_TIMEOUT_MS }, false, false).then(config => {
+    // A new notification can supersede a still-running poll.
+    signal.throwIfAborted();
+    const { clusters, statelessClusters, backstageOrigin } = store.getState().config;
     const clustersToConfig: ConfigState['clusters'] = {};
     config?.clusters.forEach((cluster: Cluster) => {
       clustersToConfig[cluster.name] = cluster;
@@ -178,7 +184,7 @@ const fetchConfig = (dispatch: Dispatch<UnknownAction>) => {
       // Check if the config is different
       const configDifferent =
         isEqualClusterConfigs(clusters, clustersToConfig) ||
-        currentBackstageOrigin !== nextBackstageOrigin ||
+        (backstageOrigin ?? '') !== nextBackstageOrigin ||
         !isEqual(store.getState().config.clusterSources, configToStore.clusterSources);
 
       if (configDifferent) {
@@ -227,7 +233,10 @@ export default function Layout({}: LayoutProps) {
   const arePluginsLoaded = useTypedSelector(state => state.plugins.loaded);
   const isThemeConfigReady = useTypedSelector(state => state.theme.backendConfigReady);
   const dispatch = useDispatch();
-  const clusters = useTypedSelector(state => state.config.clusters);
+  const authenticationCluster = useTypedSelector(state =>
+    getEffectiveCluster(state.config, getCluster() || '')
+  );
+  const requiresToken = () => authenticationCluster?.useToken !== false;
   const isFullWidth = useTypedSelector(state => state.ui.isFullWidth);
   const { t } = useTranslation();
   const allClusters = useClustersConf();
@@ -267,14 +276,22 @@ export default function Layout({}: LayoutProps) {
     data: config,
     isLoading,
     error,
+    refetch,
   } = useQuery({
     queryKey: ['cluster-fetch'],
-    queryFn: () => fetchConfig(dispatch),
+    queryFn: ({ signal }) => fetchConfig(dispatch, signal),
     retry: false,
     refetchInterval: disableBackendLoader
       ? CLUSTER_FETCH_INTERVAL
       : query => (query.state.status === 'error' ? false : CLUSTER_FETCH_INTERVAL),
   });
+
+  const discoveryEnabled = useTypedSelector(state =>
+    hasConfiguredClusterSources(state.config.clusterSources)
+  );
+  useEffect(() => {
+    if (discoveryEnabled) return watchClusterConfig(() => refetch({ throwOnError: true }));
+  }, [discoveryEnabled, refetch]);
 
   // Remove splash screen styles from the body
   // that are added in frontend/index.html
@@ -446,22 +463,10 @@ export default function Layout({}: LayoutProps) {
                   <NavigationTabs />
                   {clustersToResolve.length > 0 ? (
                     <AllowedNamespacesSelectorGate clusters={clustersToResolve}>
-                      <RouteSwitcher
-                        requiresToken={() => {
-                          const clusterName = getCluster() || '';
-                          const cluster = clusters ? clusters[clusterName] : undefined;
-                          return cluster?.useToken === undefined || cluster?.useToken;
-                        }}
-                      />
+                      <RouteSwitcher requiresToken={requiresToken} />
                     </AllowedNamespacesSelectorGate>
                   ) : (
-                    <RouteSwitcher
-                      requiresToken={() => {
-                        const clusterName = getCluster() || '';
-                        const cluster = clusters ? clusters[clusterName] : undefined;
-                        return cluster?.useToken === undefined || cluster?.useToken;
-                      }}
-                    />
+                    <RouteSwitcher requiresToken={requiresToken} />
                   )}
                 </Container>
               </Box>
