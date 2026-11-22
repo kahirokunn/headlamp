@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1318,6 +1319,8 @@ func TestWatchAddUpdateDeleteSyncsContext(t *testing.T) {
 
 	headlampContext := requireProfileContextEventually(t, store, "in-cluster/default/spoke-a")
 	require.Equal(t, "https://spoke-a.example.com", headlampContext.Cluster.Server)
+	initialRevision := headlampContext.Discovery.ConnectionRevision
+	require.NotEmpty(t, initialRevision)
 
 	updated := clusterProfile("spoke-a", "static-token", "https://spoke-a-updated.example.com")
 	updated.ObjectMeta = created.ObjectMeta
@@ -1327,7 +1330,8 @@ func TestWatchAddUpdateDeleteSyncsContext(t *testing.T) {
 	require.Eventually(t, func() bool {
 		headlampContext, err := getProfileContext(store, "in-cluster/default/spoke-a")
 
-		return err == nil && headlampContext.Cluster.Server == "https://spoke-a-updated.example.com"
+		return err == nil && headlampContext.Cluster.Server == "https://spoke-a-updated.example.com" &&
+			headlampContext.Discovery.ConnectionRevision != initialRevision
 	}, clusterInventoryTestEventuallyTimeout, clusterInventoryTestEventuallyTick)
 
 	require.NoError(t, client.ApisV1alpha1().ClusterProfiles("default").Delete(
@@ -1337,6 +1341,39 @@ func TestWatchAddUpdateDeleteSyncsContext(t *testing.T) {
 	))
 
 	requireNoProfileContextEventually(t, store, "in-cluster/default/spoke-a")
+}
+
+func TestClusterProfileProxyCredentialRotationChangesConnectionRevision(t *testing.T) {
+	store := kubeconfig.NewContextStore()
+	runner := newTestRunner(t, Options{
+		Store:     store,
+		HubConfig: &rest.Config{Host: "https://hub.example.com"},
+	})
+	profile := clusterProfile("spoke-a", "static-token", "https://spoke-a.example.com")
+	profile.ResourceVersion = "1"
+	proxy := url.URL{Scheme: "http", Host: "proxy.example.com:8080", User: url.UserPassword("fixture-user", "initial")}
+	profile.Status.AccessProviders[0].Cluster.ProxyURL = proxy.String()
+	client := ciafake.NewSimpleClientset(profile)
+	runner.source.(*clusterProfileSource).clientForConfig = func(*rest.Config) (ciaclient.Interface, error) {
+		return client, nil
+	}
+	ctx := testRunnerContext(t, runner)
+	reconcileAndWaitForRoot(t, ctx, runner, inClusterRootID)
+	initial := requireProfileContextEventually(t, store, "in-cluster/default/spoke-a")
+
+	replacement := profile.DeepCopy()
+	replacement.ResourceVersion = "2"
+	proxy.User = url.UserPassword("fixture-user", "rotated")
+	rotatedProxy := proxy.String()
+	replacement.Status.AccessProviders[0].Cluster.ProxyURL = rotatedProxy
+	_, err := client.ApisV1alpha1().ClusterProfiles("default").UpdateStatus(ctx, replacement, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		updated, err := getProfileContext(store, "in-cluster/default/spoke-a")
+
+		return err == nil && updated.ClusterID == initial.ClusterID && updated.Cluster.ProxyURL == rotatedProxy &&
+			updated.Discovery.ConnectionRevision != initial.Discovery.ConnectionRevision
+	}, clusterInventoryTestEventuallyTimeout, clusterInventoryTestEventuallyTick)
 }
 
 func TestWatchUpdateSyncsClusterInventoryConditions(t *testing.T) {
@@ -1359,6 +1396,7 @@ func TestWatchUpdateSyncsClusterInventoryConditions(t *testing.T) {
 		"HealthCheckFailed",
 		"control plane endpoint is not ready",
 	)
+	createdProfile.ResourceVersion = "1"
 	created, err := client.ApisV1alpha1().ClusterProfiles("default").Create(
 		ctx,
 		createdProfile,
@@ -1370,6 +1408,7 @@ func TestWatchUpdateSyncsClusterInventoryConditions(t *testing.T) {
 	require.NotNil(t, inventoryMetadata(headlampContext))
 	require.Len(t, inventoryMetadata(headlampContext).Conditions, 1)
 	require.Equal(t, metav1.ConditionFalse, inventoryMetadata(headlampContext).Conditions[0].Status)
+	initialRevision := headlampContext.Discovery.ConnectionRevision
 
 	updatedProfile := clusterProfileWithControlPlaneCondition(
 		metav1.ConditionTrue,
@@ -1377,6 +1416,7 @@ func TestWatchUpdateSyncsClusterInventoryConditions(t *testing.T) {
 		"control plane endpoint is ready",
 	)
 	updatedProfile.ObjectMeta = created.ObjectMeta
+	updatedProfile.ResourceVersion = "2"
 	_, err = client.ApisV1alpha1().ClusterProfiles("default").Update(ctx, updatedProfile, metav1.UpdateOptions{})
 	require.NoError(t, err)
 
@@ -1388,7 +1428,8 @@ func TestWatchUpdateSyncsClusterInventoryConditions(t *testing.T) {
 
 		conditions := inventoryMetadata(headlampContext).Conditions
 
-		return len(conditions) == 1 &&
+		return headlampContext.Discovery.ConnectionRevision == initialRevision &&
+			len(conditions) == 1 &&
 			conditions[0].Type == apisv1alpha1.ClusterConditionControlPlaneHealthy &&
 			conditions[0].Status == metav1.ConditionTrue &&
 			conditions[0].Reason == "HealthCheckSucceeded"

@@ -33,6 +33,16 @@ func ContextCacheKey(contextKey string, k *kubeconfig.Context) (string, error) {
 		return "", fmt.Errorf("context key and context are required for caching")
 	}
 
+	digest, err := ConnectionDigest(k)
+	if err != nil {
+		return "", err
+	}
+
+	return contextKey + "\x00" + digest, nil
+}
+
+// ConnectionDigest identifies the settings of one connection.
+func ConnectionDigest(k *kubeconfig.Context) (string, error) {
 	var cluster api.Cluster
 	if k.Cluster != nil {
 		cluster = *k.Cluster
@@ -62,20 +72,26 @@ func ContextCacheKey(contextKey string, k *kubeconfig.Context) (string, error) {
 		namespace = k.KubeContext.Namespace
 	}
 
+	revision := ""
+	if k.Discovery != nil {
+		revision = k.Discovery.ConnectionRevision
+	}
+
 	connection, err := json.Marshal(struct {
-		Cluster   api.Cluster
-		AuthInfo  api.AuthInfo
-		Source    int
-		Namespace string
+		Cluster           api.Cluster
+		AuthInfo          api.AuthInfo
+		Source            int
+		Namespace         string
+		DiscoveryRevision string `json:",omitempty"`
 		// These exec settings are excluded from AuthInfo's JSON.
 		ExecDetails any
-	}{cluster, authInfo, k.Source, namespace, execDetails})
+	}{cluster, authInfo, k.Source, namespace, revision, execDetails})
 	if err != nil {
 		// Serialization errors may contain credential values supplied by an exec plugin.
 		return "", fmt.Errorf("could not identify connection settings for caching")
 	}
 
-	return fmt.Sprintf("%s\x00%x", contextKey, sha256.Sum256(connection)), nil
+	return fmt.Sprintf("%x", sha256.Sum256(connection)), nil
 }
 
 // CacheKey identifies a representation of an API request within one connection.

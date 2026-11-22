@@ -134,16 +134,23 @@ const (
 
 // DiscoveryOrigin identifies a generated connection without imposing source-specific types.
 type DiscoveryOrigin struct {
-	Source      string
-	DisplayName string
-	Root        string
-	Namespace   string
-	Name        string
-	Entry       string
+	// ConnectionRevision identifies the current upstream connection settings.
+	ConnectionRevision string
+	Source             string
+	DisplayName        string
+	Root               string
+	Namespace          string
+	Name               string
+	Entry              string
+	Cluster            string
+	ResourceAPIVersion string
+	ResourceKind       string
+	ResourceUID        string
 }
 
 // Context contains all information related to a kubernetes context.
 type Context struct {
+	ImportRevision    string                     `json:"-"`
 	Discovery         *DiscoveryOrigin           `json:"-"`
 	DiscoveryMetadata map[string]json.RawMessage `json:"-"`
 	Presentation      *ConnectionPresentation    `json:"-"`
@@ -200,6 +207,7 @@ func (c *Context) Copy() *Context {
 	}
 
 	return &Context{
+		ImportRevision:        c.ImportRevision,
 		Discovery:             origin,
 		DiscoveryMetadata:     metadata,
 		Presentation:          c.Presentation.Copy(),
@@ -216,6 +224,19 @@ func (c *Context) Copy() *Context {
 		ClusterID:             c.ClusterID,
 		ClusterInventory:      c.ClusterInventory.DeepCopy(),
 	}
+}
+
+// RoutingRevision identifies the connection supplying requests for this context.
+func (c *Context) RoutingRevision() string {
+	if c == nil {
+		return ""
+	}
+
+	if c.Discovery != nil {
+		return c.Discovery.ConnectionRevision
+	}
+
+	return c.ImportRevision
 }
 
 // UsesInClusterServiceAccountToken reports whether this context should authenticate

@@ -38,13 +38,23 @@ type ContextStore interface {
 	RemoveContext(name string) error
 	AddContextWithKeyAndTTL(headlampContext *Context, key string, ttl time.Duration) error
 	UpdateTTL(key string, ttl time.Duration) error
+	RetainContext(key string, expected *Context, idleTTL time.Duration) (context.Context, func(), error)
 	AddListener(listener ContextChangeListener)
+	AddContextKeyListener(listener func(string))
 	GetContextKeys() ([]string, error)
 }
 
+type contextLease struct {
+	context.Context
+	cancel context.CancelFunc
+	users  int
+}
+
 type contextStore struct {
+	leaseMu   sync.Mutex
+	leases    map[string]*contextLease
 	cache     cache.Cache[*Context]
-	listeners []ContextChangeListener
+	listeners []func(string)
 	mu        sync.RWMutex
 }
 
@@ -53,17 +63,25 @@ func NewContextStore() ContextStore {
 	c := cache.New[*Context]()
 
 	cs := &contextStore{
-		cache: c,
+		cache:  c,
+		leases: make(map[string]*contextLease),
 	}
 
 	c.SetOnEvicted(func(key string, value *Context) {
-		cs.notifyListeners()
+		cs.notifyListeners(key)
 	})
 
 	return cs
 }
 
 func (c *contextStore) AddListener(listener ContextChangeListener) {
+	if listener != nil {
+		c.AddContextKeyListener(func(string) { listener() })
+	}
+}
+
+// AddContextKeyListener reports the storage key that was added, replaced, removed or expired.
+func (c *contextStore) AddContextKeyListener(listener func(string)) {
 	if listener == nil {
 		return
 	}
@@ -74,9 +92,9 @@ func (c *contextStore) AddListener(listener ContextChangeListener) {
 	c.listeners = append(c.listeners, listener)
 }
 
-func (c *contextStore) notifyListeners() {
+func (c *contextStore) notifyListeners(key string) {
 	c.mu.RLock()
-	listeners := make([]ContextChangeListener, len(c.listeners))
+	listeners := make([]func(string), len(c.listeners))
 	copy(listeners, c.listeners)
 	c.mu.RUnlock()
 
@@ -88,7 +106,7 @@ func (c *contextStore) notifyListeners() {
 				}
 			}()
 
-			listener()
+			listener(key)
 		}()
 	}
 }
@@ -122,12 +140,7 @@ func (c *contextStore) AddContext(headlampContext *Context) error {
 	// Keep the stored context identifier consistent with the cache key.
 	headlampContext.Name = name
 
-	err := c.cache.Set(context.Background(), name, headlampContext)
-	if err == nil {
-		c.notifyListeners()
-	}
-
-	return err
+	return c.setContext(headlampContext, name, 0)
 }
 
 // GetContexts returns all contexts in the store.
@@ -183,9 +196,13 @@ func (c *contextStore) GetContext(name string) (*Context, error) {
 
 // RemoveContext removes a context from the store.
 func (c *contextStore) RemoveContext(name string) error {
+	c.leaseMu.Lock()
 	err := c.cache.Delete(context.Background(), name)
+	c.cancelLease(name)
+	c.leaseMu.Unlock()
+
 	if err == nil {
-		c.notifyListeners()
+		c.notifyListeners(name)
 	}
 
 	return err
@@ -196,15 +213,102 @@ func (c *contextStore) AddContextWithKeyAndTTL(headlampContext *Context, key str
 	// Keep the stored context identifier consistent with the cache key.
 	headlampContext.Name = key
 
-	err := c.cache.SetWithTTL(context.Background(), key, headlampContext, ttl)
+	return c.setContext(headlampContext, key, ttl)
+}
+
+func (c *contextStore) setContext(value *Context, key string, ttl time.Duration) error {
+	c.leaseMu.Lock()
+
+	retained := c.leases[key] != nil
+	if retained {
+		previous, _ := c.GetContext(key)
+
+		retained = sameRetainedConnection(previous, value)
+		if retained {
+			ttl = 0
+		}
+	}
+
+	err := c.cache.SetWithTTL(context.Background(), key, value, ttl)
+	if err == nil && !retained {
+		// Waiters awakened by cancellation must see the replacement on their next lookup.
+		c.cancelLease(key)
+	}
+	c.leaseMu.Unlock()
+
 	if err == nil {
-		c.notifyListeners()
+		c.notifyListeners(key)
 	}
 
 	return err
 }
 
-// UpdateTTL updates the ttl of a context.
+func sameRetainedConnection(first, second *Context) bool {
+	revision := first.RoutingRevision()
+
+	return first == second || (revision != "" && revision == second.RoutingRevision())
+}
+
+// ImportedContextIdleTTL is the cache lifetime after the last active use.
+const ImportedContextIdleTTL = 20 * time.Second
+
+func (c *contextStore) cancelLease(key string) {
+	if lease := c.leases[key]; lease != nil {
+		delete(c.leases, key)
+		lease.cancel()
+	}
+}
+
+// UpdateTTL updates the ttl of an unretained context.
 func (c *contextStore) UpdateTTL(key string, ttl time.Duration) error {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+
+	if c.leases[key] != nil {
+		return nil
+	}
+
 	return c.cache.UpdateTTL(context.Background(), key, ttl)
+}
+
+// RetainContext suspends cache expiry until the last user releases the lease.
+// Removing or replacing the context cancels every lease for that entry.
+func (c *contextStore) RetainContext(
+	key string, expected *Context, idleTTL time.Duration,
+) (context.Context, func(), error) {
+	c.leaseMu.Lock()
+	defer c.leaseMu.Unlock()
+
+	current, err := c.GetContext(key)
+	if err != nil || !sameRetainedConnection(current, expected) {
+		return nil, nil, cache.ErrNotFound
+	}
+
+	lease := c.leases[key]
+	if lease == nil {
+		if err := c.cache.UpdateTTL(context.Background(), key, 0); err != nil {
+			return nil, nil, err
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		lease = &contextLease{Context: ctx, cancel: cancel}
+		c.leases[key] = lease
+	}
+
+	lease.users++
+
+	return lease.Context, sync.OnceFunc(func() {
+		c.leaseMu.Lock()
+		defer c.leaseMu.Unlock()
+
+		if c.leases[key] != lease {
+			return
+		}
+
+		lease.users--
+		if lease.users == 0 {
+			c.cancelLease(key)
+			_ = c.cache.UpdateTTL(context.Background(), key, idleTTL)
+		}
+	}), nil
 }

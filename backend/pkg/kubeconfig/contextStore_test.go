@@ -209,3 +209,32 @@ func TestAddContextWithHeadlampInfo(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, cache.ErrNotFound, err)
 }
+
+func TestRetainedContextExpiresAfterItsLastRelease(t *testing.T) {
+	store := kubeconfig.NewContextStore()
+	value := &kubeconfig.Context{}
+	require.NoError(t, store.AddContextWithKeyAndTTL(value, "retained", time.Second))
+
+	ctx, first, err := store.RetainContext("retained", value, time.Millisecond)
+	require.NoError(t, err)
+	t.Cleanup(first)
+
+	_, second, err := store.RetainContext("retained", value, time.Millisecond)
+	require.NoError(t, err)
+	t.Cleanup(second)
+
+	require.NoError(t, store.UpdateTTL("retained", time.Nanosecond))
+	first()
+	first()
+	require.NoError(t, ctx.Err())
+
+	_, err = store.GetContext("retained")
+	require.NoError(t, err)
+
+	second()
+	require.Error(t, ctx.Err())
+	require.Eventually(t, func() bool {
+		_, err := store.GetContext("retained")
+		return err != nil
+	}, time.Second, time.Millisecond)
+}

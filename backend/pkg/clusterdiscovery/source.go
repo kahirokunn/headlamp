@@ -17,8 +17,12 @@ limitations under the License.
 package clusterdiscovery
 
 import (
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/url"
@@ -42,6 +46,8 @@ type Descriptor struct {
 	DisplayName string
 	// Resource is the owner resource. Each of its objects produces connections.
 	Resource schema.GroupVersionResource
+	// Kind is the Kubernetes kind of the owner resource.
+	Kind string
 	// ContextSource preserves existing source values. New sources use DiscoveredCluster.
 	ContextSource int
 	// View describes how clients present the connections of the source.
@@ -114,12 +120,15 @@ type GeneratedKubeconfig struct {
 	Name string
 	// ClusterID is the stable public ID of the connection.
 	ClusterID string
-	// Config holds exactly one context and its cluster. Credentials in it are ignored.
+	// Config holds exactly one context and its cluster. Kubernetes user credentials are ignored.
 	Config *api.Config
 	// Metadata is credential-free JSON, returned to clients under each of its keys.
 	Metadata map[string]json.RawMessage
 	// Presentation optionally sets the display name and adds public fields.
 	Presentation *kubeconfig.ConnectionPresentation
+	// ProxyConfigVersion is the credential-free version of the object supplying an authenticated proxy,
+	// when it differs from the owner. Otherwise the owner's resourceVersion is used.
+	ProxyConfigVersion string
 }
 
 // Registry contains the sources linked into this Headlamp binary.
@@ -133,7 +142,7 @@ func (r *Registry) Register(source Source) error {
 	}
 
 	d := source.Descriptor()
-	if d.ID == "" || d.DisplayName == "" || d.Resource.Empty() {
+	if d.ID == "" || d.DisplayName == "" || d.Resource.Empty() || d.Kind == "" {
 		return errors.New("discovery source descriptor is incomplete")
 	}
 
@@ -151,7 +160,7 @@ func (r *Registry) Register(source Source) error {
 // Sources returns a copy of the registered sources in registration order.
 func (r *Registry) Sources() []Source { return append([]Source(nil), r.sources...) }
 
-// ConfigForCluster builds a credential-free kubeconfig for a source connection.
+// ConfigForCluster builds a kubeconfig without Kubernetes user credentials.
 func ConfigForCluster(name string, cluster *api.Cluster, namespace string) *api.Config {
 	return &api.Config{
 		Clusters:       map[string]*api.Cluster{name: cluster},
@@ -191,6 +200,49 @@ func ConnectionCluster(cluster *api.Cluster) (*api.Cluster, error) {
 	}, nil
 }
 
+// discoveredConnectionRevision fingerprints routing settings without credentials.
+// Replicas observing the same resource produce the same revision.
+func discoveredConnectionRevision(connection *kubeconfig.Context, proxyConfigVersion string) string {
+	fingerprint := sha256.New()
+	cluster := connection.Cluster
+	writeHashString(fingerprint, connection.Discovery.ResourceUID)
+	writeHashString(fingerprint, cluster.Server)
+	writeHashString(fingerprint, cluster.TLSServerName)
+	writeHashString(fingerprint, fmt.Sprintf("%t", cluster.InsecureSkipTLSVerify))
+	writeHashString(fingerprint, fmt.Sprintf("%t", cluster.DisableCompression))
+
+	// Proxy user information and other private URL fields stay out of the revision.
+	proxy, err := url.Parse(cluster.ProxyURL)
+	if err == nil {
+		writeHashString(fingerprint, proxy.Scheme)
+		writeHashString(fingerprint, proxy.Host)
+
+		// The API server's version changes when proxy credentials change.
+		if proxy.User != nil {
+			writeHashString(fingerprint, proxyConfigVersion)
+		}
+	}
+
+	for remaining := cluster.CertificateAuthorityData; len(remaining) > 0; {
+		block, rest := pem.Decode(remaining)
+		if block == nil {
+			break
+		}
+
+		remaining = rest
+
+		if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			continue
+		}
+
+		if _, err := x509.ParseCertificate(block.Bytes); err == nil {
+			writeHashBytes(fingerprint, block.Bytes)
+		}
+	}
+
+	return hex.EncodeToString(fingerprint.Sum(nil))
+}
+
 // loadGenerated uses the same loader and OIDC settings for every registered source.
 func (r *Runner) loadGenerated(
 	root string,
@@ -223,12 +275,15 @@ func (r *Runner) loadGenerated(
 	context.ClusterID = g.ClusterID
 	context.OidcConf = r.oidcConfig.Copy()
 	context.Discovery = &kubeconfig.DiscoveryOrigin{
-		Source:      d.ID,
-		DisplayName: d.DisplayName,
-		Root:        root,
-		Namespace:   owner.Namespace,
-		Name:        owner.Name,
-		Entry:       g.Key,
+		Source:             d.ID,
+		DisplayName:        d.DisplayName,
+		Root:               root,
+		Namespace:          owner.Namespace,
+		Name:               owner.Name,
+		Entry:              g.Key,
+		Cluster:            r.originCluster(root),
+		ResourceAPIVersion: d.Resource.GroupVersion().String(),
+		ResourceKind:       d.Kind,
 	}
 
 	if err := context.SetDiscoveryMetadata(g.Metadata); err != nil {

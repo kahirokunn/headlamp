@@ -46,7 +46,7 @@ var _ headlampconfig.WebSocketMultiplexer = (*stubMultiplexer)(nil)
 // NewContextStore starts a cache cleanup goroutine with no Close method, which
 // would leak until the test process exits; the tests here never call store
 // methods, so a no-op stub avoids that.
-type stubContextStore struct{}
+type stubContextStore struct{ kubeconfig.ContextStore }
 
 func (stubContextStore) AddContext(*kubeconfig.Context) error           { return nil }
 func (stubContextStore) GetContexts() ([]*kubeconfig.Context, error)    { return nil, nil }

@@ -27,7 +27,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -38,6 +40,103 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd/api"
 )
+
+type notificationTestStore struct {
+	kubeconfig.ContextStore
+	err error
+}
+
+func (s *notificationTestStore) AddContext(connection *kubeconfig.Context) error {
+	if s.err != nil {
+		return s.err
+	}
+
+	return s.ContextStore.AddContext(connection)
+}
+
+func (s *notificationTestStore) RemoveContext(name string) error {
+	if s.err != nil {
+		return s.err
+	}
+
+	return s.ContextStore.RemoveContext(name)
+}
+
+func TestConnectionNotificationsFollowSuccessfulStoreChanges(t *testing.T) {
+	store := &notificationTestStore{ContextStore: kubeconfig.NewContextStore()}
+
+	var snapshots []string
+
+	runner := newTestRunner(t, Options{
+		Store: store,
+		OnConnectionsChanged: func() {
+			connections, err := store.GetContexts()
+			require.NoError(t, err)
+
+			server := ""
+			if len(connections) > 0 {
+				server = connections[0].Cluster.Server
+			}
+
+			snapshots = append(snapshots, server)
+		},
+	})
+	connection := &kubeconfig.Context{
+		Name:      "spoke",
+		Discovery: &kubeconfig.DiscoveryOrigin{ResourceUID: "owner"},
+		Cluster:   &api.Cluster{Server: "https://original.example.com"},
+	}
+	runner.storeConnection(connection, "owner", "")
+	replacement := connection.Copy()
+	replacement.Cluster.Server = "https://replacement.example.com"
+
+	store.err = errors.New("store unavailable")
+
+	runner.storeConnection(replacement, "owner", "")
+	runner.removeContexts([]string{connection.Name})
+	require.Equal(t, []string{"https://original.example.com"}, snapshots)
+
+	store.err = nil
+
+	runner.storeConnection(replacement, "owner", "")
+	runner.removeContexts([]string{connection.Name})
+	require.Equal(t, []string{"https://original.example.com", "https://replacement.example.com", ""}, snapshots)
+}
+
+func TestDiscoveredConnectionRevisionAgreesAcrossReplicas(t *testing.T) {
+	first := &Runner{store: kubeconfig.NewContextStore()}
+	second := &Runner{store: kubeconfig.NewContextStore()}
+	proxy := url.URL{Scheme: "https", Host: "proxy.example.com", User: url.UserPassword("fixture", "first")}
+	connection := &kubeconfig.Context{
+		Name:      "spoke",
+		Discovery: &kubeconfig.DiscoveryOrigin{ResourceUID: "owner"},
+		Cluster: &api.Cluster{
+			Server:   "https://spoke.example.com",
+			ProxyURL: proxy.String(),
+		},
+	}
+
+	firstConnection := connection.Copy()
+	first.storeConnection(firstConnection, "owner", "version-1")
+	require.NotEmpty(t, firstConnection.Discovery.ConnectionRevision)
+
+	secondConnection := connection.Copy()
+	proxy.User = url.UserPassword("fixture", "second")
+	secondConnection.Cluster.ProxyURL = proxy.String()
+	second.storeConnection(secondConnection, "owner", "version-1")
+	require.Equal(t, firstConnection.Discovery.ConnectionRevision, secondConnection.Discovery.ConnectionRevision)
+
+	replacement := connection.Copy()
+	replacement.Cluster.ProxyURL = proxy.String()
+	second.storeConnection(replacement, "owner", "version-2")
+	require.NotEqual(t, firstConnection.Discovery.ConnectionRevision, replacement.Discovery.ConnectionRevision)
+
+	replacement = connection.Copy()
+	proxy.Host = "replacement.example.com"
+	replacement.Cluster.ProxyURL = proxy.String()
+	second.storeConnection(replacement, "owner", "version-1")
+	require.NotEqual(t, firstConnection.Discovery.ConnectionRevision, replacement.Discovery.ConnectionRevision)
+}
 
 var generatedTestCA = sync.OnceValue(func() []byte {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -133,9 +232,10 @@ func TestRegistryRejectsUnusableSources(t *testing.T) {
 		name       string
 		descriptor Descriptor
 	}{
-		{name: "no ID", descriptor: Descriptor{DisplayName: "Fleet", Resource: sampleFleetResource}},
-		{name: "no display name", descriptor: Descriptor{ID: "fleet", Resource: sampleFleetResource}},
-		{name: "no owner resource", descriptor: Descriptor{ID: "fleet", DisplayName: "Fleet"}},
+		{name: "no ID", descriptor: Descriptor{DisplayName: "Fleet", Resource: sampleFleetResource, Kind: "FleetMember"}},
+		{name: "no display name", descriptor: Descriptor{ID: "fleet", Resource: sampleFleetResource, Kind: "FleetMember"}},
+		{name: "no owner resource", descriptor: Descriptor{ID: "fleet", DisplayName: "Fleet", Kind: "FleetMember"}},
+		{name: "no owner kind", descriptor: Descriptor{ID: "fleet", DisplayName: "Fleet", Resource: sampleFleetResource}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := registry.Register(describedSource{descriptor: tc.descriptor})
