@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import { expect, Page, test } from '@playwright/test';
+import { expect, Page, test, type WebSocketRoute } from '@playwright/test';
 
 const selector = 'team=headlamp';
 
@@ -438,5 +438,111 @@ test('a selector refresh preserves routed page state', async ({ page }) => {
     await expect(search).toHaveValue('keep this filter');
   } finally {
     releaseSelector();
+  }
+});
+
+test('uses namespaces from the replacement connection with the same selector', async ({ page }) => {
+  let revision = 'original';
+  let openConfigStream!: (socket: WebSocketRoute) => void;
+  const configStream = new Promise<WebSocketRoute>(resolve => {
+    openConfigStream = resolve;
+  });
+  let releaseReplacement!: () => void;
+  const replacementReady = new Promise<void>(resolve => {
+    releaseReplacement = resolve;
+  });
+  const listRequests: { revision: string | null; namespace: string }[] = [];
+
+  await page.addInitScript(selector => {
+    localStorage.setItem(
+      'cluster_settings.test',
+      JSON.stringify({ allowedNamespacesSelector: selector })
+    );
+  }, selector);
+  await mockHeadlamp(page, ['test'], async () => ['original-team']);
+  await page.routeWebSocket('**/config/events', openConfigStream);
+  await page.route('**/config', route =>
+    route.fulfill({
+      json: {
+        clusters: [
+          {
+            name: 'test',
+            auth_type: '',
+            useToken: false,
+            meta_data: {
+              discoveryConnectionRevision: revision,
+              discoveryOrigin: {
+                cluster: 'hub',
+                resource: {
+                  apiVersion: 'example.test/v1',
+                  kind: 'Cluster',
+                  name: 'test',
+                  uid: revision,
+                },
+              },
+            },
+          },
+        ],
+        clusterSources: [
+          { id: 'test-source', label: 'Test', nameLabel: 'Cluster', configured: true },
+        ],
+      },
+    })
+  );
+  await page.route('**/clusters/test/api/v1/namespaces?**', async route => {
+    const params = new URL(route.request().url()).searchParams;
+    if (params.get('labelSelector') !== selector) return route.fallback();
+    if (params.get('__headlamp_connection_revision') !== 'replacement') return route.fallback();
+    await replacementReady;
+    await route.fulfill({ json: namespaceList(['replacement-team']) });
+  });
+  page.on('request', request => {
+    const url = new URL(request.url());
+    const match = /\/api\/v1\/namespaces\/([^/]+)\/pods$/.exec(url.pathname);
+    if (match) {
+      listRequests.push({
+        revision: url.searchParams.get('__headlamp_connection_revision'),
+        namespace: match[1],
+      });
+    }
+  });
+
+  try {
+    await page.goto('/c/test/pods');
+    await expect
+      .poll(() => listRequests)
+      .toContainEqual({
+        revision: 'original',
+        namespace: 'original-team',
+      });
+    const heading = page.getByRole('heading', { name: 'Pods', exact: true });
+    await expect(heading).toBeVisible();
+    const socket = await configStream;
+    revision = 'replacement';
+    const selectorRequest = page.waitForRequest(request => {
+      const url = new URL(request.url());
+      return (
+        url.pathname.endsWith('/api/v1/namespaces') &&
+        url.searchParams.get('labelSelector') === selector &&
+        url.searchParams.get('__headlamp_connection_revision') === revision
+      );
+    });
+    socket.send('{"type":"config"}');
+    await selectorRequest;
+    await expect(heading).not.toBeVisible();
+
+    releaseReplacement();
+    await expect
+      .poll(() => listRequests)
+      .toContainEqual({
+        revision: 'replacement',
+        namespace: 'replacement-team',
+      });
+    expect(listRequests).not.toContainEqual({
+      revision: 'replacement',
+      namespace: 'original-team',
+    });
+  } finally {
+    releaseReplacement();
   }
 });

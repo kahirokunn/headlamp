@@ -62,11 +62,7 @@ test('shows an error when the API server rejects an OIDC token', async ({ page }
     })
   );
 
-  await page.goto('/');
-  await page.evaluate(clusterName => {
-    window.history.pushState({}, '', `/c/${clusterName}/login`);
-    window.dispatchEvent(new PopStateEvent('popstate'));
-  }, CLUSTER_NAME);
+  await page.goto(`/c/${CLUSTER_NAME}/login`);
   await expect(page.getByRole('heading', { level: 1, name: 'Authentication' })).toBeVisible();
 
   const [popup] = await Promise.all([
