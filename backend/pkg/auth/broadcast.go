@@ -104,7 +104,9 @@ func isOIDCAuthContext(kCtx *kubeconfig.Context) bool {
 //
 // Gated by the --oidc-use-token-broadcast flag (disabled by default).
 func BroadcastOIDCToken(params BroadcastOIDCTokenParams) {
-	sourceOIDCConfig, ok := loadBroadcastSourceOIDCConfig(params.KubeConfigStore, params.SourceCluster)
+	source, _ := params.Request.Context().Value(cookieConnectionKey{}).(*kubeconfig.Context)
+
+	sourceOIDCConfig, ok := loadBroadcastSourceOIDCConfig(params.KubeConfigStore, params.SourceCluster, source)
 	if !ok {
 		return
 	}
@@ -140,14 +142,18 @@ func BroadcastOIDCToken(params BroadcastOIDCTokenParams) {
 // OIDC config (auth-provider type, non-nil config, non-empty issuer+client-id).
 // Logs and returns ok=false on any check failure so the caller can return early.
 func loadBroadcastSourceOIDCConfig(
-	store kubeconfig.ContextStore, sourceCluster string,
+	store kubeconfig.ContextStore, sourceCluster string, sourceContext *kubeconfig.Context,
 ) (*kubeconfig.OidcConfig, bool) {
-	sourceContext, err := store.GetContext(sourceCluster)
-	if err != nil {
-		logger.Log(logger.LevelError, map[string]string{logFieldSourceCluster: sourceCluster}, err,
-			"failed to get source context for broadcasting OIDC token")
+	if sourceContext == nil {
+		var err error
 
-		return nil, false
+		sourceContext, err = store.GetContext(sourceCluster)
+		if err != nil {
+			logger.Log(logger.LevelError, map[string]string{logFieldSourceCluster: sourceCluster}, err,
+				"failed to get source context for broadcasting OIDC token")
+
+			return nil, false
+		}
 	}
 
 	if !isOIDCAuthContext(sourceContext) {
@@ -238,9 +244,14 @@ func broadcastToTarget(
 		return
 	}
 
+	request := WithCookieConnection(params.Request, kCtx)
+	if !CookieConnectionCurrent(request, params.KubeConfigStore) {
+		return
+	}
+
 	if err := SetTokenCookie(
 		params.Writer,
-		params.Request,
+		request,
 		kCtx.Name,
 		params.Token,
 		params.BaseURL,

@@ -1096,6 +1096,7 @@ func newSigningOIDCTestServer(t *testing.T) *oidcTestServer {
 			"issuer":                                srv.URL,
 			"authorization_endpoint":                srv.URL + "/auth",
 			"token_endpoint":                        srv.URL + "/token",
+			"end_session_endpoint":                  srv.URL + "/logout",
 			"jwks_uri":                              srv.URL + "/jwks",
 			"id_token_signing_alg_values_supported": []string{"RS256"},
 		})

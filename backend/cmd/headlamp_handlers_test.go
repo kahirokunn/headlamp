@@ -478,7 +478,7 @@ func TestHandleNodeDrainStatusValidation(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rr3.Code)
 
 	// Non-string cache value -> 500.
-	badKey := drainCacheKey("n1", "c1")
+	badKey := drainCacheKey("n1", "c1", nil)
 	require.NoError(t, cfg.Cache.Set(context.Background(), badKey, 12345))
 	req4 := httptest.NewRequestWithContext(context.Background(), http.MethodGet, statusURL, nil)
 	rr4 := httptest.NewRecorder()

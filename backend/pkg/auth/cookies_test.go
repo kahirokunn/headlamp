@@ -28,6 +28,7 @@ import (
 	"testing"
 
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/auth"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 	"github.com/stretchr/testify/require"
 )
 
@@ -964,4 +965,63 @@ func TestLogoutInvalidationSurvivesTokenResizeAndRelogin(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLateDiscoveredLoginAndLogoutPreserveReplacementCookies(t *testing.T) {
+	const cluster = "workload"
+
+	const base = "/headlamp"
+
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+
+	request := func(path, revision string) *http.Request {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "https://headlamp.test"+path, nil)
+		for _, cookie := range jar.Cookies(req.URL) {
+			req.AddCookie(cookie)
+		}
+
+		return auth.WithCookieConnection(req, &kubeconfig.Context{
+			Name: cluster, Discovery: &kubeconfig.DiscoveryOrigin{ConnectionRevision: revision},
+		})
+	}
+	apply := func(req *http.Request, response *httptest.ResponseRecorder) {
+		result := response.Result()
+
+		t.Cleanup(func() { _ = result.Body.Close() })
+		jar.SetCookies(req.URL, result.Cookies())
+	}
+	login := func(req *http.Request, user string) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		require.NoError(t, auth.SetTokenCookie(response, req, cluster, user, base, 3600))
+		require.NoError(t, auth.SetIDTokenCookie(response, req, cluster, user+"-id", base, 3600))
+
+		return response
+	}
+
+	callback := base + "/oidc-callback"
+	first := request(callback, "A")
+	apply(first, login(first, "old"))
+
+	logoutPath := auth.GetOIDCLogoutCookiePath(base, cluster)
+	logout := request(logoutPath, "A")
+	lateLogout := httptest.NewRecorder()
+	auth.ClearTokenCookieBounded(lateLogout, logout, cluster, base)
+	auth.ClearIDTokenCookie(lateLogout, logout, cluster, base)
+
+	oldCallback := request(callback, "A")
+	lateLogin := login(oldCallback, "old")
+	current := request(callback, "B")
+	apply(current, login(current, "new"))
+
+	apply(logout, lateLogout)
+	apply(oldCallback, lateLogin)
+
+	token, err := auth.GetTokenFromCookie(request(auth.GetCookiePath(base, cluster), "B"), cluster)
+	require.NoError(t, err)
+	require.Equal(t, "new", token)
+
+	idToken, err := auth.GetIDTokenFromCookie(request(logoutPath, "B"), cluster)
+	require.NoError(t, err)
+	require.Equal(t, "new-id", idToken)
 }

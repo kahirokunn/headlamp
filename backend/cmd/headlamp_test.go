@@ -1617,7 +1617,7 @@ func TestDrainNodePodDeletionFailure(t *testing.T) {
 	cacheKey := uuid.NewSHA1(uuid.Nil, []byte("test-node"+"\x00"+"test-cluster")).String()
 	ctx := context.Background()
 
-	c.drainNode(ctx, fakeClient, "test-node", "test-cluster")
+	c.drainNode(ctx, fakeClient, "test-node", cacheKey)
 
 	require.Eventually(t, func() bool {
 		cacheItem, err := testCache.Get(ctx, cacheKey)
@@ -1671,7 +1671,7 @@ func TestDrainNodeAllPodsDeletedSuccessfully(t *testing.T) {
 	cacheKey := uuid.NewSHA1(uuid.Nil, []byte("test-node"+"\x00"+"test-cluster")).String()
 	ctx := context.Background()
 
-	c.drainNode(ctx, fakeClient, "test-node", "test-cluster")
+	c.drainNode(ctx, fakeClient, "test-node", cacheKey)
 
 	require.Eventually(t, func() bool {
 		cacheItem, err := testCache.Get(ctx, cacheKey)
@@ -1750,7 +1750,7 @@ func TestDrainNodeEvictsInsteadOfDeleting(t *testing.T) {
 	fakeClient, c, testCache, cacheKey := drainTestSetup(t)
 	evictionRemovesPod(fakeClient)
 
-	c.drainNode(context.Background(), fakeClient, "test-node", "test-cluster")
+	c.drainNode(context.Background(), fakeClient, "test-node", cacheKey)
 	assert.Equal(t, "success", waitForDrainStatus(t, testCache, cacheKey))
 
 	var evictions, deletes int
@@ -1797,7 +1797,7 @@ func TestDrainNodeRetriesEvictionBlockedByPDB(t *testing.T) {
 		return false, nil, nil
 	})
 
-	c.drainNode(context.Background(), fakeClient, "test-node", "test-cluster")
+	c.drainNode(context.Background(), fakeClient, "test-node", cacheKey)
 	assert.Equal(t, "success", waitForDrainStatus(t, testCache, cacheKey))
 	assert.Equal(t, int32(3), attempts.Load())
 }
@@ -1818,7 +1818,7 @@ func TestDrainNodeFailsWhenPDBBlocksUntilTimeout(t *testing.T) {
 		return false, nil, nil
 	})
 
-	c.drainNode(context.Background(), fakeClient, "test-node", "test-cluster")
+	c.drainNode(context.Background(), fakeClient, "test-node", cacheKey)
 	assert.Equal(t, "error: failed to evict 1 pod(s)", waitForDrainStatus(t, testCache, cacheKey))
 }
 
@@ -1931,7 +1931,7 @@ func TestDrainNodeWaitsForEvictedPodToTerminate(t *testing.T) {
 		return action.GetSubresource() == "eviction", nil, nil
 	})
 
-	c.drainNode(context.Background(), fakeClient, "test-node", "test-cluster")
+	c.drainNode(context.Background(), fakeClient, "test-node", cacheKey)
 
 	assert.Never(t, func() bool {
 		item, err := testCache.Get(context.Background(), cacheKey)
@@ -1958,7 +1958,7 @@ func TestDrainNodeFailsWhenEvictedPodNeverTerminates(t *testing.T) {
 		return action.GetSubresource() == "eviction", nil, nil
 	})
 
-	c.drainNode(context.Background(), fakeClient, "test-node", "test-cluster")
+	c.drainNode(context.Background(), fakeClient, "test-node", cacheKey)
 	assert.Equal(t, "error: failed to evict 1 pod(s)", waitForDrainStatus(t, testCache, cacheKey))
 }
 
@@ -1993,7 +1993,7 @@ func TestDrainNodeDoesNotEvictReplacementPod(t *testing.T) {
 			corev1.Resource("pods"), "pdb-pod", errors.New("precondition failed: UID mismatch"))
 	})
 
-	c.drainNode(context.Background(), fakeClient, "test-node", "test-cluster")
+	c.drainNode(context.Background(), fakeClient, "test-node", cacheKey)
 	assert.Equal(t, "success", waitForDrainStatus(t, testCache, cacheKey))
 	assert.Equal(t, int32(2), attempts.Load(), "the replacement pod must not be evicted")
 }
@@ -2029,7 +2029,7 @@ func TestDrainNodeDoesNotWaitForReplacementPodBlockedByPDB(t *testing.T) {
 
 	start := time.Now()
 
-	c.drainNode(context.Background(), fakeClient, "test-node", "test-cluster")
+	c.drainNode(context.Background(), fakeClient, "test-node", cacheKey)
 	assert.Equal(t, "success", waitForDrainStatus(t, testCache, cacheKey))
 	assert.Less(t, time.Since(start), drainEvictTimeout, "the drain must not wait for the replacement pod")
 	assert.Equal(t, int32(2), attempts.Load())
@@ -2074,14 +2074,14 @@ func TestDrainNodeJoiningRequestWaitsForInitialStatus(t *testing.T) {
 		return true, nil, errors.New("node is gone")
 	})
 
-	go c.drainNode(context.Background(), fakeClient, "test-node", "test-cluster")
+	go c.drainNode(context.Background(), fakeClient, "test-node", cacheKey)
 
 	<-blocking.entered
 
 	joined := make(chan struct{})
 
 	go func() {
-		c.drainNode(context.Background(), fakeClient, "test-node", "test-cluster")
+		c.drainNode(context.Background(), fakeClient, "test-node", cacheKey)
 		close(joined)
 	}()
 
@@ -2137,7 +2137,7 @@ func TestDrainNodeStopsEvictingAtTheDeadline(t *testing.T) {
 		return true, nil, apierrors.NewTooManyRequests("would violate the pod's disruption budget", 1)
 	})
 
-	c.drainNode(context.Background(), fakeClient, "test-node", "test-cluster")
+	c.drainNode(context.Background(), fakeClient, "test-node", cacheKey)
 	assert.Equal(t, "error: failed to evict 3 pod(s)", waitForDrainStatus(t, testCache, cacheKey))
 	assert.Equal(t, int32(1), attempts.Load(), "no eviction may be started after the deadline")
 }
@@ -2162,7 +2162,7 @@ func TestDrainNodeReportsInProgressWhileBlocked(t *testing.T) {
 
 	ctx := context.Background()
 
-	c.drainNode(ctx, fakeClient, "test-node", "test-cluster")
+	c.drainNode(ctx, fakeClient, "test-node", cacheKey)
 
 	item, err := testCache.Get(ctx, cacheKey)
 	require.NoError(t, err, "a status must exist as soon as the drain is started")
@@ -2205,7 +2205,7 @@ func TestDrainNodeRenewsStatusWhileARequestIsStalled(t *testing.T) {
 
 	ctx := context.Background()
 
-	c.drainNode(ctx, fakeClient, "test-node", "test-cluster")
+	c.drainNode(ctx, fakeClient, "test-node", cacheKey)
 
 	<-started
 
@@ -2272,11 +2272,11 @@ func TestDrainNodeIgnoresRequestsWhileDraining(t *testing.T) {
 
 	ctx := context.Background()
 
-	c.drainNode(ctx, fakeClient, "test-node", "test-cluster")
+	c.drainNode(ctx, fakeClient, "test-node", cacheKey)
 
 	<-started
 
-	c.drainNode(ctx, fakeClient, "test-node", "test-cluster")
+	c.drainNode(ctx, fakeClient, "test-node", cacheKey)
 
 	assert.Equal(t, int32(1), nodeReads.Load(), "a drain that is already running must not be started again")
 
@@ -2289,7 +2289,7 @@ func TestDrainNodeIgnoresRequestsWhileDraining(t *testing.T) {
 	// The guard is released when the drain ends.
 	waitForDrainToEnd(t, c, cacheKey)
 
-	c.drainNode(ctx, fakeClient, "test-node", "test-cluster")
+	c.drainNode(ctx, fakeClient, "test-node", cacheKey)
 
 	assert.Equal(t, "success", waitForDrainStatus(t, testCache, cacheKey))
 	assert.Equal(t, int32(2), nodeReads.Load(), "the node must be drainable again after the drain finished")
@@ -2353,7 +2353,7 @@ func TestDrainNodeCancelledContextDoesNotWriteCache(t *testing.T) {
 
 	cacheKey := uuid.NewSHA1(uuid.Nil, []byte("test-node"+"\x00"+"test-cluster")).String()
 
-	c.drainNode(ctx, fakeClient, "test-node", "test-cluster")
+	c.drainNode(ctx, fakeClient, "test-node", cacheKey)
 
 	assert.Never(t, func() bool {
 		_, err := testCache.Get(context.Background(), cacheKey)
@@ -2408,7 +2408,7 @@ func TestDrainNodeSkipsDaemonSetPods(t *testing.T) {
 	cacheKey := uuid.NewSHA1(uuid.Nil, []byte("test-node"+"\x00"+"test-cluster")).String()
 	ctx := context.Background()
 
-	c.drainNode(ctx, fakeClient, "test-node", "test-cluster")
+	c.drainNode(ctx, fakeClient, "test-node", cacheKey)
 
 	require.Eventually(t, func() bool {
 		cacheItem, err := testCache.Get(ctx, cacheKey)
@@ -4153,6 +4153,8 @@ func TestHandleClusterHelm(t *testing.T) {
 	router := mux.NewRouter()
 	handleClusterHelm(config, router)
 
+	const releasesPath = "/clusters/test-cluster/helm/releases/list"
+
 	// Test cases for failed cases
 	testCases := []struct {
 		name           string
@@ -4166,6 +4168,20 @@ func TestHandleClusterHelm(t *testing.T) {
 			"GET",
 			"/clusters/test-cluster/helm/releases/list",
 			"test-token", http.StatusInternalServerError,
+		},
+		{
+			"List Releases - Valid Connection",
+			http.MethodGet,
+			releasesPath + "?" + discoveryConnectionRevisionParam + "=" + unversionedDiscoveryConnection,
+			"test-token",
+			http.StatusInternalServerError,
+		},
+		{
+			"List Releases - Wrong Connection",
+			http.MethodGet,
+			releasesPath + "?" + discoveryConnectionRevisionParam + "=stale",
+			"test-token",
+			http.StatusConflict,
 		},
 		{
 			"Install Release - Valid Token",
@@ -6194,15 +6210,78 @@ func TestGetOIDCPostLogoutRedirectURL(t *testing.T) {
 	assert.False(t, ok)
 }
 
+func TestOIDCLogoutTransitionRejectsReplacementWithSameIDToken(t *testing.T) {
+	const cluster = "logout-switch"
+
+	store := kubeconfig.NewContextStore()
+	issuer := setupOIDCProviderWithEndSessionEndpoint()(t)
+	connection := func(revision string) *kubeconfig.Context {
+		ctx := newOIDCLogoutTestContext(t, cluster, issuer, false)
+		ctx.Discovery = &kubeconfig.DiscoveryOrigin{ConnectionRevision: revision}
+
+		return ctx
+	}
+	original := connection("original")
+	replacement := connection("replacement")
+
+	require.NoError(t, store.AddContext(original))
+
+	cfg := &HeadlampConfig{HeadlampConfig: &headlampconfig.HeadlampConfig{
+		HeadlampCFG:      &headlampconfig.HeadlampCFG{KubeConfigStore: store},
+		Cache:            cache.New[interface{}](),
+		TelemetryHandler: &telemetry.RequestHandler{},
+	}}
+	handler := createHeadlampHandler(newTestHandlerCtx(t), cfg)
+	addIDToken := func(r *http.Request, ctx *kubeconfig.Context) {
+		t.Helper()
+
+		cookieResponse := httptest.NewRecorder()
+		require.NoError(t, auth.SetIDTokenCookie(
+			cookieResponse, auth.WithCookieConnection(r, ctx), cluster, "same-provider-token", "", 60,
+		))
+
+		for _, header := range cookieResponse.Header().Values("Set-Cookie") {
+			cookie, err := http.ParseSetCookie(header)
+			require.NoError(t, err)
+
+			if cookie.MaxAge >= 0 {
+				r.AddCookie(cookie)
+			}
+		}
+	}
+
+	start := httptest.NewRequestWithContext(t.Context(), http.MethodPost, auth.GetOIDCLogoutCookiePath("", cluster), nil)
+	start.Header.Set("Content-Type", "application/json")
+	start.Header.Set("Accept", "application/json")
+	addIDToken(start, original)
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, start)
+	require.Equal(t, http.StatusOK, response.Code)
+
+	var redirect struct{ RedirectURL string }
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &redirect))
+	require.Contains(t, redirect.RedirectURL, "/oidc-logout/redirect")
+
+	require.NoError(t, store.AddContext(replacement))
+	follow := httptest.NewRequestWithContext(t.Context(), http.MethodGet, redirect.RedirectURL, nil)
+	addIDToken(follow, replacement)
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, follow)
+	require.Equal(t, http.StatusBadRequest, response.Code)
+	require.Empty(t, response.Header().Values("Set-Cookie"))
+}
+
 func TestOIDCLogoutState(t *testing.T) {
 	now := time.Now()
-	state := createOIDCLogoutState("team/cluster", "id-token", now)
+	state := createOIDCLogoutState("team/cluster", "rev-a", "id-token", now)
 
-	assert.True(t, validateOIDCLogoutState(state, "team/cluster", "id-token", now))
-	assert.False(t, validateOIDCLogoutState(state, "other-cluster", "id-token", now))
-	assert.False(t, validateOIDCLogoutState(state, "team/cluster", "other-token", now))
-	assert.False(t, validateOIDCLogoutState(state+"tampered", "team/cluster", "id-token", now))
-	assert.False(t, validateOIDCLogoutState(state, "team/cluster", "id-token", now.Add(2*time.Minute)))
+	assert.True(t, validateOIDCLogoutState(state, "team/cluster", "rev-a", "id-token", now))
+	assert.False(t, validateOIDCLogoutState(state, "other-cluster", "rev-a", "id-token", now))
+	assert.False(t, validateOIDCLogoutState(state, "team/cluster", "rev-a", "other-token", now))
+	assert.False(t, validateOIDCLogoutState(state+"tampered", "team/cluster", "rev-a", "id-token", now))
+	assert.False(t, validateOIDCLogoutState(state, "team/cluster", "rev-a", "id-token", now.Add(2*time.Minute)))
 }
 
 // capturedLog is a single entry recorded by captureLogs.
@@ -6789,6 +6868,28 @@ func TestCreateHeadlampHandlerSetsSecurityHeaders(t *testing.T) {
 			assert.Equal(t, "nosniff", rr.Header().Get("X-Content-Type-Options"))
 		})
 	}
+}
+
+func TestDevModeAllowsClusterPreflight(t *testing.T) {
+	handler := createHeadlampHandler(newTestHandlerCtx(t), &HeadlampConfig{
+		HeadlampConfig: &headlampconfig.HeadlampConfig{
+			HeadlampCFG: &headlampconfig.HeadlampCFG{DevMode: true, KubeConfigStore: kubeconfig.NewContextStore()},
+			Cache:       cache.New[interface{}](),
+		},
+	})
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodOptions, "/clusters/workload/api/v1/pods", nil)
+	req.Header.Set("Origin", "http://localhost:3000")
+	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	req.Header.Set("Access-Control-Request-Headers",
+		"authorization,cache-control,"+strings.ToLower(discoveryConnectionRevisionHeader))
+
+	recorder := httptest.NewRecorder()
+
+	handler.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Contains(t, recorder.Header().Get("Access-Control-Allow-Headers"), "Cache-Control")
+	assert.Contains(t, recorder.Header().Get("Access-Control-Allow-Headers"), discoveryConnectionRevisionHeader)
 }
 
 func TestGetConfigIncludesBackstageOrigin(t *testing.T) {

@@ -127,6 +127,50 @@ func TestGetClusterConfigWithFallback(t *testing.T) {
 	assert.Nil(t, config)
 }
 
+func TestMultiplexerKeepsWatchOnItsUserContext(t *testing.T) {
+	const cluster, user = "same-name", "test-user"
+
+	store := kubeconfig.NewContextStore()
+	m := NewMultiplexer(store, false)
+
+	server := createMockKubeAPIServer()
+	defer server.Close()
+
+	shared := &kubeconfig.Context{
+		Name: cluster, Cluster: &api.Cluster{Server: "https://shared.example.com"},
+	}
+	require.NoError(t, store.AddContext(shared))
+
+	userKey := statelessContextKey(cluster, user)
+	userContext := func() *kubeconfig.Context {
+		return &kubeconfig.Context{Cluster: &api.Cluster{Server: server.URL, InsecureSkipTLSVerify: true}}
+	}
+	require.NoError(t, store.AddContextWithKeyAndTTL(userContext(), userKey, time.Minute))
+
+	conn, err := m.establishClusterConnection(cluster, user, "/api/v1/pods", "watch=1", nil, nil, nil)
+	require.NoError(t, err)
+
+	defer m.removeConnection(conn)
+
+	require.Equal(t, server.URL, conn.clusterContext.Cluster.Server)
+
+	require.NoError(t, store.AddContextWithKeyAndTTL(userContext(), userKey, time.Minute))
+
+	refreshed, err := m.reconnect(conn)
+	require.NoError(t, err)
+
+	defer m.removeConnection(refreshed)
+
+	require.Equal(t, server.URL, refreshed.clusterContext.Cluster.Server)
+
+	require.NoError(t, store.RemoveContext(userKey))
+
+	replacement, err := m.reconnect(refreshed)
+	require.ErrorIs(t, err, errClusterConnectionChanged)
+	require.Nil(t, replacement)
+	require.True(t, refreshed.IsClosed())
+}
+
 func TestCreateConnection(t *testing.T) {
 	m := NewMultiplexer(kubeconfig.NewContextStore(), false)
 	clientConn, _ := createTestWebSocketConnection()
@@ -410,6 +454,18 @@ func TestMonitorConnection(t *testing.T) {
 	assert.Equal(t, StateClosed, conn.Status.State)
 }
 
+func TestWatchStatusIncludesTheSubscriptionQuery(t *testing.T) {
+	client, server := createTestWebSocketConnection()
+	defer server.Close()
+
+	conn := createTestConnection("test-cluster", "test-user", "/api/v1/pods", "watch=1&resourceVersion=5", client)
+	conn.updateStatus(StateConnected, nil)
+
+	status := readClientMessageOfType(t, client, "STATUS")
+	require.Equal(t, conn.Query, status.Query)
+	require.Equal(t, conn.UserID, status.UserID)
+}
+
 func TestUpdateStatus(t *testing.T) {
 	clientConn, clientServer := createTestWebSocketConnection()
 	defer clientServer.Close()
@@ -463,7 +519,7 @@ func TestCleanupConnections(t *testing.T) {
 	conn := createTestConnection("test-cluster", "test-user", "/api/v1/pods", "", clientConn)
 	conn.WSConn = wsConn.conn
 
-	connKey := m.createConnectionKey("test-cluster", "/api/v1/pods", "test-user")
+	connKey := connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}
 	m.connections[connKey] = conn
 
 	m.cleanupConnections()
@@ -484,12 +540,110 @@ func TestCloseConnection(t *testing.T) {
 	conn := createTestConnection("test-cluster-1", "test-user", "/api/v1/pods", "", clientConn)
 	conn.WSConn = wsConn.conn
 
-	connKey := m.createConnectionKey("test-cluster-1", "/api/v1/pods", "test-user")
+	connKey := connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}
 	m.connections[connKey] = conn
 
-	m.CloseConnection("test-cluster-1", "/api/v1/pods", "test-user")
+	m.CloseConnection(conn.ClusterID, conn.Path, conn.UserID, conn.Query)
 	assert.Empty(t, m.connections)
 	assert.True(t, conn.closed)
+}
+
+func TestMultiplexerChecksTheRequestedConnectionBeforeReusingAWatch(t *testing.T) {
+	const cluster, user = "same-name", "test-user"
+
+	server := createMockKubeAPIServer()
+	defer server.Close()
+
+	store := kubeconfig.NewContextStore()
+	initial := &kubeconfig.Context{
+		Name: cluster, Cluster: &api.Cluster{Server: server.URL, InsecureSkipTLSVerify: true},
+		Discovery: &kubeconfig.DiscoveryOrigin{ConnectionRevision: "first"},
+	}
+	require.NoError(t, store.AddContext(initial))
+
+	m := NewMultiplexer(store, false)
+
+	client, clientServer := createTestWebSocketConnection()
+	defer clientServer.Close()
+	defer m.closeClientConnections(client)
+
+	request := Message{
+		Type: "REQUEST", ClusterID: cluster, Path: "/api/v1/pods", UserID: user,
+		Query: "watch=1&" + discoveryConnectionRevisionParam + "=first&" + discoveryConnectionEpochParam + "=1",
+	}
+	connection, err := m.getOrCreateConnection(request, client, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, request.Query, connection.Query)
+
+	upstreamQuery, err := multiplexerUpstreamQuery(request.Query, initial)
+	require.NoError(t, err)
+	require.Equal(t, "watch=1", upstreamQuery)
+
+	replacement := initial.Copy()
+	replacement.Discovery = &kubeconfig.DiscoveryOrigin{ConnectionRevision: "second"}
+	require.NoError(t, store.AddContext(replacement))
+
+	queries := []string{
+		request.Query,
+		discoveryConnectionRevisionParam + "=" + unversionedDiscoveryConnection,
+	}
+
+	for _, query := range queries {
+		request.Query = query
+		current, err := m.getOrCreateConnection(request, client, nil, nil)
+		require.ErrorIs(t, err, errClusterConnectionChanged)
+		require.Nil(t, current)
+	}
+}
+
+func TestDelayedCloseOnlyClosesItsWatchQuery(t *testing.T) {
+	const cluster, path, user = "test-cluster", "/api/v1/pods", "test-user"
+
+	server := createMockKubeAPIServer()
+	defer server.Close()
+
+	store := kubeconfig.NewContextStore()
+	require.NoError(t, store.AddContext(&kubeconfig.Context{
+		Name: cluster, Cluster: &api.Cluster{Server: server.URL, InsecureSkipTLSVerify: true},
+	}))
+
+	m := NewMultiplexer(store, false)
+
+	client, clientServer := createTestWebSocketConnection()
+	defer clientServer.Close()
+	defer m.closeClientConnections(client)
+
+	request := Message{
+		Type: "REQUEST", ClusterID: cluster, Path: path, UserID: user, Query: "watch=1&resourceVersion=2",
+	}
+	original, err := m.getOrCreateConnection(request, client, nil, nil)
+	require.NoError(t, err)
+
+	relist := request
+	relist.Query = "watch=1&resourceVersion=5"
+	relisted, err := m.getOrCreateConnection(relist, client, nil, nil)
+	require.NoError(t, err)
+	require.NotSame(t, original, relisted)
+
+	request.Type = "CLOSE"
+	m.processClientMessage(nil, client, request)
+	require.True(t, original.IsClosed())
+	require.False(t, relisted.IsClosed())
+
+	current, err := m.getOrCreateConnection(relist, client, nil, nil)
+	require.NoError(t, err)
+	require.Same(t, relisted, current)
+
+	// The fake Kubernetes socket echoes the update so the replacement runs the real forwarder.
+	update := `{"type":"MODIFIED","object":{"metadata":{"name":"relisted-pod","resourceVersion":"6"}}}`
+	require.NoError(t, current.WSConn.WriteMessage(websocket.TextMessage, []byte(update)))
+
+	complete := readClientMessageOfType(t, client, "COMPLETE")
+	require.Equal(t, relist.Query, complete.Query)
+
+	forwarded := readClientMessageOfType(t, client, "DATA")
+	require.Equal(t, relist.Query, forwarded.Query)
+	require.JSONEq(t, update, forwarded.Data)
 }
 
 func TestCloseClientConnectionsClearsClientBeforeClosing(t *testing.T) {
@@ -504,7 +658,7 @@ func TestCloseClientConnectionsClearsClientBeforeClosing(t *testing.T) {
 	conn := createTestConnection("test-cluster", "test-user", "/api/v1/pods", "", clientConn)
 	conn.WSConn = wsConn.conn
 
-	connKey := m.createConnectionKey("test-cluster", "/api/v1/pods", "test-user")
+	connKey := connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}
 	m.connections[connKey] = conn
 
 	m.closeClientConnections(clientConn)
@@ -725,7 +879,7 @@ func TestGetOrCreateConnection(t *testing.T) {
 
 	token := "token"
 
-	conn, err := m.getOrCreateConnection(msg, clientConn, &token)
+	conn, err := m.getOrCreateConnection(msg, clientConn, &token, nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, conn)
 	assert.Equal(t, "test-cluster", conn.ClusterID)
@@ -734,13 +888,13 @@ func TestGetOrCreateConnection(t *testing.T) {
 	assert.Equal(t, "watch=true", conn.Query)
 
 	// Test getting an existing connection
-	conn2, err := m.getOrCreateConnection(msg, clientConn, &token)
+	conn2, err := m.getOrCreateConnection(msg, clientConn, &token, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, conn, conn2, "Should return the same connection instance")
 
 	// Test with invalid cluster
 	msg.ClusterID = "non-existent-cluster"
-	conn3, err := m.getOrCreateConnection(msg, clientConn, &token)
+	conn3, err := m.getOrCreateConnection(msg, clientConn, &token, nil)
 	assert.Error(t, err)
 	assert.Nil(t, conn3)
 }
@@ -768,7 +922,9 @@ func TestEstablishClusterConnection(t *testing.T) {
 	defer clientServer.Close()
 
 	// Test successful connection establishment
-	conn, err := m.establishClusterConnection("test-cluster", "test-user", "/api/v1/pods", "watch=true", clientConn, nil)
+	conn, err := m.establishClusterConnection(
+		"test-cluster", "test-user", "/api/v1/pods", "watch=true", clientConn, nil, nil,
+	)
 	assert.NoError(t, err)
 	assert.NotNil(t, conn)
 	assert.Equal(t, "test-cluster", conn.ClusterID)
@@ -777,7 +933,9 @@ func TestEstablishClusterConnection(t *testing.T) {
 	assert.Equal(t, "watch=true", conn.Query)
 
 	// Test with invalid cluster
-	conn, err = m.establishClusterConnection("non-existent", "test-user", "/api/v1/pods", "watch=true", clientConn, nil)
+	conn, err = m.establishClusterConnection(
+		"non-existent", "test-user", "/api/v1/pods", "watch=true", clientConn, nil, nil,
+	)
 	assert.Error(t, err)
 	assert.Nil(t, conn)
 }
@@ -826,6 +984,7 @@ func TestEstablishClusterConnectionUsesServiceAccountToken(t *testing.T) {
 		"watch=true",
 		clientConn,
 		&requestToken,
+		nil,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, conn)
@@ -896,6 +1055,7 @@ func TestEstablishClusterConnectionUsesAPIProxy(t *testing.T) {
 		"watch=true",
 		clientConn,
 		&oidcBearer,
+		nil,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, conn)
@@ -934,7 +1094,8 @@ func TestReconnect(t *testing.T) {
 
 	// Create initial connection
 	conn := m.createConnection("test-cluster", "test-user", "/api/v1/services", "watch=true", clientConn, nil)
-	connKey := m.createConnectionKey("test-cluster", "/api/v1/services", "test-user")
+	connKey := connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}
+
 	m.mutex.Lock()
 	m.connections[connKey] = conn
 	m.mutex.Unlock()
@@ -1456,7 +1617,7 @@ func TestGetOrCreateConnection_TokenRefresh(t *testing.T) {
 		UserID:    "test-user",
 	}
 
-	conn, err := m.getOrCreateConnection(msg, clientConn, &originalToken)
+	conn, err := m.getOrCreateConnection(msg, clientConn, &originalToken, nil)
 	assert.NoError(t, err)
 	assert.NotNil(t, conn)
 	assert.Equal(t, &originalToken, conn.Token)
@@ -1465,7 +1626,7 @@ func TestGetOrCreateConnection_TokenRefresh(t *testing.T) {
 	newToken := "new-refreshed-token"
 
 	// Get the same connection, but with a new token
-	conn2, err := m.getOrCreateConnection(msg, clientConn, &newToken)
+	conn2, err := m.getOrCreateConnection(msg, clientConn, &newToken, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, conn, conn2, "Should return the same connection instance")
 
@@ -1491,7 +1652,7 @@ func TestGetOrCreateConnectionDoesNotOverwriteServiceAccountToken(t *testing.T) 
 	)
 	conn.usesServiceAccountToken = true
 
-	connKey := m.createConnectionKey(conn.ClusterID, conn.Path, conn.UserID)
+	connKey := connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}
 	m.connections[connKey] = conn
 
 	// No context is stored to match a stateless context that expired while
@@ -1504,7 +1665,7 @@ func TestGetOrCreateConnectionDoesNotOverwriteServiceAccountToken(t *testing.T) 
 		UserID:    conn.UserID,
 	}
 
-	refreshedConn, err := m.getOrCreateConnection(msg, clientConn, &requestToken)
+	refreshedConn, err := m.getOrCreateConnection(msg, clientConn, &requestToken, nil)
 	require.NoError(t, err)
 	assert.Equal(t, conn, refreshedConn)
 	require.NotNil(t, refreshedConn.Token)
@@ -1544,7 +1705,7 @@ func TestReconnect_WithToken(t *testing.T) {
 	conn.Status.State = StateError // Simulate an error state
 
 	// Add the connection to the multiplexer's connections map
-	connKey := m.createConnectionKey(conn.ClusterID, conn.Path, conn.UserID)
+	connKey := connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}
 	m.connections[connKey] = conn
 
 	// Test reconnection with the same token
@@ -1565,7 +1726,7 @@ func TestReconnect_WithToken(t *testing.T) {
 	newConn.Status.State = StateError
 
 	// Update the connection in the multiplexer's map
-	connKey = m.createConnectionKey(newConn.ClusterID, newConn.Path, newConn.UserID)
+	connKey = connectionKey{newConn.ClusterID, newConn.Path, newConn.UserID, newConn.Query}
 	m.connections[connKey] = newConn
 
 	// Reconnect with the new token
@@ -1996,13 +2157,11 @@ func BenchmarkSendIfNewResourceVersion_DirectMetadata(b *testing.B) {
 }
 
 // benchConnectionKeySink prevents the compiler from optimizing away benchmark work.
-var benchConnectionKeySink string
+var benchConnectionKeySink connectionKey
 
 // BenchmarkCreateConnectionKey measures the allocation overhead of creating
 // connection keys used for map lookups on every WebSocket message routing.
 func BenchmarkCreateConnectionKey(b *testing.B) {
-	m := NewMultiplexer(kubeconfig.NewContextStore(), false)
-
 	clusterID := "my-production-cluster"
 	path := "/api/v1/namespaces/kube-system/pods"
 	userID := "user-abc123-def456"
@@ -2011,7 +2170,7 @@ func BenchmarkCreateConnectionKey(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		benchConnectionKeySink = m.createConnectionKey(clusterID, path, userID)
+		benchConnectionKeySink = connectionKey{clusterID, path, userID, "watch=1"}
 	}
 }
 
@@ -2125,7 +2284,7 @@ func TestMonitorConnection_ExponentialBackoff(t *testing.T) {
 
 	// A monitored connection is always registered; a reconnect only retries while it still is.
 	m.mutex.Lock()
-	m.connections[m.createConnectionKey(conn.ClusterID, conn.Path, conn.UserID)] = conn
+	m.connections[connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}] = conn
 	m.mutex.Unlock()
 
 	done := make(chan struct{})
@@ -2248,7 +2407,7 @@ func TestReconnectAbortsIfConnectionClosedDuringDial(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	connKey := m.createConnectionKey(clusterID, path, userID)
+	connKey := connectionKey{clusterID, path, userID, "watch=1"}
 	conn := m.createConnection(clusterID, userID, path, "watch=1", nil, nil)
 
 	m.mutex.Lock()
@@ -2266,7 +2425,7 @@ func TestReconnectAbortsIfConnectionClosedDuringDial(t *testing.T) {
 
 	waitForDial(t, dialStarted)
 
-	m.CloseConnection(clusterID, path, userID)
+	m.CloseConnection(clusterID, path, userID, conn.Query)
 	close(releaseDial)
 
 	select {
@@ -2294,7 +2453,7 @@ func TestClientWriteFailureKeepsReplacementConnection(t *testing.T) {
 	clusterID := "test-cluster"
 	path := "/api/v1/pods"
 	userID := "test-user"
-	connKey := m.createConnectionKey(clusterID, path, userID)
+	connKey := connectionKey{clusterID, path, userID, "watch=1"}
 
 	failedClient, failedServer := createTestWebSocketConnection()
 	defer failedServer.Close()
@@ -2367,7 +2526,7 @@ func TestReconnectResumesFromLatestResourceVersion(t *testing.T) {
 	conn := m.createConnection("test-cluster", "test-user", path, query, clientConn, nil)
 
 	m.mutex.Lock()
-	m.connections[m.createConnectionKey(conn.ClusterID, path, conn.UserID)] = conn
+	m.connections[connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}] = conn
 	m.mutex.Unlock()
 
 	clusterConn, clusterServer := createTestWebSocketConn()
@@ -2389,6 +2548,9 @@ func TestReconnectResumesFromLatestResourceVersion(t *testing.T) {
 
 	assert.Equal(t, "resourceVersion=250&watch=1", <-queries)
 	assert.Equal(t, query, resumed.Query, "messages must keep routing to the subscribed query")
+
+	status := readClientMessageOfType(t, clientConn, "STATUS")
+	require.Equal(t, query, status.Query)
 }
 
 // readClientMessageOfType returns the next message of type msgType the multiplexer wrote to
@@ -2464,7 +2626,7 @@ func TestSupersededConnectionStopsForwarding(t *testing.T) {
 	conn := m.createConnection("test-cluster", "test-user", "/api/v1/pods", "watch=1", clientConn, nil)
 
 	m.mutex.Lock()
-	m.connections[m.createConnectionKey(conn.ClusterID, conn.Path, conn.UserID)] = conn
+	m.connections[connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}] = conn
 	m.mutex.Unlock()
 
 	resumed, err := m.reconnect(conn)
@@ -2509,7 +2671,7 @@ func TestExpiredWatchEventEndsConnection(t *testing.T) {
 
 	conn := m.createConnection("test-cluster", "test-user", "/api/v1/pods", "watch=1", clientConn, nil)
 	conn.WSConn = clusterConn
-	connKey := m.createConnectionKey(conn.ClusterID, conn.Path, conn.UserID)
+	connKey := connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}
 
 	m.mutex.Lock()
 	m.connections[connKey] = conn
@@ -2567,7 +2729,7 @@ func TestReconnectHandshakeExpiryEndsWatch(t *testing.T) {
 	conn := m.createConnection("test-cluster", "test-user", "/api/v1/pods", "watch=1", clientConn, nil)
 	conn.Status.State = StateError
 	conn.resourceVersion = "250"
-	connKey := m.createConnectionKey(conn.ClusterID, conn.Path, conn.UserID)
+	connKey := connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}
 
 	m.mutex.Lock()
 	m.connections[connKey] = conn
@@ -2631,7 +2793,7 @@ func TestFirstDialExpiryAsksClientToRelist(t *testing.T) {
 		Type:      "REQUEST",
 	}
 
-	_, err := m.getOrCreateConnection(msg, clientConn, nil)
+	_, err := m.getOrCreateConnection(msg, clientConn, nil, nil)
 	require.ErrorIs(t, err, errWatchExpired)
 
 	m.handleConnectionError(clientConn, msg, err)
@@ -2639,6 +2801,32 @@ func TestFirstDialExpiryAsksClientToRelist(t *testing.T) {
 	data := readClientMessageOfType(t, clientConn, "DATA")
 	assert.Equal(t, msg.Query, data.Query)
 	assert.JSONEq(t, watchExpiredEvent, data.Data)
+}
+
+func TestWatchHandshakeStatusReachesSubscriber(t *testing.T) {
+	for _, status := range []int{http.StatusServiceUnavailable, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+
+			m := NewMultiplexer(kubeconfig.NewContextStore(), false)
+			_, err := m.dialWebSocket("ws"+strings.TrimPrefix(server.URL, "http"), nil, server.URL, nil)
+			require.Error(t, err)
+
+			client, clientServer := createTestWebSocketConnection()
+			defer clientServer.Close()
+
+			m.handleConnectionError(client, Message{ClusterID: "workload", Path: "/api/v1/pods", Query: "watch=1"}, err)
+
+			var payload struct {
+				Status int `json:"status"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(readClientMessageOfType(t, client, "ERROR").Data), &payload))
+			assert.Equal(t, status, payload.Status)
+		})
+	}
 }
 
 func TestReconnectClosesConnectionReplacedDuringDial(t *testing.T) {
@@ -2654,7 +2842,7 @@ func TestReconnectClosesConnectionReplacedDuringDial(t *testing.T) {
 	}))
 
 	conn := m.createConnection("test-cluster", "test-user", "/api/v1/pods", "watch=1", nil, nil)
-	connKey := m.createConnectionKey(conn.ClusterID, conn.Path, conn.UserID)
+	connKey := connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}
 
 	m.mutex.Lock()
 	m.connections[connKey] = conn
@@ -2719,7 +2907,7 @@ func TestReconnectClosesConnectionReplacedDuringFailedDial(t *testing.T) {
 
 	conn := m.createConnection("test-cluster", "test-user", "/api/v1/pods", "watch=1", nil, nil)
 	conn.Status.State = StateError
-	connKey := m.createConnectionKey(conn.ClusterID, conn.Path, conn.UserID)
+	connKey := connectionKey{conn.ClusterID, conn.Path, conn.UserID, conn.Query}
 
 	m.mutex.Lock()
 	m.connections[connKey] = conn

@@ -24,6 +24,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/auth"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 )
 
@@ -53,39 +54,39 @@ func requestClusterName(r *http.Request, pathTemplate string) string {
 // kubeconfig shadows a global connection with the same name, so the lookup follows
 // the handlers' resolution. The result is attached to the returned request: the
 // WebSocket user-id subprotocol is consumed on first use and must not be resolved twice.
-// It returns nil when the cluster is unknown, leaving the error to the handler.
+// It returns the lookup error when the cluster cannot be resolved.
 func (c *HeadlampConfig) resolveRequestContext(
 	r *http.Request,
 	clusterName string,
-) (*http.Request, *kubeconfig.Context) {
+) (*http.Request, *kubeconfig.Context, error) {
 	if mux.Vars(r)["clusterName"] == "" {
 		// The legacy drain status route names its cluster in the query.
 		kContext, err := c.KubeConfigStore.GetContext(clusterName)
-		if err != nil {
-			return r, nil
-		}
+		resolved := resolvedClusterContext{key: clusterName, context: kContext}
 
-		return r, kContext
+		return r.WithContext(context.WithValue(r.Context(), resolvedClusterContextKey{}, resolved)), kContext, err
 	}
 
 	contextKey, err := c.getContextKeyForRequest(r)
 	if err != nil {
-		return r, nil
+		return r, nil, err
 	}
 
 	contextKey, kContext, err := c.getContextWithWebSocketFallback(r, contextKey)
 	if err != nil {
-		return r, nil
+		return r, nil, err
 	}
 
 	resolved := resolvedClusterContext{key: contextKey, context: kContext}
 
-	return r.WithContext(context.WithValue(r.Context(), resolvedClusterContextKey{}, resolved)), kContext
+	return r.WithContext(context.WithValue(r.Context(), resolvedClusterContextKey{}, resolved)), kContext, nil
 }
 
 // requireUserAuthentication runs before cluster handlers and the response
 // cache. Kubernetes validates the user's token and applies that user's RBAC.
 func (c *HeadlampConfig) requireUserAuthentication(next http.Handler) http.Handler {
+	refresh := c.OIDCTokenRefreshMiddleware(next)
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		pathTemplate, _ := mux.CurrentRoute(r).GetPathTemplate()
 
@@ -96,11 +97,31 @@ func (c *HeadlampConfig) requireUserAuthentication(next http.Handler) http.Handl
 		}
 
 		if strings.HasSuffix(pathTemplate, "/clusters/{clusterName}/set-token") {
-			next.ServeHTTP(w, r)
+			request, connection, err := c.resolveRequestContext(r, clusterName)
+			if !validateDiscoveryConnectionRevision(w, request, connection, err) {
+				return
+			}
+
+			next.ServeHTTP(w, auth.WithCookieConnection(request, connection))
+
 			return
 		}
 
-		r, kContext := c.resolveRequestContext(r, clusterName)
+		r, kContext, resolveErr := c.resolveRequestContext(r, clusterName)
+		checkedConnection := kContext
+
+		// The legacy status cache can still answer for a removed unversioned
+		// connection. Keep its original key and never look up a replacement.
+		if mux.Vars(r)["clusterName"] == "" && errors.Is(resolveErr, cache.ErrNotFound) {
+			checkedConnection = &kubeconfig.Context{}
+			resolveErr = nil
+		}
+
+		if !validateDiscoveryConnectionRevision(w, r, checkedConnection, resolveErr) {
+			return
+		}
+
+		r = auth.WithCookieConnection(r, kContext)
 		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 			processWebSocketProtocolHeader(r)
 		}
@@ -112,7 +133,7 @@ func (c *HeadlampConfig) requireUserAuthentication(next http.Handler) http.Handl
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		refresh.ServeHTTP(w, r)
 	})
 }
 
@@ -133,10 +154,9 @@ func (c *HeadlampConfig) normalizeClusterCredentials(r *http.Request, cluster st
 	if c.shouldUseUnsafeServiceAccountTokenForContext(k) {
 		clearRequestAuthorization(r)
 	} else {
-		token := c.proxyAuthToken(r)
+		token := auth.BearerTokenValue(c.proxyAuthToken(r))
 
-		// The refresh middleware sets Authorization while the request cookie
-		// still holds the old token. Only use the cookie as a fallback.
+		// Prefer the request's Authorization header, using the cookie as a fallback.
 		if token == "" {
 			token = c.requestTokenForContext(r, cluster, k)
 		}

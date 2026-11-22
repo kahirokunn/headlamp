@@ -18,21 +18,27 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/auth"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 )
+
+const testImportRevisionKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 func TestRejectedBackendCredentialsDoNotChangeContexts(t *testing.T) {
 	t.Setenv("HEADLAMP_BACKEND_TOKEN", "desktop-token")
@@ -50,6 +56,7 @@ func TestRejectedBackendCredentialsDoNotChangeContexts(t *testing.T) {
 			reject := func() {
 				req := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
 					"/clusters/user-context/api/v1/pods", nil)
+				req.Header.Set(importRevisionKeyHeader, testImportRevisionKey)
 				req.Header.Set("KUBECONFIG", base64.StdEncoding.EncodeToString(config))
 				req.Header.Set("X-HEADLAMP-USER-ID", "user")
 
@@ -98,6 +105,40 @@ func TestInventoryRoutesRequireUserAuthentication(t *testing.T) {
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, req)
 			require.Equal(t, http.StatusUnauthorized, response.Code, response.Body.String())
+		})
+	}
+}
+
+func TestClusterConnectionPreconditionPreservesLookupErrors(t *testing.T) {
+	cfg := newDrainAuthConfig(t, &kubeconfig.Context{Name: "unrelated"})
+	cfg.EnableDynamicClusters = true
+	router := mux.NewRouter()
+	handleClusterAPI(cfg, router)
+
+	for _, tc := range []struct {
+		name, revision, kubeconfig string
+		status                     int
+	}{
+		{name: "unknown ordinary cluster", revision: unversionedDiscoveryConnection, status: http.StatusNotFound},
+		{
+			name: "invalid stateless kubeconfig", revision: unversionedDiscoveryConnection,
+			kubeconfig: "invalid!", status: http.StatusBadRequest,
+		},
+		{name: "removed discovered connection", revision: "previous", status: http.StatusConflict},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/clusters/missing/api/v1/pods", nil)
+			req.Header.Set(discoveryConnectionRevisionHeader, tc.revision)
+
+			if tc.kubeconfig != "" {
+				req.Header.Set(importRevisionKeyHeader, testImportRevisionKey)
+				req.Header.Set("KUBECONFIG", tc.kubeconfig)
+				req.Header.Set("X-HEADLAMP-USER-ID", "user")
+			}
+
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, req)
+			require.Equal(t, tc.status, response.Code, response.Body.String())
 		})
 	}
 }
@@ -204,6 +245,145 @@ func TestInventoryOIDCLoginForwardsTheSignedInUser(t *testing.T) {
 	require.Len(t, strings.Split(forwardedToken, "."), 3)
 }
 
+func TestOIDCLoginExpiresWhenTheConnectionIsReplaced(t *testing.T) {
+	provider := newSigningOIDCTestServer(t)
+
+	var store kubeconfig.ContextStore
+
+	handler, cluster := newOIDCTestHandler(t, provider, func(config *HeadlampConfig) {
+		store = config.KubeConfigStore
+		connection, err := store.GetContext("oidc-char-test")
+		require.NoError(t, err)
+
+		connection.Discovery = &kubeconfig.DiscoveryOrigin{ConnectionRevision: "original"}
+	})
+	state := extractState(t, driveOIDCStart(t, handler, cluster))
+	original, err := store.GetContext(cluster)
+	require.NoError(t, err)
+
+	replacement := original.Copy()
+	replacement.Discovery.ConnectionRevision = "replacement"
+	require.NoError(t, store.AddContext(replacement))
+
+	callback := callOIDCCallback(t, handler, "state="+state+"&code=code")
+	require.Equal(t, http.StatusConflict, callback.Code, callback.Body.String())
+	require.Empty(t, callback.Header().Values("Set-Cookie"))
+}
+
+//nolint:funlen // Drive login, callback and logout through the same HTTP handler.
+func TestImportedOIDCUsesItsOwnConnection(t *testing.T) {
+	provider := newSigningOIDCTestServer(t)
+	global := setupOIDCProviderWithEndSessionEndpoint()(t)
+
+	var config *HeadlampConfig
+
+	handler, cluster := newOIDCTestHandler(t, provider, func(c *HeadlampConfig) {
+		config = c
+		c.UseInCluster = true
+		c.EnableDynamicClusters = true
+		c.OidcUseCookie = true
+		c.SessionTTL = 600
+		connection, err := c.KubeConfigStore.GetContext("oidc-char-test")
+		require.NoError(t, err)
+
+		connection.OidcConf.IdpIssuerURL = global
+	})
+	kubeconfigData, err := clientcmd.Write(api.Config{
+		Clusters: map[string]*api.Cluster{cluster: {Server: "https://k8s.example.com"}},
+		Contexts: map[string]*api.Context{cluster: {Cluster: cluster, AuthInfo: cluster}},
+		AuthInfos: map[string]*api.AuthInfo{cluster: {AuthProvider: &api.AuthProviderConfig{
+			Name: "oidc", Config: map[string]string{
+				"idp-issuer-url": provider.URL(), "client-id": "test-client-id",
+			},
+		}}},
+		CurrentContext: cluster,
+	})
+	require.NoError(t, err)
+
+	raw := base64.StdEncoding.EncodeToString(kubeconfigData)
+	connections, _, err := kubeconfig.LoadContextsFromBase64String(raw, kubeconfig.DynamicCluster)
+	require.NoError(t, err)
+	require.Len(t, connections, 1)
+
+	fingerprint, err := importedConnectionRevision(&connections[0], testImportRevisionKey)
+	require.NoError(t, err)
+
+	revision := fingerprint + "-1"
+	user := "browser--" + revision
+	request := func(method, path string, cookies []*http.Cookie) *httptest.ResponseRecorder {
+		r := httptest.NewRequestWithContext(t.Context(), method, path, nil)
+		if method == http.MethodPost {
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set(importRevisionKeyHeader, testImportRevisionKey)
+			r.Header.Set("KUBECONFIG", raw)
+			r.Header.Set("X-HEADLAMP-USER-ID", user)
+			r.Header.Set(discoveryConnectionRevisionHeader, revision)
+		}
+
+		for _, cookie := range cookies {
+			r.AddCookie(cookie)
+		}
+
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, r)
+
+		return response
+	}
+	redirectURL := func(response *httptest.ResponseRecorder) *url.URL {
+		t.Helper()
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+
+		var result struct{ RedirectURL string }
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &result))
+		target, err := url.Parse(result.RedirectURL)
+		require.NoError(t, err)
+
+		return target
+	}
+
+	login := "/oidc?cluster=" + cluster + "&popup=true"
+	target := redirectURL(request(http.MethodPost, login, nil))
+	require.Equal(t, provider.URL()+"/auth", target.Scheme+"://"+target.Host+target.Path)
+	require.NotContains(t, target.String(), user)
+
+	callback := driveOIDCCallback(t, handler, extractState(t, target))
+	require.Equal(t, http.StatusSeeOther, callback.Code, callback.Body.String())
+	require.Contains(t, callback.Header().Get("Location"), discoveryConnectionRevisionParam+"="+revision)
+	require.Contains(t, callback.Header().Get("Location"), "popup=true")
+	cookies := callback.Result().Cookies()
+	require.NotEmpty(t, cookies)
+
+	desktopState := extractState(t, redirectURL(request(http.MethodPost, login, nil)))
+	desktopRequest := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
+		"/oidc-callback?state="+url.QueryEscape(desktopState)+"&code="+url.QueryEscape(testAuthCode), nil)
+	desktopRequest.Header.Set("Accept", "application/json")
+
+	// An in-progress login pins its imported context even when unrelated
+	// requests update the cache's idle expiry.
+	require.NoError(t, config.KubeConfigStore.UpdateTTL(statelessContextKey(cluster, user), time.Nanosecond))
+
+	desktopCallback := httptest.NewRecorder()
+	handler.ServeHTTP(desktopCallback, desktopRequest)
+	require.Equal(t, http.StatusNoContent, desktopCallback.Code)
+	require.Empty(t, desktopCallback.Header().Get("Location"))
+	require.NotEmpty(t, desktopCallback.Result().Cookies())
+
+	logoutPath := auth.GetOIDCLogoutCookiePath("", cluster)
+	transition := redirectURL(request(http.MethodPost, logoutPath, cookies))
+	require.NotContains(t, transition.String(), user)
+	follow := request(http.MethodGet, transition.String(), cookies)
+	require.Equal(t, http.StatusFound, follow.Code, follow.Body.String())
+	require.Contains(t, follow.Header().Get("Location"), provider.URL()+"/logout?")
+	require.NotContains(t, follow.Header().Get("Location"), global)
+
+	pending := extractState(t, redirectURL(request(http.MethodPost, login, nil)))
+	require.NoError(t, config.removeImportedConnection(t.Context(), statelessContextKey(cluster, user), revision))
+	staleCallback := driveOIDCCallback(t, handler, pending)
+	require.Equal(t, http.StatusConflict, staleCallback.Code, staleCallback.Body.String())
+	require.Empty(t, staleCallback.Header().Values("Set-Cookie"))
+	require.Equal(t, http.StatusConflict, request(http.MethodPost, logoutPath, cookies).Code)
+}
+
 func TestInventoryMultiplexerRejectsMissingCredentialsOnReusedConnection(t *testing.T) {
 	store := kubeconfig.NewContextStore()
 	require.NoError(t, store.AddContext(&kubeconfig.Context{
@@ -212,16 +392,16 @@ func TestInventoryMultiplexerRejectsMissingCredentialsOnReusedConnection(t *test
 	}))
 	m := NewMultiplexer(store, true)
 	message := Message{ClusterID: "inventory", UserID: "user-a", Path: "/api/v1/pods"}
-	m.connections[m.createConnectionKey(message.ClusterID, message.Path, message.UserID)] = &Connection{}
+	m.connections[connectionKey{message.ClusterID, message.Path, message.UserID, message.Query}] = &Connection{}
 
 	for _, token := range []*string{nil, new(string)} {
-		_, err := m.getOrCreateConnection(message, nil, token)
+		_, err := m.getOrCreateConnection(message, nil, token, nil)
 		require.ErrorContains(t, err, "user authentication is required")
 	}
 
 	require.NoError(t, store.AddContext(&kubeconfig.Context{Name: "inventory", Source: kubeconfig.KubeConfig}))
 
-	_, err := m.getOrCreateConnection(message, nil, nil)
+	_, err := m.getOrCreateConnection(message, nil, nil, nil)
 	require.NoError(t, err)
 }
 
@@ -309,7 +489,335 @@ func userKubeconfigFor(t *testing.T, name, server string) []byte {
 
 // A user's own kubeconfig shadows a global connection with the same name, so the
 // authentication gate must judge the connection the request will actually use.
-//
+func TestTokenEndpointsSelectImportedConnection(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("token management must not call Kubernetes")
+	}))
+	t.Cleanup(server.Close)
+
+	const cluster = "imported"
+
+	global := &kubeconfig.Context{
+		Name: cluster, Source: kubeconfig.DiscoveredCluster,
+		KubeContext: &api.Context{Cluster: cluster, AuthInfo: cluster},
+		Cluster:     &api.Cluster{Server: server.URL, InsecureSkipTLSVerify: true},
+		AuthInfo:    &api.AuthInfo{},
+		Discovery:   &kubeconfig.DiscoveryOrigin{ConnectionRevision: "global"},
+	}
+	cfg := newDrainAuthConfig(t, global)
+	cfg.EnableDynamicClusters = true
+	router := mux.NewRouter()
+	handleClusterAPI(cfg, router)
+
+	userKubeconfig := base64.StdEncoding.EncodeToString(userKubeconfigFor(t, cluster, server.URL))
+
+	for _, shadowed := range []bool{true, false} {
+		for _, endpoint := range []string{
+			"/clusters/" + cluster + "/set-token",
+			"/encoded-clusters/" + auth.EncodeClusterForURL(cluster) + "/clear-token",
+		} {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, endpoint,
+				strings.NewReader(`{"token":"private"}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(importRevisionKeyHeader, testImportRevisionKey)
+			req.Header.Set("KUBECONFIG", userKubeconfig)
+			req.Header.Set("X-HEADLAMP-USER-ID", "browser-user")
+			req.Header.Set(discoveryConnectionRevisionHeader, unversionedDiscoveryConnection)
+
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, req)
+			require.Equal(t, http.StatusOK, response.Code, "shadowed=%t: %s", shadowed, response.Body.String())
+		}
+
+		if shadowed {
+			require.NoError(t, cfg.KubeConfigStore.RemoveContext(cluster))
+		}
+	}
+
+	_, err := cfg.KubeConfigStore.GetContext(statelessContextKey(cluster, "browser-user"))
+	require.NoError(t, err)
+}
+
+//nolint:funlen // Exercise both imported routes through the HTTP router.
+func TestReplacementImportKeepsItsOwnRouteAndCookies(t *testing.T) {
+	const cluster = "same-name"
+
+	reached := make(chan string, 8)
+	makeAPI := func(endpoint string) *httptest.Server {
+		return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Empty(t, r.Header.Get(importRevisionKeyHeader))
+			assert.Empty(t, r.Header.Get("KUBECONFIG"))
+
+			reached <- endpoint + ":" + r.Header.Get("Authorization")
+
+			_, _ = w.Write([]byte("{}"))
+		}))
+	}
+	original := makeAPI("A")
+	t.Cleanup(original.Close)
+
+	replacement := makeAPI("B")
+	t.Cleanup(replacement.Close)
+
+	config := newDrainAuthConfig(t, &kubeconfig.Context{Name: cluster})
+	config.EnableDynamicClusters = true
+	router := mux.NewRouter()
+	handleClusterAPI(config, router)
+
+	kubeconfigA := base64.StdEncoding.EncodeToString(userKubeconfigFor(t, cluster, original.URL))
+	kubeconfigB := base64.StdEncoding.EncodeToString(userKubeconfigFor(t, cluster, replacement.URL))
+	parsed, errs := parseClusterFromKubeConfig([]string{kubeconfigA, kubeconfigB}, testImportRevisionKey)
+	require.Empty(t, errs)
+	require.Len(t, parsed, 2)
+	require.Equal(t, 0, *parsed[0].KubeconfigIndex)
+	require.Equal(t, 1, *parsed[1].KubeconfigIndex)
+	revisionA, revisionB := parsed[0].ImportRevision, parsed[1].ImportRevision
+	require.NotEqual(t, revisionA, revisionB)
+
+	request := func(method, path, raw, revision string, cookies []*http.Cookie) *httptest.ResponseRecorder {
+		r := httptest.NewRequestWithContext(t.Context(), method, "/clusters/"+cluster+path,
+			strings.NewReader(`{"token":"token-for-A"}`))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set(importRevisionKeyHeader, testImportRevisionKey)
+		r.Header.Set("KUBECONFIG", raw)
+		r.Header.Set("X-HEADLAMP-USER-ID", "browser-user--"+revision)
+		r.Header.Set(discoveryConnectionRevisionHeader, revision)
+
+		for _, cookie := range cookies {
+			r.AddCookie(cookie)
+		}
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+
+		return w
+	}
+
+	save := request(http.MethodPost, "/set-token", kubeconfigA, revisionA, nil)
+	require.Equal(t, http.StatusOK, save.Code, save.Body.String())
+	cookies := save.Result().Cookies()
+	require.NotEmpty(t, cookies)
+
+	readA := request(http.MethodGet, "/api/v1/pods", kubeconfigA, revisionA, cookies)
+	require.Equal(t, http.StatusOK, readA.Code, readA.Body.String())
+	require.Len(t, reached, 1)
+	require.Equal(t, "A:Bearer token-for-A", <-reached)
+
+	readB := request(http.MethodGet, "/api/v1/pods", kubeconfigB, revisionB, cookies)
+	require.Equal(t, http.StatusOK, readB.Code, readB.Body.String())
+	require.Len(t, reached, 1)
+	require.Equal(t, "B:Basic bG9jYWwtdXNlcjpsb2NhbC1wYXNz", <-reached)
+
+	stale := request(http.MethodDelete, "/api/v1/pods/work", kubeconfigB, revisionA, cookies)
+	require.Equal(t, http.StatusConflict, stale.Code, stale.Body.String())
+	require.Empty(t, reached)
+}
+
+//nolint:funlen // Test retirement, late rehydration, and a fresh incarnation through the router.
+func TestRetiringAnImportCancelsOnlyItsConnection(t *testing.T) {
+	const alias, browser = "workload", "browser"
+
+	cfg := newDrainAuthConfig(t, &kubeconfig.Context{Name: alias})
+	cfg.EnableDynamicClusters = true
+	router := mux.NewRouter()
+	cfg.addClusterSetupRoute(router)
+	handleClusterAPI(cfg, router)
+
+	add := func(host, incarnation string) (string, string, *kubeconfig.Context, string) {
+		raw := base64.StdEncoding.EncodeToString(userKubeconfigFor(t, alias, "https://"+host+".example.invalid"))
+		contexts, errs, err := kubeconfig.LoadContextsFromBase64String(raw, kubeconfig.DynamicCluster)
+		require.NoError(t, err)
+		require.Empty(t, errs)
+		require.Len(t, contexts, 1)
+		revision, err := importedConnectionRevision(&contexts[0], testImportRevisionKey)
+		require.NoError(t, err)
+
+		userID := browser + "--" + revision + "-" + incarnation
+		key := statelessContextKey(alias, userID)
+		require.NoError(t, cfg.setKeyInCache(key, contexts[0]))
+		connection, err := cfg.KubeConfigStore.GetContext(key)
+		require.NoError(t, err)
+
+		return userID, key, connection, raw
+	}
+	oldID, oldKey, old, originalRaw := add("original", "1")
+	newID, newKey, replacement, _ := add("replacement", "2")
+	ctxA, releaseA, err := cfg.KubeConfigStore.RetainContext(oldKey, old, time.Second)
+	require.NoError(t, err)
+	t.Cleanup(releaseA)
+
+	ctxB, releaseB, err := cfg.KubeConfigStore.RetainContext(newKey, replacement, time.Second)
+	require.NoError(t, err)
+	t.Cleanup(releaseB)
+
+	retire := func(userID string) {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost,
+			"/stateless-connections/"+auth.EncodeClusterForURL(alias)+"/retire", nil)
+		req.Header.Set("X-HEADLAMP-USER-ID", userID)
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		require.Equal(t, http.StatusNoContent, w.Code, w.Body.String())
+	}
+	retire("other-" + oldID)
+	require.NoError(t, ctxA.Err())
+	require.NoError(t, cfg.KubeConfigStore.UpdateTTL(oldKey, time.Nanosecond))
+	_, err = cfg.KubeConfigStore.GetContext(oldKey)
+	require.NoError(t, err)
+
+	retire(oldID)
+	retire(oldID)
+	require.Error(t, ctxA.Err())
+	require.NoError(t, ctxB.Err())
+	require.NotEqual(t, oldID, newID)
+
+	_, err = cfg.KubeConfigStore.GetContext(oldKey)
+	require.Error(t, err)
+	_, err = cfg.KubeConfigStore.GetContext(newKey)
+	require.NoError(t, err)
+
+	request := func(userID string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost,
+			"/clusters/"+alias+"/set-token", strings.NewReader(`{"token":"test"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(importRevisionKeyHeader, testImportRevisionKey)
+		req.Header.Set("KUBECONFIG", originalRaw)
+		req.Header.Set("X-HEADLAMP-USER-ID", userID)
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		return w
+	}
+	stale := request(oldID)
+	require.Equal(t, http.StatusConflict, stale.Code, stale.Body.String())
+	require.Contains(t, stale.Body.String(), "Discovered cluster connection changed")
+
+	_, err = cfg.KubeConfigStore.GetContext(oldKey)
+	require.Error(t, err)
+
+	// An intentional re-import can use the same connection settings under a new incarnation.
+	restored := request(strings.TrimSuffix(oldID, "-1") + "-3")
+	require.Equal(t, http.StatusOK, restored.Code, restored.Body.String())
+}
+
+func TestSelectImportWithSharedEffectiveName(t *testing.T) {
+	load := func(name string) kubeconfig.Context {
+		raw := userKubeconfigFor(t, name, "https://"+name+".example.invalid")
+		encoded := base64.StdEncoding.EncodeToString(raw)
+		contexts, errs, err := kubeconfig.LoadContextsFromBase64String(encoded, kubeconfig.DynamicCluster)
+		require.NoError(t, err)
+		require.Empty(t, errs)
+
+		c := contexts[0]
+		c.KubeContext.Extensions = map[string]runtime.Object{
+			"headlamp_info": &runtime.Unknown{Raw: []byte(`{"customName":"shared"}`)},
+		}
+
+		return c
+	}
+
+	contexts := []kubeconfig.Context{load("first"), load("second")}
+	parsed, errs := parseCustomNameClusters(contexts, testImportRevisionKey)
+	require.Empty(t, parsed)
+	require.Len(t, errs, 1)
+	require.ErrorContains(t, errs[0], "shared")
+
+	sibling := load("other")
+	sibling.KubeContext.Extensions = nil
+	parsed, errs = parseCustomNameClusters(append(contexts, sibling), testImportRevisionKey)
+	require.Len(t, errs, 1)
+	require.Len(t, parsed, 1)
+	require.Equal(t, "other", parsed[0].Name)
+
+	for _, selected := range contexts {
+		revision, err := importedConnectionRevision(&selected, testImportRevisionKey)
+		require.NoError(t, err)
+		_, routed, err := selectStatelessContext("shared", "browser--"+revision, testImportRevisionKey, contexts)
+		require.NoError(t, err)
+		require.Equal(t, selected.Cluster.Server, routed.Cluster.Server)
+	}
+
+	_, _, err := selectStatelessContext("shared", "browser--import-"+strings.Repeat("0", 32),
+		testImportRevisionKey, contexts)
+	require.ErrorIs(t, err, errClusterConnectionChanged)
+}
+
+func TestImportedRevisionIgnoresOtherContextsInTheRecord(t *testing.T) {
+	config := api.Config{
+		Clusters: map[string]*api.Cluster{
+			"alpha": {Server: "https://alpha.example.invalid"},
+			"beta":  {Server: "https://beta.example.invalid"},
+		},
+		AuthInfos: map[string]*api.AuthInfo{
+			"alpha": {Token: "alpha-token"},
+			"beta":  {Token: "beta-token"},
+		},
+		Contexts: map[string]*api.Context{
+			"alpha": {Cluster: "alpha", AuthInfo: "alpha"},
+			"beta":  {Cluster: "beta", AuthInfo: "beta", Namespace: "workloads"},
+		},
+		CurrentContext: "beta",
+	}
+	revision := func(key string) string {
+		raw, err := clientcmd.Write(config)
+		require.NoError(t, err)
+
+		clusters, errs := parseClusterFromKubeConfig([]string{base64.StdEncoding.EncodeToString(raw)}, key)
+		require.Empty(t, errs)
+
+		for _, cluster := range clusters {
+			if cluster.Name == "beta" {
+				return cluster.ImportRevision
+			}
+		}
+
+		t.Fatal("beta is missing from parsed kubeconfig")
+
+		return ""
+	}
+
+	original := revision(testImportRevisionKey)
+	require.NotEmpty(t, original)
+	require.Empty(t, revision(""))
+	require.NotEqual(t, original, revision(strings.Repeat("ab", 32)))
+	delete(config.Contexts, "alpha")
+	delete(config.AuthInfos, "alpha")
+	delete(config.Clusters, "alpha")
+	require.Equal(t, original, revision(testImportRevisionKey))
+
+	config.AuthInfos["beta"].Token = "replacement-token"
+
+	require.NotEqual(t, original, revision(testImportRevisionKey))
+}
+
+func TestLegacyDrainStatusSurvivesMissingUnversionedContext(t *testing.T) {
+	const cluster, node = "local", "node-1"
+
+	config := newDrainAuthConfig(t, &kubeconfig.Context{Name: cluster})
+	require.NoError(t, config.KubeConfigStore.RemoveContext(cluster))
+	require.NoError(t, config.Cache.Set(t.Context(), drainCacheKey(node, cluster, nil), "pending"))
+
+	router := mux.NewRouter()
+	router.Handle("/drain-node-status", config.authenticatedHandler(http.HandlerFunc(config.handleNodeDrainStatus)))
+
+	for _, tc := range []struct {
+		revision string
+		want     int
+	}{
+		{unversionedDiscoveryConnection, http.StatusOK},
+		{"superseded", http.StatusConflict},
+	} {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
+			"/drain-node-status?cluster="+cluster+"&nodeName="+node, nil)
+		req.Header.Set(discoveryConnectionRevisionHeader, tc.revision)
+
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		require.Equal(t, tc.want, response.Code, response.Body.String())
+	}
+}
+
 //nolint:funlen // HTTP and WebSocket credential integration.
 func TestStatelessConnectionShadowsSameNamedOIDCConnection(t *testing.T) {
 	t.Setenv("HEADLAMP_BACKEND_TOKEN", "desktop-token")
@@ -355,6 +863,7 @@ func TestStatelessConnectionShadowsSameNamedOIDCConnection(t *testing.T) {
 	t.Run("stateless request uses its own credentials", func(t *testing.T) {
 		received = nil
 		response := do(func(req *http.Request) {
+			req.Header.Set(importRevisionKeyHeader, testImportRevisionKey)
 			req.Header.Set("KUBECONFIG", base64.StdEncoding.EncodeToString(userKubeconfig))
 			req.Header.Set("X-HEADLAMP-USER-ID", "user-a")
 		})

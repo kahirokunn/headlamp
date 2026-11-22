@@ -96,12 +96,7 @@ func BearerTokenValue(token string) string {
 // the Bearer token from the Authorization header of the HTTP request, falling
 // back to the cluster cookie when the header is missing.
 func ParseClusterAndToken(r *http.Request) (string, string) {
-	cluster := ""
-
-	matches := clusterPathRegex.FindStringSubmatch(r.URL.Path)
-	if len(matches) > 1 {
-		cluster = matches[1]
-	}
+	cluster := clusterFromRequestPath(r)
 
 	// Try Authorization header first (for backward compatibility)
 	token := BearerTokenValue(r.Header.Get("Authorization"))
@@ -121,6 +116,15 @@ func ParseClusterAndToken(r *http.Request) (string, string) {
 	}
 
 	return cluster, token
+}
+
+func clusterFromRequestPath(r *http.Request) string {
+	matches := clusterPathRegex.FindStringSubmatch(r.URL.Path)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+
+	return ""
 }
 
 // GetExpiryUnixTimeUTC expiration unix time UTC from a token payload map exp field.
@@ -700,6 +704,7 @@ func marshalToString(val interface{}) (string, bool) {
 type RefreshAndSetTokenParams struct {
 	Ctx                       context.Context
 	OIDCAuthConfig            *kubeconfig.OidcConfig
+	KubeConfigStore           kubeconfig.ContextStore
 	Cache                     cache.Cache[interface{}]
 	Token                     string
 	Cluster                   string
@@ -798,6 +803,10 @@ func RefreshAndSetToken(params RefreshAndSetTokenParams) {
 			err, "failed to extract token string")
 		params.TelemetryHandler.RecordError(params.Span, err, "Token extraction failed")
 
+		return
+	}
+
+	if !CookieConnectionCurrent(params.Request, params.KubeConfigStore) {
 		return
 	}
 

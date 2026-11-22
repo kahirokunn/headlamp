@@ -38,6 +38,7 @@ import (
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/logger"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/plugins"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/portforward"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/spa"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/telemetry"
 	"go.opentelemetry.io/otel/attribute"
@@ -229,6 +230,7 @@ func createHeadlampConfig(conf *config.Config) *HeadlampConfig {
 	cache := cache.New[interface{}]()
 	kubeConfigStore := kubeconfig.NewContextStore()
 	setupKubeConfigStoreWatcher(kubeConfigStore)
+	portforward.WatchConnections(kubeConfigStore, cache)
 
 	multiplexer := NewMultiplexer(kubeConfigStore, conf.InCluster && conf.UnsafeUseServiceAccountToken)
 
@@ -323,7 +325,12 @@ func GetContextKeyAndKContext(w http.ResponseWriter,
 
 	contextKey, err := c.getContextKeyForRequest(r)
 	if err != nil {
-		c.handleError(w, ctx, span, err, "failed to get context Key:", http.StatusBadRequest)
+		if errors.Is(err, errClusterConnectionChanged) {
+			writeDiscoveryConnectionConflict(w)
+		} else {
+			c.handleError(w, ctx, span, err, "failed to get context Key:", http.StatusBadRequest)
+		}
+
 		span.End()
 
 		return nil, "", nil, err

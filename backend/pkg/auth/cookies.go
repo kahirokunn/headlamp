@@ -17,14 +17,167 @@ limitations under the License.
 package auth
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 )
+
+type cookieConnectionKey struct{}
+
+// WithCookieConnection binds authentication cookies to the selected connection.
+func WithCookieConnection(r *http.Request, connection *kubeconfig.Context) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), cookieConnectionKey{}, connection))
+}
+
+func cookieConnection(r *http.Request) *kubeconfig.Context {
+	connection, _ := r.Context().Value(cookieConnectionKey{}).(*kubeconfig.Context)
+	return connection
+}
+
+// CookieConnectionCurrent reports whether a selected discovered connection still
+// owns the cookie slot after an operation that could have blocked.
+func CookieConnectionCurrent(r *http.Request, store kubeconfig.ContextStore) bool {
+	connection := cookieConnection(r)
+
+	revision := connection.RoutingRevision()
+	if revision == "" {
+		return true
+	}
+
+	current, err := store.GetContext(connection.Name)
+
+	return err == nil && current.RoutingRevision() == revision
+}
+
+func connectionCookieScope(r *http.Request) string {
+	connection := cookieConnection(r)
+
+	revision := connection.RoutingRevision()
+	if revision == "" {
+		return ""
+	}
+
+	if connection.ImportRevision != "" {
+		revision = connection.Name
+	}
+
+	scope := sha256.Sum256([]byte(revision))
+
+	return hex.EncodeToString(scope[:16]) + ":"
+}
+
+func cookieClusterName(r *http.Request, cluster string) string {
+	name := SanitizeClusterName(cluster)
+	connection := cookieConnection(r)
+
+	if name != "" && connection != nil {
+		if connection.Discovery != nil && connection.RoutingRevision() != "" {
+			return name + ".discovery." + strings.TrimSuffix(connectionCookieScope(r), ":")
+		}
+
+		if connection.ImportRevision != "" {
+			return name + "." + connection.ImportRevision
+		}
+	}
+
+	return name
+}
+
+// A noncredential marker is visible on both the proxy and encoded logout paths.
+// Each login gets a fresh marker so a delayed logout can revoke exactly the
+// sessions visible to the browser when it sent the request.
+func discoveredSessionPrefix(r *http.Request, cluster, kind string) string {
+	connection := cookieConnection(r)
+	if connection == nil || connection.Discovery == nil || connection.RoutingRevision() == "" {
+		return ""
+	}
+
+	key := sha256.Sum256([]byte(cluster))
+
+	return fmt.Sprintf("headlamp-%s-session-%x-", kind, key[:12])
+}
+
+func setSessionMarker(w http.ResponseWriter, r *http.Request, name, baseURL string, maxAge int) {
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure follows the deployment's request scheme.
+		Name: name, Value: "1", Path: "/" + strings.Trim(baseURL, "/"),
+		HttpOnly: true, Secure: IsSecureContext(r), SameSite: http.SameSiteStrictMode, MaxAge: maxAge,
+	})
+}
+
+func clearObservedSessions(w http.ResponseWriter, r *http.Request, prefix, baseURL string) {
+	if prefix == "" {
+		return
+	}
+
+	for _, cookie := range r.Cookies() {
+		id, ok := strings.CutPrefix(cookie.Name, prefix)
+		if ok && len(id) == 32 && cookie.Value == "1" {
+			if _, err := hex.DecodeString(id); err == nil {
+				setSessionMarker(w, r, cookie.Name, baseURL, -1)
+			}
+		}
+	}
+}
+
+func tokenCookieChunks(w http.ResponseWriter, r *http.Request, cluster, kind, token, baseURL string,
+	ttl int, chunk func(string) ([]string, error),
+) ([]string, error) {
+	scope := connectionCookieScope(r)
+
+	prefix := discoveredSessionPrefix(r, cluster, kind)
+	if prefix == "" {
+		return chunk(scope + token)
+	}
+
+	var nonce [16]byte
+
+	_, _ = rand.Read(nonce[:])
+	id := hex.EncodeToString(nonce[:])
+
+	chunks, err := chunk(scope + id + ":" + token)
+	if err != nil {
+		return nil, err
+	}
+
+	clearObservedSessions(w, r, prefix, baseURL)
+	setSessionMarker(w, r, prefix+id, baseURL, ttl)
+
+	return chunks, nil
+}
+
+func readCookieToken(r *http.Request, cluster, kind, value string) string {
+	token, matches := strings.CutPrefix(value, connectionCookieScope(r))
+	if !matches {
+		return ""
+	}
+
+	prefix := discoveredSessionPrefix(r, cluster, kind)
+	if prefix != "" {
+		id, credential, found := strings.Cut(token, ":")
+		if !found || len(id) != 32 {
+			return ""
+		}
+
+		marker, err := r.Cookie(prefix + id)
+		if err != nil || marker.Value != "1" {
+			return ""
+		}
+
+		return credential
+	}
+
+	return token
+}
 
 const (
 	// chunkSize is the size of each token chunk, less than 4KB because of the size limit.
@@ -149,7 +302,7 @@ func SetTokenCookie(
 		return nil
 	}
 
-	sanitizedCluster := SanitizeClusterName(cluster)
+	sanitizedCluster := cookieClusterName(r, cluster)
 	if sanitizedCluster == "" {
 		return nil
 	}
@@ -157,7 +310,7 @@ func SetTokenCookie(
 	secure := IsSecureContext(r)
 	cookiePath := GetCookiePath(baseURL, cluster)
 
-	chunks, sizeErr := boundedAuthTokenChunks(token)
+	chunks, sizeErr := tokenCookieChunks(w, r, cluster, "auth", token, baseURL, sessionTTL, boundedAuthTokenChunks)
 	for i, chunk := range chunks {
 		// G124: Secure is set from IsSecureContext so localhost development still works;
 		// HttpOnly and SameSite are set unconditionally.
@@ -183,7 +336,7 @@ func SetTokenCookie(
 
 // GetTokenFromCookie retrieves an authentication cookie for a specific cluster.
 func GetTokenFromCookie(r *http.Request, cluster string) (string, error) {
-	sanitizedCluster := SanitizeClusterName(cluster)
+	sanitizedCluster := cookieClusterName(r, cluster)
 	if sanitizedCluster == "" {
 		return "", errors.New("invalid cluster name")
 	}
@@ -205,7 +358,7 @@ func GetTokenFromCookie(r *http.Request, cluster string) (string, error) {
 	}
 
 	if token.Len() > 0 {
-		return token.String(), nil
+		return readCookieToken(r, cluster, "auth", token.String()), nil
 	}
 
 	return "", nil
@@ -213,7 +366,9 @@ func GetTokenFromCookie(r *http.Request, cluster string) (string, error) {
 
 // ClearTokenCookie clears an authentication cookie for a specific cluster.
 func ClearTokenCookie(w http.ResponseWriter, r *http.Request, cluster, baseURL string) {
-	sanitizedCluster := SanitizeClusterName(cluster)
+	clearObservedSessions(w, r, discoveredSessionPrefix(r, cluster, "auth"), baseURL)
+
+	sanitizedCluster := cookieClusterName(r, cluster)
 	if sanitizedCluster == "" {
 		return
 	}
@@ -248,7 +403,9 @@ func ClearTokenCookie(w http.ResponseWriter, r *http.Request, cluster, baseURL s
 // ClearTokenCookieBounded invalidates chunk zero and clears other visible chunks.
 // Unsent suffixes expire naturally and cannot be read without chunk zero.
 func ClearTokenCookieBounded(w http.ResponseWriter, r *http.Request, cluster, baseURL string) {
-	sanitizedCluster := SanitizeClusterName(cluster)
+	clearObservedSessions(w, r, discoveredSessionPrefix(r, cluster, "auth"), baseURL)
+
+	sanitizedCluster := cookieClusterName(r, cluster)
 	if sanitizedCluster == "" {
 		return
 	}
@@ -303,7 +460,7 @@ func SetIDTokenCookie(
 		return nil
 	}
 
-	sanitizedCluster := SanitizeClusterName(cluster)
+	sanitizedCluster := cookieClusterName(r, cluster)
 	if sanitizedCluster == "" {
 		return nil
 	}
@@ -312,7 +469,7 @@ func SetIDTokenCookie(
 
 	cookiePath := GetOIDCLogoutCookiePath(baseURL, cluster)
 
-	chunks, sizeErr := boundedIDTokenChunks(idToken)
+	chunks, sizeErr := tokenCookieChunks(w, r, cluster, "id", idToken, baseURL, sessionTTL, boundedIDTokenChunks)
 
 	for i, chunk := range chunks {
 		// G124: Secure is set from IsSecureContext so localhost development still works;
@@ -349,7 +506,7 @@ func boundedIDTokenChunks(idToken string) ([]string, error) {
 // GetIDTokenFromCookie retrieves the ID token cookie for a specific cluster.
 // Supports chunked cookies for large ID tokens.
 func GetIDTokenFromCookie(r *http.Request, cluster string) (string, error) {
-	sanitizedCluster := SanitizeClusterName(cluster)
+	sanitizedCluster := cookieClusterName(r, cluster)
 	if sanitizedCluster == "" {
 		return "", errors.New("invalid cluster name")
 	}
@@ -370,8 +527,8 @@ func GetIDTokenFromCookie(r *http.Request, cluster string) (string, error) {
 		idToken.WriteString(cookie.Value)
 	}
 
-	if idToken.Len() > 0 {
-		return idToken.String(), nil
+	if token := readCookieToken(r, cluster, "id", idToken.String()); token != "" {
+		return token, nil
 	}
 
 	return "", http.ErrNoCookie
@@ -380,7 +537,9 @@ func GetIDTokenFromCookie(r *http.Request, cluster string) (string, error) {
 // ClearIDTokenCookie clears the ID token cookie for a specific cluster.
 // Chunk zero is always invalidated, even when the request path hides the cookies.
 func ClearIDTokenCookie(w http.ResponseWriter, r *http.Request, cluster, baseURL string) {
-	sanitizedCluster := SanitizeClusterName(cluster)
+	clearObservedSessions(w, r, discoveredSessionPrefix(r, cluster, "id"), baseURL)
+
+	sanitizedCluster := cookieClusterName(r, cluster)
 	if sanitizedCluster == "" {
 		return
 	}

@@ -256,7 +256,7 @@ func TestClusterHelpersAndManualConfig(t *testing.T) {
 		},
 	}
 
-	clusters, errs := parseCustomNameClusters(contexts)
+	clusters, errs := parseCustomNameClusters(contexts, "")
 	require.Len(t, clusters, 1)
 	assert.Equal(t, "friendly", clusters[0].Name)
 	require.Len(t, errs, 1)
@@ -364,8 +364,8 @@ func TestMultiplexerProcessClientMessage(t *testing.T) {
 	m := NewMultiplexer(store, false)
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/wsMultiplexer", nil)
 
-	targetKey := m.createConnectionKey("c1", "/p", "u1")
-	otherKey := m.createConnectionKey("c1", "/other", "u1")
+	targetKey := connectionKey{clusterID: "c1", path: "/p", userID: "u1"}
+	otherKey := connectionKey{clusterID: "c1", path: "/other", userID: "u1"}
 
 	m.mutex.Lock()
 	m.connections[targetKey] = &Connection{

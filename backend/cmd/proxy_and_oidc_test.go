@@ -1133,7 +1133,7 @@ func TestParseCustomNameAndDeleteClusterErrors(t *testing.T) {
 			},
 		}
 
-		clusters, errs := parseCustomNameClusters(ctxs)
+		clusters, errs := parseCustomNameClusters(ctxs, "")
 		assert.Len(t, clusters, 1)
 		assert.Equal(t, "alias-1", clusters[0].Name)
 		assert.Len(t, errs, 1)
@@ -1156,7 +1156,7 @@ users:
   user:
     token: tok
 `))
-		clusters, errs := parseClusterFromKubeConfig([]string{kc, "!!!bad!!!"})
+		clusters, errs := parseClusterFromKubeConfig([]string{kc, "!!!bad!!!"}, "")
 		assert.Len(t, clusters, 1)
 		assert.NotEmpty(t, errs)
 	})
@@ -1257,21 +1257,12 @@ func TestDrainNodeAndRenameClusterErrors(t *testing.T) {
 	})
 }
 
-func TestMultiplexerUpgradeAndLogoutRedirect(t *testing.T) {
-	t.Run("HandleClientWebSocket non-ws request fails upgrade", func(t *testing.T) {
-		m := NewMultiplexer(kubeconfig.NewContextStore(), false)
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/wsMultiplexer", nil)
-		rec := httptest.NewRecorder()
-		m.HandleClientWebSocket(rec, req)
-		assert.Equal(t, http.StatusBadRequest, rec.Code)
-	})
-
-	t.Run("sendOIDCLogoutRedirect writes redirect", func(t *testing.T) {
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/logout", nil)
-		rec := httptest.NewRecorder()
-		sendOIDCLogoutRedirect(rec, req, "https://idp.example.com/logout?reason=done")
-		assert.Equal(t, http.StatusFound, rec.Code)
-	})
+func TestMultiplexerRejectsNonWebSocketRequest(t *testing.T) {
+	m := NewMultiplexer(kubeconfig.NewContextStore(), false)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/wsMultiplexer", nil)
+	rec := httptest.NewRecorder()
+	m.HandleClientWebSocket(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
 func TestNodeDrainStatusAndPluginDeleteSuccess(t *testing.T) {
@@ -1481,9 +1472,8 @@ func TestHandleServerStartErrorAndClusterDiscovery(t *testing.T) {
 
 	// Exercise drainNode against a fake clientset with a cordonable node and no pods.
 	cs := fake.NewClientset(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}})
-	hc.drainNode(context.Background(), cs, "node-1", "c1")
-
-	cacheKey := drainCacheKey("node-1", "c1")
+	cacheKey := drainCacheKey("node-1", "c1", nil)
+	hc.drainNode(t.Context(), cs, "node-1", cacheKey)
 
 	require.Eventually(t, func() bool {
 		val, err := hc.Cache.Get(context.Background(), cacheKey)
@@ -1545,7 +1535,7 @@ func TestOidcCallbackAndLogoutProviderURLHelpers(t *testing.T) {
 	cbURL := getOidcCallbackURL(req, hc)
 	assert.Contains(t, cbURL, "/headlamp/oidc-callback")
 
-	_, err := getOIDCLogoutProviderURL(hc, req, "missing")
+	_, err := getOIDCLogoutProviderURL(hc, req, "missing", &kubeconfig.Context{})
 	require.Error(t, err)
 
 	var idpURL string
@@ -1568,7 +1558,9 @@ func TestOidcCallbackAndLogoutProviderURLHelpers(t *testing.T) {
 		},
 	}))
 
-	logoutURL, err := getOIDCLogoutProviderURL(hc, req, "c-oidc")
+	connection, err := hc.KubeConfigStore.GetContext("c-oidc")
+	require.NoError(t, err)
+	logoutURL, err := getOIDCLogoutProviderURL(hc, req, "c-oidc", connection)
 	require.NoError(t, err)
 	assert.Contains(t, logoutURL.String(), "https://idp.example.com/logout")
 
@@ -1591,7 +1583,7 @@ func TestOidcCallbackAndLogoutProviderURLHelpers(t *testing.T) {
 
 func TestOIDCLogoutAndTokenHelpers(t *testing.T) {
 	t.Run("validateOIDCLogoutState rejects missing and mismatched state", func(t *testing.T) {
-		assert.False(t, validateOIDCLogoutState("s1", "s2", "c1", time.Now()))
+		assert.False(t, validateOIDCLogoutState("s1", "s2", "", "c1", time.Now()))
 	})
 
 	t.Run("applyRequestTokenToContext copies bearer token", func(t *testing.T) {

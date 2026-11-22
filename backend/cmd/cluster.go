@@ -21,11 +21,13 @@ import (
 )
 
 type Cluster struct {
-	Name     string                 `json:"name"`
-	Server   string                 `json:"server,omitempty"`
-	AuthType string                 `json:"auth_type"`
-	Metadata map[string]interface{} `json:"meta_data"`
-	Error    string                 `json:"error,omitempty"`
+	Name            string                 `json:"name"`
+	Server          string                 `json:"server,omitempty"`
+	AuthType        string                 `json:"auth_type"`
+	Metadata        map[string]interface{} `json:"meta_data"`
+	Error           string                 `json:"error,omitempty"`
+	ImportRevision  string                 `json:"importRevision,omitempty"`
+	KubeconfigIndex *int                   `json:"kubeconfigIndex,omitempty"`
 }
 
 type ClusterReq struct {

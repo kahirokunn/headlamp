@@ -95,7 +95,17 @@ func RequestHandlerForStoredContext(kContext *kubeconfig.Context, store kubeconf
 func RequestHandlerWithContext(kContext *kubeconfig.Context, sessions cache.Cache[interface{}],
 	unsafeUseServiceAccountToken, allowLocalCredentials bool, contextKey string, w http.ResponseWriter, r *http.Request,
 ) {
-	handleRequestContext(kContext, nil, sessions, unsafeUseServiceAccountToken, contextKey,
+	RequestHandlerForImportedContext(kContext, nil, sessions, unsafeUseServiceAccountToken,
+		allowLocalCredentials, contextKey, w, r)
+}
+
+// RequestHandlerForImportedContext authenticates with the freshly supplied
+// kubeconfig and uses the store to retain its import revision when available.
+func RequestHandlerForImportedContext(kContext *kubeconfig.Context, store kubeconfig.ContextStore,
+	sessions cache.Cache[interface{}], unsafeUseServiceAccountToken, allowLocalCredentials bool,
+	contextKey string, w http.ResponseWriter, r *http.Request,
+) {
+	handleRequestContext(kContext, store, sessions, unsafeUseServiceAccountToken, contextKey,
 		true, allowLocalCredentials, w, r)
 }
 
@@ -199,11 +209,19 @@ func preparePortForwardTrust(kContext *kubeconfig.Context, token string, allowFi
 }
 
 //nolint:funlen // Authentication must complete before dispatching any local session operation.
-func handleRequestContext(connection *kubeconfig.Context, store kubeconfig.ContextStore, sessions cache.Cache[interface{}],
-	unsafeUseServiceAccountToken bool, contextKey string, allowContextCredentials, allowLocalCredentials bool,
+func handleRequestContext(connection *kubeconfig.Context, store kubeconfig.ContextStore,
+	sessions cache.Cache[interface{}], unsafeUseServiceAccountToken bool,
+	contextKey string, allowContextCredentials, allowLocalCredentials bool,
 	w http.ResponseWriter, r *http.Request,
 ) {
+	connectionCurrent, retainConnection := forwardConnectionLifecycle(store, contextKey, connection)
+	if connectionCurrent != nil && !connectionCurrent() {
+		writeForwardConnectionConflict(w)
+		return
+	}
+
 	kContext := connection.Copy()
+	r = auth.WithCookieConnection(r, connection)
 
 	token, err := requestToken(r)
 	if err != nil {
@@ -261,6 +279,13 @@ func handleRequestContext(connection *kubeconfig.Context, store kubeconfig.Conte
 
 	review, err := client.AuthenticationV1().SelfSubjectReviews().Create(ctx,
 		&authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+
+	if connectionCurrent != nil && !connectionCurrent() {
+		writeForwardConnectionConflict(w)
+
+		return
+	}
+
 	if err != nil {
 		status := http.StatusServiceUnavailable
 		if apierrors.IsUnauthorized(err) {
@@ -287,7 +312,6 @@ func handleRequestContext(connection *kubeconfig.Context, store kubeconfig.Conte
 
 	switch r.Method {
 	case http.MethodPost:
-		connectionCurrent, retainConnection := forwardConnectionLifecycle(store, contextKey, connection)
 		startPortForwardForOwner(kContext, sessions, unsafeUseServiceAccountToken, contextKey, cacheKey,
 			connectionCurrent, retainConnection, w, r)
 	case http.MethodDelete:

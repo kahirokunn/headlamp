@@ -106,13 +106,20 @@ func NewOIDCTokenRefreshMiddleware(config OIDCTokenRefreshConfig) func(http.Hand
 				return
 			}
 
-			cluster, token := ParseClusterAndToken(r)
-			if config.shouldBypassOIDCRefresh(cluster, token, w, r, span, &status, next) {
+			cluster := clusterFromRequestPath(r)
+			if cluster == "" && config.shouldBypassOIDCRefresh(cluster, "", w, r, span, &status, next) {
 				return
 			}
 
-			kContext, err := config.KubeConfigStore.GetContext(cluster)
+			kContext, err := config.contextForRefresh(r, cluster)
 			if config.handleGetContextError(err, cluster, w, r, span, ctx, &status, next) {
+				return
+			}
+
+			r = WithCookieConnection(r, kContext)
+
+			_, token := ParseClusterAndToken(r)
+			if config.shouldBypassOIDCRefresh(cluster, token, w, r, span, &status, next) {
 				return
 			}
 
@@ -144,6 +151,7 @@ func NewOIDCTokenRefreshMiddleware(config OIDCTokenRefreshConfig) func(http.Hand
 			RefreshAndSetToken(RefreshAndSetTokenParams{
 				Ctx:                       ctx,
 				OIDCAuthConfig:            oidcAuthConfig,
+				KubeConfigStore:           config.KubeConfigStore,
 				Cache:                     config.Cache,
 				Token:                     token,
 				Cluster:                   cluster,
@@ -161,6 +169,19 @@ func NewOIDCTokenRefreshMiddleware(config OIDCTokenRefreshConfig) func(http.Hand
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func (c *OIDCTokenRefreshConfig) contextForRefresh(r *http.Request, cluster string) (*kubeconfig.Context, error) {
+	connection, resolved := r.Context().Value(cookieConnectionKey{}).(*kubeconfig.Context)
+	if !resolved {
+		return c.KubeConfigStore.GetContext(cluster)
+	}
+
+	if connection == nil {
+		return nil, cache.ErrNotFound
+	}
+
+	return connection, nil
 }
 
 // shouldUseUnsafeServiceAccountToken reports whether the config is running
