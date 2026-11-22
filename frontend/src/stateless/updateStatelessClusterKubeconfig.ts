@@ -17,6 +17,7 @@
 import * as jsyaml from 'js-yaml';
 import { decodeBase64, encodeBase64 } from '../helpers/base64';
 import { KubeconfigObject } from '../lib/k8s/kubeconfig';
+import store from '../redux/stores/store';
 import {
   CursorSuccessEvent,
   DatabaseErrorEvent,
@@ -39,9 +40,10 @@ import {
 export function updateStatelessClusterKubeconfig(
   kubeconfig: string,
   customName: string,
-  clusterName: string
+  clusterName: string,
+  recordId = store.getState().config.statelessClusters?.[clusterName]?.kubeconfigRecordId
 ): Promise<void> {
-  return new Promise<void>(async (resolve, reject) => {
+  return new Promise<void>((resolve, reject) => {
     try {
       const request = indexedDB.open('kubeconfigs', 1) as any;
       request.onupgradeneeded = handleDatabaseUpgrade;
@@ -58,21 +60,30 @@ export function updateStatelessClusterKubeconfig(
         const transaction = db.transaction(['kubeconfigStore'], 'readwrite');
         const store = transaction.objectStore('kubeconfigStore');
 
-        // variable to track if we found and updated the context
-        let updated = false;
+        transaction.oncomplete = () => {
+          db.close();
+          resolve();
+        };
+        transaction.onabort = () => {
+          db.close();
+          reject(transaction.error ?? new Error('Kubeconfig update was aborted'));
+        };
 
-        store.openCursor().onsuccess = function onCursor(event: Event) {
+        const cursorRequest = store.openCursor(recordId, 'prev');
+        cursorRequest.onsuccess = function onCursor(event: Event) {
           const e = event as CursorSuccessEvent;
           const cursor = e.target?.result;
 
           if (!cursor) {
-            if (!updated) {
-              reject(`Cluster with name ${clusterName} not found`);
-            }
+            reject(`Cluster with name ${clusterName} not found`);
             return;
           }
 
           const row = cursor.value;
+          if (row.pending) {
+            cursor.continue();
+            return;
+          }
           const rowKubeconfig64 = row.kubeconfig;
           const parsed = jsyaml.load(decodeBase64(rowKubeconfig64)) as KubeconfigObject;
 
@@ -106,25 +117,19 @@ export function updateStatelessClusterKubeconfig(
 
           const putRequest = store.put(updatedRow);
 
-          putRequest.onsuccess = () => {
-            updated = true;
-            resolve();
-          };
-
           putRequest.onerror = (err: any) => {
             reject(`Failed to update kubeconfig: ${err.target.error}`);
           };
-
-          store.openCursor().onerror = function onCursorError(event: Event) {
-            const de = event as DatabaseErrorEvent;
-            reject(de.target ? de.target.error : 'Error during the cursor operation');
-          };
+        };
+        cursorRequest.onerror = function onCursorError(event: Event) {
+          const de = event as DatabaseErrorEvent;
+          reject(de.target ? de.target.error : 'Error during the cursor operation');
         };
       };
 
       // The onerror event is fired when the database is opened.
       // This is where you handle errors
-      request.onerror = handleDataBaseError;
+      request.onerror = (event: DatabaseErrorEvent) => handleDataBaseError(event, reject);
     } catch (error) {
       reject(error);
     }

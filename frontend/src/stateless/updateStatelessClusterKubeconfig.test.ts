@@ -18,26 +18,6 @@ import * as jsyaml from 'js-yaml';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 import { updateStatelessClusterKubeconfig } from './updateStatelessClusterKubeconfig';
 
-// --- PARTIAL MOCK: keep the real module but override findMatchingContexts
-vi.mock('./index', async () => {
-  const actual = await vi.importActual<typeof import('./index')>('./index');
-  return {
-    ...actual,
-    findMatchingContexts: vi.fn((clusterName: string, parsed: any) => {
-      const ctx = (parsed.contexts || []).find(
-        (c: any) =>
-          c?.name === clusterName ||
-          (c?.context?.extensions || []).some(
-            (e: any) => e?.name === 'headlamp_info' && e?.extension?.customName === clusterName
-          )
-      );
-      return { matchingKubeconfig: ctx || null, matchingContext: ctx || null };
-    }),
-    handleDataBaseError: vi.fn(),
-    handleDatabaseUpgrade: vi.fn(),
-  };
-});
-
 // Provide global atob/btoa for Node test env
 if (typeof (global as any).atob === 'undefined') {
   (global as any).atob = (s: string) => Buffer.from(s, 'base64').toString('utf8');
@@ -48,7 +28,7 @@ if (typeof (global as any).btoa === 'undefined') {
 
 type Row = { key: string; kubeconfig: string };
 
-function makeFakeIndexedDB(rows: Row[], opts?: { failPut?: boolean }) {
+function makeFakeIndexedDB(rows: Row[], opts?: { failPut?: boolean; failCommit?: boolean }) {
   const calls: { deletedKeys: any[]; putArgs: any[] } = { deletedKeys: [], putArgs: [] };
 
   const store = {
@@ -69,20 +49,27 @@ function makeFakeIndexedDB(rows: Row[], opts?: { failPut?: boolean }) {
         }
         calls.putArgs.push(arg);
         req.onsuccess?.({});
+        if (opts?.failCommit) {
+          transaction.error = new Error('Unable to commit kubeconfig update');
+          transaction.onabort?.();
+        } else {
+          transaction.oncomplete?.();
+        }
       }, 0);
       return req;
     },
-    openCursor: () => {
+    openCursor: (key?: Row['key']) => {
+      const matches = key === undefined ? rows : rows.filter(row => row.key === key);
       const req: any = {};
       Object.defineProperty(req, 'onsuccess', {
         set(fn: (ev: any) => void) {
           let idx = 0;
           const iterate = () => {
             const cursor =
-              idx < rows.length
+              idx < matches.length
                 ? {
-                    value: rows[idx],
-                    key: rows[idx].key,
+                    value: matches[idx],
+                    key: matches[idx].key,
                     continue: () => {
                       idx++;
                       setTimeout(iterate, 0);
@@ -98,11 +85,13 @@ function makeFakeIndexedDB(rows: Row[], opts?: { failPut?: boolean }) {
     },
   };
 
-  const db = {
-    transaction: () => ({
-      objectStore: () => store,
-    }),
-  };
+  const transaction: {
+    objectStore: () => typeof store;
+    error?: Error;
+    oncomplete?: () => void;
+    onabort?: () => void;
+  } = { objectStore: () => store };
+  const db = { transaction: () => transaction, close: vi.fn() };
 
   const open = () => {
     const req: any = {};
@@ -188,7 +177,7 @@ describe('updateStatelessClusterKubeconfig (dynamic; no clusterID path)', () => 
     (global as any).indexedDB = { open: fake.open };
 
     await expect(
-      updateStatelessClusterKubeconfig('IGNORED', 'New Name', 'ctx1')
+      updateStatelessClusterKubeconfig('IGNORED', 'New Name', 'Old Name')
     ).resolves.toBeUndefined();
 
     expect(fake.calls.putArgs.length).toBe(1);
@@ -264,6 +253,17 @@ describe('updateStatelessClusterKubeconfig (dynamic; no clusterID path)', () => 
     await expect(
       updateStatelessClusterKubeconfig('IGNORED', 'Nope', 'missing-ctx')
     ).rejects.toContain('not found');
+  });
+
+  test('reports a transaction abort after the write request succeeds', async () => {
+    const row = { key: 'row-1', kubeconfig: makeKubeB64({ name: 'ctx1' }) };
+    const fake = makeFakeIndexedDB([row], { failCommit: true });
+    (global as any).indexedDB = { open: fake.open };
+
+    await expect(updateStatelessClusterKubeconfig('IGNORED', 'Pretty', 'ctx1')).rejects.toThrow(
+      'Unable to commit kubeconfig update'
+    );
+    expect(fake.calls.putArgs).toHaveLength(1);
   });
 
   test('rejects when put fails', async () => {

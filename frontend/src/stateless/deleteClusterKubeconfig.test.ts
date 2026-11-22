@@ -17,10 +17,8 @@
 import * as jsyaml from 'js-yaml';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 import { deleteClusterKubeconfig } from './deleteClusterKubeconfig';
-import { findMatchingContexts } from './index';
 
 vi.mock('./index', () => ({
-  findMatchingContexts: vi.fn(),
   handleDataBaseError: vi.fn(),
   handleDatabaseUpgrade: vi.fn(),
 }));
@@ -48,7 +46,7 @@ function makeFakeIndexedDB(rows: Row[]) {
       // simulate async success
       setTimeout(() => {
         calls.deletedKeys.push(key);
-        if (req.onsuccess) req.onsuccess({}); // event not used by code
+        transaction.oncomplete?.(); // event not used by code
       }, 0);
       return req;
     },
@@ -56,11 +54,12 @@ function makeFakeIndexedDB(rows: Row[]) {
       const req: any = {};
       setTimeout(() => {
         calls.putArgs.push(arg);
-        if (req.onsuccess) req.onsuccess({});
+        transaction.oncomplete?.();
       }, 0);
       return req;
     },
-    openCursor: () => {
+    openCursor: (key?: Row['key']) => {
+      const matches = key === undefined ? rows : rows.filter(row => row.key === key);
       const req: any = {};
       // expose a method to trigger cursor iteration when onsuccess is set
       Object.defineProperty(req, 'onsuccess', {
@@ -70,10 +69,10 @@ function makeFakeIndexedDB(rows: Row[]) {
           let idx = 0;
           const iterate = () => {
             const cursor =
-              idx < rows.length
+              idx < matches.length
                 ? {
-                    value: rows[idx],
-                    key: rows[idx].key,
+                    value: matches[idx],
+                    key: matches[idx].key,
                     continue: () => {
                       idx++;
                       setTimeout(iterate, 0);
@@ -81,7 +80,10 @@ function makeFakeIndexedDB(rows: Row[]) {
                   }
                 : null;
             // call handler with { target: { result: cursor } }
-            setTimeout(() => fn({ target: { result: cursor } }), 0);
+            setTimeout(() => {
+              fn({ target: { result: cursor } });
+              if (!cursor) transaction.oncomplete?.();
+            }, 0);
           };
           iterate();
         },
@@ -90,18 +92,11 @@ function makeFakeIndexedDB(rows: Row[]) {
     },
   };
 
-  const db = {
-    transaction: (_names: string[] | string, _mode: string) => {
-      void _names;
-      void _mode;
-      return {
-        objectStore: (_name: string) => {
-          void _name;
-          return store;
-        },
-      };
-    },
+  const transaction = {
+    objectStore: () => store,
+    oncomplete: undefined as (() => void) | undefined,
   };
+  const db = { transaction: () => transaction, close: vi.fn() };
 
   const requests: any[] = [];
   const open = (_name: string, _version?: number) => {
@@ -134,12 +129,6 @@ describe('deleteClusterKubeconfig', () => {
     const fake = makeFakeIndexedDB([]);
     (global as any).indexedDB = { open: fake.open };
 
-    // make findMatchingContexts not match anything
-    (findMatchingContexts as unknown as any).mockReturnValue({
-      matchingKubeconfig: null,
-      matchingContext: null,
-    });
-
     await expect(deleteClusterKubeconfig('some-cluster')).resolves.toBeNull();
   });
 
@@ -155,12 +144,6 @@ describe('deleteClusterKubeconfig', () => {
     const row = { key: 42, kubeconfig: kube64 };
     const fake = makeFakeIndexedDB([row]);
     (global as any).indexedDB = { open: fake.open };
-
-    // mock findMatchingContexts to indicate match for this row
-    (findMatchingContexts as unknown as any).mockReturnValue({
-      matchingKubeconfig: { name: 'ctx1' },
-      matchingContext: null,
-    });
 
     await expect(deleteClusterKubeconfig('ctx1')).resolves.toBe(kube64);
 
@@ -189,12 +172,6 @@ describe('deleteClusterKubeconfig', () => {
     const row = { key: 'row-key', kubeconfig: kube64 };
     const fake = makeFakeIndexedDB([row]);
     (global as any).indexedDB = { open: fake.open };
-
-    // mock findMatchingContexts to indicate match for ctx1
-    (findMatchingContexts as unknown as any).mockReturnValue({
-      matchingKubeconfig: { name: 'ctx1' },
-      matchingContext: null,
-    });
 
     await expect(deleteClusterKubeconfig('ctx1')).resolves.toBe(kube64);
 

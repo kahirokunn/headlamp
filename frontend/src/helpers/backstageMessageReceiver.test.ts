@@ -160,7 +160,16 @@ describe('setupBackstageMessageReceiver', () => {
       apiVersion: 'v1',
       kind: 'Config',
       'current-context': 'test-context',
-      contexts: [{ name: 'test-context', context: { cluster: 'test-cluster', user: 'test-user' } }],
+      contexts: [
+        {
+          name: 'test-context',
+          context: {
+            cluster: 'test-cluster',
+            user: 'test-user',
+            extensions: [{ name: 'headlamp_info', extension: { customName: 'team-a' } }],
+          },
+        },
+      ],
       clusters: [{ name: 'test-cluster', cluster: {} }],
       users: [{ name: 'test-user', user: {} }],
     };
@@ -172,7 +181,7 @@ describe('setupBackstageMessageReceiver', () => {
     );
     await vi.runAllTimersAsync();
 
-    expect(findAndReplaceKubeconfig).toHaveBeenCalledWith('test-context', expect.any(String), true);
+    expect(findAndReplaceKubeconfig).toHaveBeenCalledWith('team-a', expect.any(String), true);
     expect(window.parent.postMessage).toHaveBeenCalledWith(
       { type: 'BACKSTAGE_KUBECONFIG_ACK' },
       TRUSTED_ORIGIN

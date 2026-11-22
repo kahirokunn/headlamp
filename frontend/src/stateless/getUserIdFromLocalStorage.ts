@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import { generateSecureToken } from '.';
+import { generateSecureToken } from './records';
 
 /**
  * In the backend we use a unique ID to identify a user. If there is no ID in localStorage
@@ -22,10 +22,11 @@ import { generateSecureToken } from '.';
  * cluster name and this headlamp-userId to create a unique ID for a cluster. If we don't
  * do it then if 2 different users have a cluster with the same name, then the
  * proxy will be overwritten.
+ * @param revision Imported connection revision, if any.
  * @returns headlamp-userId from localStorage
  */
 
-export function getUserIdFromLocalStorage(): string {
+export function getUserIdFromLocalStorage(revision?: string): string {
   let headlampUserId = localStorage.getItem('headlamp-userId');
 
   if (!headlampUserId) {
@@ -36,5 +37,8 @@ export function getUserIdFromLocalStorage(): string {
     }
   }
 
-  return headlampUserId!;
+  const routingRevision = revision?.split(':', 1)[0];
+  return routingRevision?.startsWith('import-')
+    ? `${headlampUserId}--${routingRevision}`
+    : headlampUserId!;
 }

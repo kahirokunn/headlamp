@@ -17,6 +17,7 @@
 import jsyaml from 'js-yaml';
 import { KubeconfigObject } from '../lib/k8s/kubeconfig';
 import * as statelessFunctions from '../stateless';
+import { effectiveContextName } from '../stateless/storedContexts';
 import { decodeBase64, encodeBase64 } from './base64';
 import { isBackstage } from './isBackstage';
 
@@ -136,38 +137,38 @@ async function storeKubeconfigFromBackstage(kubeconfig: string) {
     const parsedKubeconfig = jsyaml.load(decodedKubeconfig) as KubeconfigObject;
 
     // For each context, create a new kubeconfig
-    const promises = parsedKubeconfig.contexts.map(
-      async (context: { name: string; context: { cluster: string; user: string } }) => {
-        // Find the corresponding cluster and auth info
-        const cluster = parsedKubeconfig.clusters.find(
-          (c: { name: string }) => c.name === context.context.cluster
-        );
-        const authInfo = parsedKubeconfig.users.find(
-          (u: { name: string }) => u.name === context.context.user
-        );
+    const promises = parsedKubeconfig.contexts.map(async context => {
+      // Find the corresponding cluster and auth info
+      const cluster = parsedKubeconfig.clusters.find(
+        (c: { name: string }) => c.name === context.context.cluster
+      );
+      const authInfo = parsedKubeconfig.users.find(
+        (u: { name: string }) => u.name === context.context.user
+      );
 
-        if (!cluster || !authInfo) {
-          console.warn(`Missing cluster or auth info for context ${context.name}`);
-          return;
-        }
-
-        // Create a new kubeconfig with just this context, cluster, and auth info
-        const newKubeconfig: KubeconfigObject = {
-          apiVersion: parsedKubeconfig.apiVersion,
-          kind: parsedKubeconfig.kind,
-          preferences: parsedKubeconfig.preferences,
-          'current-context': context.name,
-          contexts: [context],
-          clusters: [cluster],
-          users: [authInfo],
-        };
-
-        // Convert back to YAML and base64 encode
-        const newKubeconfigYaml = jsyaml.dump(newKubeconfig, { lineWidth: -1 });
-        const newKubeconfigBase64 = encodeBase64(newKubeconfigYaml);
-        await statelessFunctions.findAndReplaceKubeconfig(context.name, newKubeconfigBase64, true);
+      if (!cluster || !authInfo) {
+        console.warn(`Missing cluster or auth info for context ${context.name}`);
+        return;
       }
-    );
+
+      // Create a new kubeconfig with just this context, cluster, and auth info
+      const newKubeconfig: KubeconfigObject = {
+        apiVersion: parsedKubeconfig.apiVersion,
+        kind: parsedKubeconfig.kind,
+        preferences: parsedKubeconfig.preferences,
+        'current-context': context.name,
+        contexts: [context],
+        clusters: [cluster],
+        users: [authInfo],
+      };
+
+      // Convert back to YAML and base64 encode
+      const newKubeconfigYaml = jsyaml.dump(newKubeconfig, { lineWidth: -1 });
+      const newKubeconfigBase64 = encodeBase64(newKubeconfigYaml);
+      const name = effectiveContextName(context);
+      if (name === undefined) throw new Error(`Invalid headlamp_info for context ${context.name}`);
+      await statelessFunctions.findAndReplaceKubeconfig(name, newKubeconfigBase64, true);
+    });
     // Wait for all kubeconfig operations to complete
     await Promise.all(promises);
   } catch (error) {

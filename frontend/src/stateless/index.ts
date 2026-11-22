@@ -19,23 +19,39 @@ import { addBackstageAuthHeaders } from '../helpers/addBackstageAuthHeaders';
 import { getHeadlampAPIHeaders } from '../helpers/getHeadlampAPIHeaders';
 import { request } from '../lib/k8s/api/v1/clusterRequests';
 import { JSON_HEADERS } from '../lib/k8s/api/v1/constants';
+import { createDiscoveryConnectionChangedError } from '../lib/k8s/api/v2/discoveryConnection';
 import { Cluster } from '../lib/k8s/cluster';
-import { KubeconfigObject } from '../lib/k8s/kubeconfig';
 import { ConfigState, setStatelessConfig } from '../redux/configSlice';
 import store from '../redux/stores/store';
 import { deleteClusterKubeconfig } from './deleteClusterKubeconfig';
 import { findKubeconfigByClusterName } from './findKubeconfigByClusterName';
 import { getUserIdFromLocalStorage } from './getUserIdFromLocalStorage';
+import { installKubeconfigRecord } from './installKubeconfigRecord';
+import {
+  assertUnambiguousImport,
+  DatabaseEvent,
+  displacedImport,
+  handleDatabaseUpgrade,
+  importedClusterFromRecord,
+  sameImportedSelection,
+  StoredKubeconfig,
+} from './records';
+import { retireImportedConnection } from './retireConnections';
+import { rollbackKubeconfigImport } from './rollbackKubeconfigImport';
 import { updateStatelessClusterKubeconfig } from './updateStatelessClusterKubeconfig';
+
+export { findMatchingContexts } from './storedContexts';
+export { generateSecureToken, handleDatabaseUpgrade } from './records';
+export type { DatabaseEvent } from './records';
 
 /**
  * ParsedConfig is the object that is fetched from the backend.
  * It contains a list of parsed cluster entries under the `clusters` field.
  * Each item corresponds to a parsed cluster object used by stateless config state.
- * @see KubeconfigObject
  * @see fetchStatelessClusterKubeConfigs
  */
 interface ParsedConfig {
+  ambiguousContexts?: Array<{ name: string; kubeconfigIndex: number }>;
   clusters?: Cluster[];
 }
 
@@ -45,12 +61,19 @@ interface ParsedConfig {
  * @param parsedConfig Parsed backend response that may include a `clusters` array.
  * @returns Object with `statelessClusters` indexed by cluster name.
  */
-export function toStatelessConfigState(parsedConfig: ParsedConfig | null | undefined) {
+export function toStatelessConfigState(
+  parsedConfig: ParsedConfig | null | undefined,
+  recordIds?: number[],
+  incarnations?: Array<Record<string, string> | undefined>
+) {
   const statelessClusters: NonNullable<ConfigState['statelessClusters']> = {};
 
   if (parsedConfig?.clusters && Array.isArray(parsedConfig.clusters)) {
-    parsedConfig.clusters.forEach((cluster: Cluster) => {
-      statelessClusters[cluster.name] = cluster;
+    parsedConfig.clusters.forEach(({ kubeconfigIndex, ...cluster }: Cluster) => {
+      const index = kubeconfigIndex ?? (recordIds?.length === 1 ? 0 : undefined);
+      const recordId = index === undefined ? undefined : recordIds?.[index];
+      const incarnation = index === undefined ? undefined : incarnations?.[index]?.[cluster.name];
+      statelessClusters[cluster.name] = importedClusterFromRecord(cluster, recordId, incarnation);
     });
   }
 
@@ -69,33 +92,17 @@ export function toStatelessConfigState(parsedConfig: ParsedConfig | null | undef
  */
 export function mergeStatelessConfigState(
   currentStatelessClusters: ConfigState['statelessClusters'],
-  parsedConfig: ParsedConfig | null | undefined
+  parsedConfig: ParsedConfig | null | undefined,
+  recordIds?: number[],
+  incarnations?: Array<Record<string, string> | undefined>
 ) {
-  const nextState = toStatelessConfigState(parsedConfig);
+  const nextState = toStatelessConfigState(parsedConfig, recordIds, incarnations);
 
   return {
     statelessClusters: {
       ...(currentStatelessClusters || {}),
       ...nextState.statelessClusters,
     },
-  };
-}
-
-/**
- * DatabaseEvent is the event that is fired when the IndexedDB is upgraded.
- * It is used to create the object store. It is also used to get the result of the
- * IndexedDB open request. The result is the IndexedDB database. It is used to create
- * the transaction and the object store. It is also used to get the result of the
- * IndexedDB add request. The result is the key of the added object.
- * @see storeStatelessClusterKubeconfig
- * @see getStatelessClusterKubeConfigs
- * @see findKubeconfigByClusterName
- */
-export interface DatabaseEvent extends Event {
-  // target is the request that generated the event.
-  target: IDBOpenDBRequest & {
-    // result is the IndexedDB database. It is used to create the transaction and the object store.
-    result: IDBDatabase;
   };
 }
 
@@ -132,22 +139,6 @@ export interface CursorSuccessEvent extends Event {
   };
 }
 
-/** handleDatabaseUpgrade creates the object store if it doesn't exist.
- * this upgrade is only called when the database is created.
- * It is not called when the database is opened.
- * @param event - The event that is fired when the IndexedDB is upgraded.
- * @see storeStatelessClusterKubeconfig
- * @see getStatelessClusterKubeConfigs
- * @see findKubeconfigByClusterName
- * **/
-export function handleDatabaseUpgrade(event: DatabaseEvent) {
-  const db = event.target ? event.target.result : null;
-  // Create the object store if it doesn't exist
-  if (db && !db.objectStoreNames.contains('kubeconfigStore')) {
-    db.createObjectStore('kubeconfigStore', { keyPath: 'id', autoIncrement: true });
-  }
-}
-
 /** handleDataBaseError handles errors when opening IndexedDB.
  * @param event - The event that is fired when the IndexedDB is upgraded.
  * @see storeStatelessClusterKubeconfig
@@ -163,12 +154,17 @@ export function handleDataBaseError(event: DatabaseErrorEvent, reject: (reason?:
 /**
  * Store the kubeconfig for a stateless cluster in IndexedDB.
  * @param kubeconfig - The kubeconfig to store.
+ * @param onStored - Receives the record key after the transaction commits.
  * @returns promise that resolves when the kubeconfig is successfully added.
  * @throws Error if IndexedDB is not supported.
  * @throws Error if the kubeconfig is invalid.
  */
-export function storeStatelessClusterKubeconfig(kubeconfig: string): Promise<void> {
-  return new Promise<void>(async (resolve, reject) => {
+export function storeStatelessClusterKubeconfig(
+  kubeconfig: string,
+  onStored?: (id: number) => void,
+  pending = false
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
     const request = indexedDB.open('kubeconfigs', 1) as any;
 
     // The onupgradeneeded event is fired when the database is created for the first time.
@@ -187,22 +183,21 @@ export function storeStatelessClusterKubeconfig(kubeconfig: string): Promise<voi
         const transaction = db.transaction(['kubeconfigStore'], 'readwrite');
         const store = transaction.objectStore('kubeconfigStore');
 
-        const newItem = { kubeconfig: kubeconfig };
+        const newItem = { kubeconfig, ...(pending ? { pending: true } : {}) };
         const addRequest = store.add(newItem);
 
-        // The onsuccess event is fired when the request has succeeded.
-        // This is where you handle the results of the request.
-        addRequest.onsuccess = function requestSuccess() {
-          console.debug('Kubeconfig added to IndexedDB');
-          resolve(); // Resolve the promise when the kubeconfig is successfully added
+        transaction.oncomplete = () => {
+          db.close();
+          try {
+            onStored?.(addRequest.result as number);
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
         };
-
-        // The onerror event is fired when the request has failed.
-        // This is where you handle the error.
-        addRequest.onerror = function requestError(event: Event) {
-          const errorEvent = event as DatabaseErrorEvent;
-          console.error(errorEvent.target ? errorEvent.target.error : 'An error occurred');
-          reject(errorEvent.target ? errorEvent.target.error : 'An error occurred'); // Reject the promise on error
+        transaction.onabort = () => {
+          db.close();
+          reject(transaction.error ?? new Error('Kubeconfig could not be stored'));
         };
       } else {
         console.error('Failed to open IndexedDB');
@@ -212,7 +207,7 @@ export function storeStatelessClusterKubeconfig(kubeconfig: string): Promise<voi
 
     // The onerror event is fired when the database is opened.
     // This is where you handle errors.
-    request.onerror = handleDataBaseError;
+    request.onerror = (event: DatabaseErrorEvent) => handleDataBaseError(event, reject);
   });
 }
 
@@ -222,8 +217,12 @@ export function storeStatelessClusterKubeconfig(kubeconfig: string): Promise<voi
  * @throws Error if IndexedDB is not supported.
  * @throws Error if the kubeconfig is invalid.
  */
-export function getStatelessClusterKubeConfigs(): Promise<string[]> {
-  return new Promise<string[]>(async (resolve, reject) => {
+export async function getStatelessClusterKubeConfigs(): Promise<string[]> {
+  return (await getStatelessKubeconfigRecords()).map(record => record.kubeconfig);
+}
+
+function getStatelessKubeconfigRecords(): Promise<StoredKubeconfig[]> {
+  return new Promise((resolve, reject) => {
     const request = indexedDB.open('kubeconfigs', 1) as any;
 
     // The onupgradeneeded event is fired when the database is created for the first time.
@@ -241,18 +240,33 @@ export function getStatelessClusterKubeConfigs(): Promise<string[]> {
         const transaction = db.transaction(['kubeconfigStore'], 'readonly');
         const store = transaction.objectStore('kubeconfigStore');
 
-        const kubeconfigs: string[] = [];
+        const kubeconfigs: StoredKubeconfig[] = [];
+        transaction.oncomplete = () => db.close();
+        transaction.onabort = () => {
+          db.close();
+          reject(transaction.error ?? new Error('Kubeconfig lookup was aborted'));
+        };
 
         /** The onsuccess event is fired when the request has succeeded.
          * This is where you handle the results of the request.
          * The result is the cursor. It is used to iterate through the object store.
          * The cursor is null when there are no more objects to iterate through.
          * */
-        store.openCursor().onsuccess = function storeSuccess(event: Event) {
+        const cursorRequest = store.openCursor();
+        cursorRequest.onerror = () => reject(cursorRequest.error);
+        cursorRequest.onsuccess = function storeSuccess(event: Event) {
           const successEvent = event as CursorSuccessEvent;
           const cursor = successEvent.target.result;
           if (cursor) {
-            kubeconfigs.push(cursor.value.kubeconfig);
+            if (cursor.value.pending) {
+              cursor.continue();
+              return;
+            }
+            kubeconfigs.push({
+              id: cursor.primaryKey as number,
+              kubeconfig: cursor.value.kubeconfig,
+              incarnations: cursor.value.incarnations,
+            });
             cursor.continue();
           } else {
             // All kubeconfigs have been retrieved
@@ -266,51 +280,8 @@ export function getStatelessClusterKubeConfigs(): Promise<string[]> {
 
     // The onerror event is fired when the database is opened.
     // This is where you handle errors.
-    request.onerror = handleDataBaseError;
+    request.onerror = (event: DatabaseErrorEvent) => handleDataBaseError(event, reject);
   });
-}
-
-/**
- * Finds the kubeconfig and context with the matching cluster name or custom name in headlamp_info.
- * @param clusterID The ID for a cluster, composed of the kubeconfig path and cluster name
- * @param clusterName The name of the cluster to find.
- * @param parsedKubeconfig The parsed kubeconfig object.
- * @returns An object containing the matching kubeconfig and context.
- */
-export function findMatchingContexts(
-  clusterName: string,
-  parsedKubeconfig: KubeconfigObject,
-  clusterID?: string
-) {
-  let matchingContext;
-  let matchingKubeconfig;
-
-  // Note: currently clusterID is being used for non dynamic clusters only
-  if (clusterID) {
-    // Find source for the kubeconfig
-    const source = parsedKubeconfig.contexts.find(
-      context => context.context.clusterID === clusterID
-    )?.context.source;
-
-    // Find the context with the matching clusterID
-    if (source === 'kubeconfig') {
-      matchingKubeconfig = parsedKubeconfig.contexts.find(
-        context => context.context.clusterID === clusterID
-      );
-    }
-  } else {
-    // Find the context with the matching cluster name or custom name in headlamp_info
-    matchingContext = parsedKubeconfig.contexts.find(
-      context =>
-        context.name === clusterName ||
-        context.context.extensions?.find(extension => extension.name === 'headlamp_info')?.extension
-          .customName === clusterName
-    );
-
-    matchingKubeconfig = parsedKubeconfig.contexts.find(context => context.name === clusterName);
-  }
-
-  return { matchingKubeconfig, matchingContext };
 }
 
 /**
@@ -321,63 +292,115 @@ export function findMatchingContexts(
  * @returns A promise that resolves when the kubeconfig is successfully replaced.
  * @throws Error if the kubeconfig replacement fails at any step.
  *
- * Note: If deletion of the existing kubeconfig fails, the operation will still proceed
- * to store the new kubeconfig. This ensures the new configuration is applied even if
- * cleanup of the old one encounters issues.
  */
 export async function findAndReplaceKubeconfig(
   clusterName: string,
   kubeconfig: string,
   create: boolean = false
 ): Promise<void> {
-  try {
-    // First try to find the existing kubeconfig
-    const existingKubeconfig = await findKubeconfigByClusterName(clusterName);
+  const selected = store.getState().config.statelessClusters?.[clusterName];
+  let previousRecord: StoredKubeconfig | undefined;
+  const existingKubeconfig = await findKubeconfigByClusterName(
+    clusterName,
+    undefined,
+    selected?.kubeconfigRecordId,
+    record => {
+      previousRecord = record;
+    }
+  );
+  if (!existingKubeconfig && !create) {
+    throw new Error(`No existing kubeconfig found for cluster ${clusterName} and create is false`);
+  }
 
-    if (existingKubeconfig) {
-      // If found, delete the old one
-      // Note: If deletion fails, we continue with storing the new kubeconfig
-      // to ensure the new configuration is applied
-      try {
-        await deleteClusterKubeconfig(clusterName);
-      } catch (deleteError) {
-        console.warn(
-          `Failed to delete existing kubeconfig for cluster ${clusterName}, but continuing with replacement:`,
-          deleteError
-        );
-      }
-      // Store the new kubeconfig
-      await storeStatelessClusterKubeconfig(kubeconfig);
-    } else if (create) {
-      // If not found and create is true, store the new kubeconfig
-      await storeStatelessClusterKubeconfig(kubeconfig);
-    } else {
-      // If not found and create is false, throw error
-      throw new Error(
-        `No existing kubeconfig found for cluster ${clusterName} and create is false`
+  const recoverPrevious = !selected?.importRevision && existingKubeconfig;
+  const parsePrevious = recoverPrevious && existingKubeconfig !== kubeconfig;
+  const inputs = parsePrevious ? [kubeconfig, existingKubeconfig] : [kubeconfig];
+  const config = await parseStatelessKubeconfigs(inputs);
+  assertUnambiguousImport(config);
+  const replacementConfig = {
+    clusters: config?.clusters?.filter(cluster => (cluster.kubeconfigIndex ?? 0) === 0),
+  };
+  const replacement = replacementConfig.clusters?.find(cluster => cluster.name === clusterName);
+  if (!replacement) {
+    throw new Error(`The kubeconfig does not contain cluster ${clusterName}`);
+  }
+
+  if (replacementConfig.clusters?.some(cluster => cluster.name !== clusterName)) {
+    throw new Error(`The replacement kubeconfig must contain only cluster ${clusterName}`);
+  }
+
+  const assertStillSelected = () => {
+    if (
+      !sameImportedSelection(store.getState().config.statelessClusters?.[clusterName], selected)
+    ) {
+      throw createDiscoveryConnectionChangedError();
+    }
+  };
+  const prior = recoverPrevious
+    ? parsePrevious
+      ? config?.clusters?.find(
+          cluster => cluster.kubeconfigIndex === 1 && cluster.name === clusterName
+        )
+      : replacement
+    : selected;
+  const previous =
+    prior &&
+    importedClusterFromRecord(
+      prior,
+      previousRecord?.id,
+      previousRecord?.incarnations?.[clusterName]
+    );
+
+  assertStillSelected();
+  let recordId: number | undefined;
+  await storeStatelessClusterKubeconfig(
+    kubeconfig,
+    id => {
+      recordId = id;
+    },
+    true
+  );
+
+  const isInstalled = () =>
+    recordId !== undefined &&
+    store.getState().config.statelessClusters?.[clusterName]?.kubeconfigRecordId === recordId;
+  let retirementStarted = false;
+  try {
+    if (!isInstalled()) {
+      assertStillSelected();
+      retirementStarted = true;
+      await retireImportedConnection(previous);
+      assertStillSelected();
+      await installKubeconfigRecord(
+        recordId,
+        previousRecord
+          ? [
+              {
+                name: clusterName,
+                kubeconfigRecordId: previousRecord.id,
+                incarnation: selected?.importRevision
+                  ? displacedImport(selected)?.incarnation
+                  : previousRecord.incarnations?.[clusterName],
+              },
+            ]
+          : [],
+        [clusterName],
+        () => {
+          assertStillSelected();
+          return mergeStatelessConfigState(
+            store.getState().config.statelessClusters,
+            replacementConfig,
+            recordId === undefined ? undefined : [recordId]
+          );
+        }
       );
     }
   } catch (error) {
-    console.error('Error in findAndReplaceKubeconfig:', error);
-    throw error;
+    if (!isInstalled()) {
+      await rollbackKubeconfigImport(recordId, retirementStarted ? [previous] : []);
+      throw error;
+    }
   }
-}
-
-/**
- * Generates a cryptographically secure random token using the browser's crypto API.
- * @param {number} length - The length of the token.
- * @returns {string} - The generated token.
- */
-export function generateSecureToken(length = 16): string {
-  const buffer = new Uint8Array(length);
-  if (import.meta.env.NODE_ENV === 'test') {
-    // Use Math.random() in the testing environment
-    return Array.from(buffer, () => Math.floor(Math.random() * 16).toString(16)).join('');
-  }
-  window.crypto.getRandomValues(buffer);
-  return Array.from(buffer, byte => byte.toString(16).padStart(2, '0'))
-    .join('')
-    .slice(0, length);
 }
 
 /**
@@ -415,46 +438,118 @@ export function isEqualClusterConfigs(
  * Parses the cluster config from the backend and updates the redux store
  * if the present stored config is different from the fetched one.
  */
-export async function fetchStatelessClusterKubeConfigs(dispatch: any) {
-  const config = await getStatelessClusterKubeConfigs();
+export async function fetchStatelessClusterKubeConfigs(dispatch: any): Promise<void> {
+  const original = store.getState().config.statelessClusters;
+  const records = await getStatelessKubeconfigRecords().catch((error: unknown) => {
+    console.error('Error reading stored kubeconfigs:', error);
+    return undefined;
+  });
+  if (!records) return;
+  if (store.getState().config.statelessClusters !== original) return;
 
-  if (!config || config.length === 0) {
-    const statelessClusters = store.getState().config.statelessClusters;
-    if (statelessClusters && Object.keys(statelessClusters).length > 0) {
-      dispatch(setStatelessConfig({ statelessClusters: {} }));
-    }
-    return;
-  }
+  const nextConfig =
+    records.length > 0
+      ? parseStatelessKubeconfigs(records.map(record => record.kubeconfig))
+      : Promise.resolve({ clusters: [] });
 
-  const headers = addBackstageAuthHeaders(JSON_HEADERS);
-  const clusterReq = {
-    kubeconfigs: config,
-  };
+  return nextConfig
+    .then(async (config: ParsedConfig) => {
+      const nextState = toStatelessConfigState(
+        config,
+        records.map(record => record.id),
+        records.map(record => record.incarnations)
+      );
+      if (store.getState().config.statelessClusters !== original) return;
+      if (!isEqualClusterConfigs(original, nextState.statelessClusters)) return;
+      if (!original && Object.keys(nextState.statelessClusters).length === 0) return;
 
-  return request(
-    '/parseKubeConfig',
-    {
-      method: 'POST',
-      body: JSON.stringify(clusterReq),
-      headers: {
-        ...headers,
-        ...getHeadlampAPIHeaders(),
-      },
-    },
-    false,
-    false
-  )
-    .then((config: ParsedConfig) => {
-      const nextState = toStatelessConfigState(config);
-      const statelessClusters = store.getState().config.statelessClusters;
+      const previous = original
+        ? Object.values(original)
+        : (config.clusters ?? []).map(cluster => {
+            const record = records[cluster.kubeconfigIndex ?? 0];
+            return importedClusterFromRecord(
+              cluster,
+              record?.id,
+              record?.incarnations?.[cluster.name]
+            );
+          });
+      const retirements = await Promise.allSettled(
+        previous.map(cluster =>
+          retireImportedConnection(
+            cluster,
+            nextState.statelessClusters[cluster.name]?.importRevision,
+            true
+          )
+        )
+      );
+      const failed = new Set<string>();
+      retirements.forEach((result, index) => {
+        if (result.status === 'rejected') {
+          failed.add(previous[index].name);
+          console.error('Error retiring an imported connection:', result.reason);
+        }
+      });
 
-      if (isEqualClusterConfigs(statelessClusters, nextState.statelessClusters)) {
+      // Another tab may have published, removed or renewed a record during parsing
+      // or retirement. Renewals of displaced contexts do not change the winner.
+      const stored = await getStatelessKubeconfigRecords();
+      if (
+        stored.length !== records.length ||
+        stored.some(
+          (record, index) =>
+            record.id !== records[index].id || record.kubeconfig !== records[index].kubeconfig
+        )
+      )
+        return fetchStatelessClusterKubeConfigs(dispatch);
+      const selectedRecords = new Map(stored.map((record, index) => [record.id, index]));
+      for (const cluster of Object.values(nextState.statelessClusters)) {
+        const index = selectedRecords.get(cluster.kubeconfigRecordId!);
+        if (
+          index !== undefined &&
+          stored[index].incarnations?.[cluster.name] !== records[index].incarnations?.[cluster.name]
+        )
+          return fetchStatelessClusterKubeConfigs(dispatch);
+      }
+
+      const current = store.getState().config.statelessClusters;
+      if (current === original && failed.size === 0) {
         dispatch(setStatelessConfig(nextState));
+        return;
+      }
+
+      // A concurrent edit owns the entries it changed. Finish each independent
+      // transition whose original selection is still present.
+      const reconciled = { ...current };
+      for (const name of new Set([
+        ...Object.keys(original ?? {}),
+        ...Object.keys(nextState.statelessClusters),
+      ])) {
+        if (failed.has(name) || !sameImportedSelection(current?.[name], original?.[name])) continue;
+        const next = nextState.statelessClusters[name];
+        if (next) reconciled[name] = next;
+        else delete reconciled[name];
+      }
+      if (isEqualClusterConfigs(current, reconciled)) {
+        dispatch(setStatelessConfig({ statelessClusters: reconciled }));
       }
     })
     .catch((err: Error) => {
       console.error('Error getting config:', err);
     });
+}
+
+function parseStatelessKubeconfigs(kubeconfigs: string[]): Promise<ParsedConfig> {
+  const headers = addBackstageAuthHeaders(JSON_HEADERS);
+  return request(
+    '/parseKubeConfig',
+    {
+      method: 'POST',
+      body: JSON.stringify({ kubeconfigs }),
+      headers: { ...headers, ...getHeadlampAPIHeaders() },
+    },
+    false,
+    false
+  );
 }
 
 const exportFunctions = {
