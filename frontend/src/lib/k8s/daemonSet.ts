@@ -15,7 +15,13 @@
  */
 
 import { jsonPatch } from './api/v1/clusterRequests';
-import { getApiRoot } from './api/v1/formatUrl';
+import { asQuery, getApiRoot } from './api/v1/formatUrl';
+import { getDiscoveredConnectionRevision } from './api/v2/discoveredConnectionRevisions';
+import {
+  bindDiscoveryConnection,
+  discoveryRequestOptions,
+  getResourceConnectionQuery,
+} from './api/v2/discoveryConnection';
 import type { KubeContainer, LabelSelector } from './cluster';
 import ControllerRevision from './controllerRevision';
 import type { KubeMetadata } from './KubeMetadata';
@@ -109,6 +115,7 @@ class DaemonSet extends KubeObject<KubeDaemonSet> {
   }
 
   async getOwnedControllerRevisions(): Promise<ControllerRevision[]> {
+    const cluster = this.cluster;
     return new Promise((resolve, reject) => {
       let cancel: (() => void) | undefined;
       const request = ControllerRevision.apiList(
@@ -123,14 +130,14 @@ class DaemonSet extends KubeObject<KubeDaemonSet> {
         reject,
         {
           namespace: this.getNamespace(),
-          cluster: this.cluster,
-          queryParams: {
+          cluster,
+          queryParams: getResourceConnectionQuery(this, cluster, {
             labelSelector: this.spec?.selector?.matchLabels
               ? Object.entries(this.spec.selector.matchLabels)
                   .map(([k, v]) => `${k}=${v}`)
                   .join(',')
               : undefined,
-          },
+          }),
         }
       );
       request().then(c => {
@@ -157,6 +164,13 @@ class DaemonSet extends KubeObject<KubeDaemonSet> {
     const { toRevision, dryRun } = options;
 
     try {
+      const cluster = this.cluster;
+      const revision = getDiscoveredConnectionRevision(cluster);
+      const query = getResourceConnectionQuery(
+        this,
+        cluster,
+        bindDiscoveryConnection(dryRun ? { dryRun: 'All' } : {}, revision)
+      );
       const revisions = await this.getOwnedControllerRevisions();
 
       const sortedRevisions = revisions
@@ -214,12 +228,15 @@ class DaemonSet extends KubeObject<KubeDaemonSet> {
       ];
 
       const apiRoot = getApiRoot('apps', 'v1');
-      let url = `${apiRoot}/namespaces/${this.getNamespace()}/daemonsets/${this.getName()}`;
-      if (dryRun) {
-        url += '?dryRun=All';
-      }
-
-      const result = await jsonPatch(url, patchOperations, true, { cluster: this.cluster });
+      const url =
+        `${apiRoot}/namespaces/${this.getNamespace()}/daemonsets/${this.getName()}` +
+        asQuery(query);
+      const result = await jsonPatch(
+        url,
+        patchOperations,
+        true,
+        discoveryRequestOptions(cluster, query)
+      );
 
       if (!dryRun) {
         this.revisionHistoryCache = undefined;

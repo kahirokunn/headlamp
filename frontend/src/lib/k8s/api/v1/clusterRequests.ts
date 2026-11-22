@@ -24,10 +24,23 @@ import { getHeadlampAPIHeaders } from '../../../../helpers/getHeadlampAPIHeaders
 import { isBackstage } from '../../../../helpers/isBackstage';
 import { findKubeconfigByClusterName } from '../../../../stateless/findKubeconfigByClusterName';
 import { getUserIdFromLocalStorage } from '../../../../stateless/getUserIdFromLocalStorage';
+import {
+  getImportRevisionKey,
+  IMPORT_REVISION_KEY_HEADER,
+} from '../../../../stateless/importRevisionKey';
 import { logout } from '../../../auth';
 import { getCluster } from '../../../cluster';
 import type { KubeObjectInterface } from '../../KubeObject';
 import type { ApiError } from '../v2/ApiError';
+import { getDiscoveredConnectionRevision } from '../v2/discoveredConnectionRevisions';
+import type { DiscoveryConnectionRequest } from '../v2/discoveryConnection';
+import {
+  assertCurrentDiscoveryConnection,
+  DISCOVERY_CONNECTION_REVISION_HEADER,
+  getDiscoveryRequestBinding,
+  UNVERSIONED_DISCOVERY_CONNECTION,
+  withDiscoveryConnectionPath,
+} from '../v2/discoveryConnection';
 import { CLUSTERS_PREFIX, DEFAULT_TIMEOUT, JSON_HEADERS } from './constants';
 import { asQuery, combinePath } from './formatUrl';
 import type { QueryParameters } from './queryParameters';
@@ -46,6 +59,7 @@ export interface RequestParams extends RequestInit {
   cluster?: string | null;
   /** Whether to automatically log out the user if there is an authentication error. */
   autoLogoutOnAuthError?: boolean;
+  expectedDiscoveryConnection?: DiscoveryConnectionRequest;
 }
 
 export interface ClusterRequest {
@@ -127,10 +141,10 @@ export async function clusterRequest(
     cluster: paramsCluster,
     autoLogoutOnAuthError = true,
     isJSON = true,
+    expectedDiscoveryConnection: boundConnection = getDiscoveryRequestBinding(queryParams),
     ...otherParams
   } = params;
 
-  const userID = getUserIdFromLocalStorage();
   const headers: RequestHeaders = {};
   new Headers(otherParams.headers).forEach((value, key) => {
     headers[key] = value;
@@ -140,23 +154,45 @@ export async function clusterRequest(
   });
   const opts = { ...otherParams, headers };
   const cluster = paramsCluster || '';
+  const expectedDiscoveryConnection =
+    boundConnection ??
+    (cluster ? { revision: getDiscoveredConnectionRevision(cluster) } : undefined);
+  const method = opts.method?.toUpperCase() ?? 'GET';
+  const readConnection =
+    method === 'GET' || method === 'HEAD' ? expectedDiscoveryConnection : undefined;
 
   let fullPath = path;
   if (cluster) {
     const kubeconfig = await findKubeconfigByClusterName(cluster);
     if (kubeconfig !== null) {
-      opts.headers['KUBECONFIG'] = kubeconfig;
-      opts.headers['X-HEADLAMP-USER-ID'] = userID;
+      opts.headers.kubeconfig = kubeconfig;
+      opts.headers['x-headlamp-user-id'] = getUserIdFromLocalStorage(
+        expectedDiscoveryConnection?.revision
+      );
     }
 
     fullPath = combinePath(`/${CLUSTERS_PREFIX}/${cluster}`, path);
   }
 
+  if (fullPath === '/parseKubeConfig' || opts.headers.kubeconfig) {
+    opts.headers[IMPORT_REVISION_KEY_HEADER.toLowerCase()] = await getImportRevisionKey();
+  }
+
+  if (expectedDiscoveryConnection) {
+    assertCurrentDiscoveryConnection(cluster, expectedDiscoveryConnection.revision);
+    if (cluster && expectedDiscoveryConnection.revision === undefined) {
+      opts.headers[DISCOVERY_CONNECTION_REVISION_HEADER.toLowerCase()] =
+        UNVERSIONED_DISCOVERY_CONNECTION;
+    }
+  }
+
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeout);
 
-  let url = combinePath(getAppUrl(), fullPath);
-  url += asQuery(queryParams);
+  const url = withDiscoveryConnectionPath(
+    combinePath(getAppUrl(), fullPath) + asQuery(queryParams),
+    expectedDiscoveryConnection?.revision === undefined ? undefined : expectedDiscoveryConnection
+  );
   const requestData = {
     signal: controller.signal,
     credentials: 'include' as RequestCredentials,
@@ -186,6 +222,14 @@ export async function clusterRequest(
   if (!response.ok) {
     const { status, statusText } = response;
     if (autoLogoutOnAuthError && status === 401 && opts.headers.authorization && cluster) {
+      if (expectedDiscoveryConnection) {
+        try {
+          assertCurrentDiscoveryConnection(cluster, expectedDiscoveryConnection.revision);
+        } catch (error) {
+          clearTimeout(id);
+          throw error;
+        }
+      }
       console.error('Logging out due to auth error', { status, statusText, path });
       logout(cluster, true).catch(err => {
         console.error('Auto-logout failed after auth error:', err);
@@ -212,29 +256,21 @@ export async function clusterRequest(
         }
       }
     } catch (err) {
-      console.error(
-        'Unable to parse error json at url:',
-        url,
-        { err },
-        'with request data:',
-        requestData
-      );
+      console.error('Unable to parse error json at url:', url, { err, method });
     } finally {
       clearTimeout(id);
     }
 
+    if (readConnection) assertCurrentDiscoveryConnection(cluster, readConnection.revision);
     const error = new Error(message) as ApiError;
     error.status = status;
     return Promise.reject(error);
   }
 
-  if (!isJSON) {
-    clearTimeout(id);
-    return Promise.resolve(response);
-  }
-
   try {
-    return await response.json();
+    const result = isJSON ? await response.json() : response;
+    if (readConnection) assertCurrentDiscoveryConnection(cluster, readConnection.revision);
+    return result;
   } finally {
     clearTimeout(id);
   }

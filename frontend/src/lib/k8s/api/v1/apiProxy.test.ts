@@ -24,9 +24,15 @@ import { Mock, MockedFunction } from 'vitest';
 import WS from 'vitest-websocket-mock';
 import { getAppUrl } from '../../../../helpers/getAppUrl';
 import { setBackendToken } from '../../../../helpers/getHeadlampAPIHeaders';
+import * as statelessKubeconfig from '../../../../stateless/findKubeconfigByClusterName';
 import * as cluster from '../../../cluster';
 import { encodeClusterPath } from '../../../oidcLogout';
 import * as apiProxy from '../../apiProxy';
+import * as discoveredRevisions from '../v2/discoveredConnectionRevisions';
+import { DISCOVERY_CONNECTION_CHANGED, recordDiscoveryConnection } from '../v2/discoveryConnection';
+import { prepareApply } from './apply';
+import * as clusterApi from './clusterApi';
+import { startPortForwardForConnection } from './portForward';
 
 const baseApiUrl = getAppUrl();
 const wsUrl = baseApiUrl.replace('http', 'ws');
@@ -121,6 +127,69 @@ describe('apiProxy', () => {
       setBackendToken(null);
       nock.cleanAll();
     });
+
+    it('keeps a public write on the connection selected before kubeconfig lookup', async () => {
+      const revision = vi
+        .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+        .mockReturnValue('same:1');
+      const lookup = Promise.withResolvers<null>();
+      const findKubeconfig = vi
+        .spyOn(statelessKubeconfig, 'findKubeconfigByClusterName')
+        .mockReturnValueOnce(lookup.promise);
+      const request = nock(baseApiUrl)
+        .post(`/clusters/${clusterName}/api/v1/namespaces/default/pods`)
+        .query(true)
+        .reply(201, mockResponse);
+      try {
+        const write = apiProxy.post('/api/v1/namespaces/default/pods', { kind: 'Pod' }, true, {
+          cluster: clusterName,
+        });
+        revision.mockReturnValue('same:2');
+        lookup.resolve(null);
+
+        await expect(write).rejects.toMatchObject({ status: 409 });
+        expect(request.isDone()).toBe(false);
+      } finally {
+        revision.mockRestore();
+        findKubeconfig.mockRestore();
+      }
+    });
+
+    it('sends an explicit precondition for an unversioned cluster', async () => {
+      const request = nock(baseApiUrl)
+        .post(`/clusters/${clusterName}${testPath}`)
+        .matchHeader('X-Headlamp-Connection-Revision', 'unversioned')
+        .reply(409, { message: DISCOVERY_CONNECTION_CHANGED });
+      await expect(
+        apiProxy.post(testPath, {}, true, { cluster: clusterName })
+      ).rejects.toMatchObject({ status: 409 });
+      expect(request.isDone()).toBe(true);
+    });
+
+    it.each([true, false])(
+      'drops a public GET result from a replaced connection (JSON: %s)',
+      async isJSON => {
+        const revision = vi
+          .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+          .mockReturnValue('same:1');
+        const get = nock(baseApiUrl)
+          .get(`/clusters/${clusterName}${testPath}`)
+          .query({ __headlamp_connection_revision: 'same' })
+          .reply(200, () => {
+            revision.mockReturnValue('same:2');
+            return mockResponse;
+          });
+
+        try {
+          await expect(
+            apiProxy.clusterRequest(testPath, { cluster: clusterName, isJSON })
+          ).rejects.toMatchObject({ status: 409 });
+          expect(get.isDone()).toBe(true);
+        } finally {
+          revision.mockRestore();
+        }
+      }
+    );
 
     it('Successfully makes a request', async () => {
       nock(baseApiUrl).get(testPath).reply(200, mockResponse);
@@ -226,6 +295,26 @@ describe('apiProxy', () => {
   describe('apiFactory, apiFactoryWithNamespace', () => {
     let cb: Mock;
     let errCb: Mock;
+
+    it('includes the selected route in a public write with existing query parameters', async () => {
+      const revision = vi
+        .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+        .mockReturnValue('same:1');
+      const request = nock(baseApiUrl)
+        .post(`/clusters/${clusterName}/api/v1/namespaces/default/pods`)
+        .query({ dryRun: 'All', __headlamp_connection_revision: 'same' })
+        .reply(201, mockResponse);
+      try {
+        await expect(
+          apiProxy.post('/api/v1/namespaces/default/pods?dryRun=All', { kind: 'Pod' }, true, {
+            cluster: clusterName,
+          })
+        ).resolves.toEqual(mockResponse);
+        expect(request.isDone()).toBe(true);
+      } finally {
+        revision.mockRestore();
+      }
+    });
 
     beforeEach(() => {
       nock(baseApiUrl)
@@ -747,6 +836,52 @@ describe('apiProxy', () => {
         });
       }));
 
+    it('rejects a replaced connection that changed during the kubeconfig lookup', async () => {
+      const revision = vi
+        .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+        .mockReturnValue('same:1');
+      const lookup = Promise.withResolvers<null>();
+      vi.spyOn(statelessKubeconfig, 'findKubeconfigByClusterName').mockReturnValueOnce(
+        lookup.promise
+      );
+      const connected = vi.fn();
+      mockServer.on('connection', connected);
+      apiProxy.stream(testPath, cb, {
+        cluster: clusterName,
+        failCb,
+      });
+
+      revision.mockReturnValue('same:2');
+      lookup.resolve(null);
+      await vi.waitFor(() => expect(failCb).toHaveBeenCalledOnce());
+      expect(connected).not.toHaveBeenCalled();
+    });
+
+    it('drops messages that arrive from a superseded stream', async () => {
+      const revision = vi
+        .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+        .mockReturnValue('same:1');
+      mockServer.close();
+      mockServer = new WS(
+        `${wsUrl}clusters/${clusterName}${testPath}?__headlamp_connection_revision=same`
+      );
+      const socket = apiProxy.stream(testPath, cb, {
+        cluster: clusterName,
+        isJson: true,
+        failCb,
+      });
+
+      await mockServer.connected;
+      mockServer.send(JSON.stringify(mockResponse));
+      expect(cb).toHaveBeenCalledOnce();
+      revision.mockReturnValue('same:2');
+      mockServer.send(JSON.stringify({ message: 'stale' }));
+      expect(cb).toHaveBeenCalledOnce();
+      expect(failCb).toHaveBeenCalledOnce();
+      await mockServer.closed;
+      socket.cancel();
+    });
+
     it('Successfully handles WebSocket errors', () =>
       new Promise<void>(done => {
         apiProxy.stream(testPath, cb, { connectCb, failCb, isJson: true });
@@ -778,19 +913,14 @@ describe('apiProxy', () => {
   });
 
   describe('apply', () => {
+    const discoveryPath = `/clusters/${clusterName}/api/v1`;
+    const configMapDiscovery = {
+      kind: 'APIResourceList',
+      resources: [{ kind: 'ConfigMap', name: 'configmaps', namespaced: true }],
+    };
+
     beforeEach(() => {
-      nock(baseApiUrl)
-        .get(`/clusters/test-cluster/api/v1`)
-        .reply(200, {
-          kind: 'APIResourceList',
-          resources: [
-            {
-              kind: 'ConfigMap',
-              name: 'configmaps',
-              namespaced: true,
-            },
-          ],
-        });
+      nock(baseApiUrl).get(discoveryPath).reply(200, configMapDiscovery);
 
       vi.spyOn(cluster, 'getCluster').mockReturnValue(clusterName);
       // vi.spyOn(console, 'warn').mockImplementation();
@@ -850,6 +980,139 @@ describe('apiProxy', () => {
 
       const response = await apiProxy.apply(mockConfigMap, undefined, { dryRun: true });
       expect(response).toEqual(modifiedConfigMap);
+    });
+
+    it('keeps apply and its fallback on the original discovered connection', async () => {
+      vi.spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision').mockReturnValue(
+        'original:1'
+      );
+      const query = { dryRun: 'All', __headlamp_connection_revision: 'original' };
+      const scope = nock(baseApiUrl)
+        .get(discoveryPath)
+        .query({ __headlamp_connection_revision: 'original' })
+        .reply(200, configMapDiscovery)
+        .post(`/clusters/${clusterName}/api/v1/namespaces/${namespace}/configmaps`)
+        .query(query)
+        .reply(409, errorMessage)
+        .put(
+          `/clusters/${clusterName}/api/v1/namespaces/${namespace}/configmaps/${mockConfigMap.metadata.name}`
+        )
+        .query(query)
+        .reply(200, modifiedConfigMap);
+
+      await expect(apiProxy.apply(mockConfigMap, undefined, { dryRun: true })).resolves.toEqual(
+        modifiedConfigMap
+      );
+      expect(scope.isDone()).toBe(true);
+    });
+
+    it.each([
+      { retained: false, captured: 'original:1' },
+      { retained: true, captured: 'original:1' },
+      { retained: true, captured: undefined },
+    ])(
+      'rejects a deferred create after the connection changes ($retained, $captured)',
+      async ({ retained, captured }) => {
+        const revision = vi
+          .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+          .mockReturnValue('original:2');
+        const source = {};
+        if (retained) recordDiscoveryConnection(source, clusterName, captured);
+        else revision.mockReturnValue(captured);
+        const submit = prepareApply(clusterName, retained ? source : undefined);
+        revision.mockReturnValue('original:2');
+        const discovery = nock(baseApiUrl)
+          .get(discoveryPath)
+          .query(true)
+          .reply(200, configMapDiscovery);
+        const write = nock(baseApiUrl)
+          .post(`/clusters/${clusterName}/api/v1/namespaces/${namespace}/configmaps`)
+          .query(true)
+          .reply(200, modifiedConfigMap);
+
+        await expect(submit(mockConfigMap)).rejects.toMatchObject({
+          status: 409,
+          message: expect.stringContaining(DISCOVERY_CONNECTION_CHANGED),
+        });
+        expect(discovery.isDone()).toBe(false);
+        expect(write.isDone()).toBe(false);
+      }
+    );
+
+    it.each(['discovery', 'post'] as const)(
+      'stops applying when the connection changes during %s',
+      async during => {
+        const revision = vi
+          .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+          .mockReturnValue('original:1');
+        const query = { __headlamp_connection_revision: 'original' };
+        const discovery = nock(baseApiUrl)
+          .get(discoveryPath)
+          .query(query)
+          .reply(200, () => {
+            if (during === 'discovery') revision.mockReturnValue('original:2');
+            return configMapDiscovery;
+          });
+        const post = nock(baseApiUrl)
+          .post(`/clusters/${clusterName}/api/v1/namespaces/${namespace}/configmaps`)
+          .query(query)
+          .reply(409, () => {
+            revision.mockReturnValue('original:2');
+            return errorMessage;
+          });
+        const put = nock(baseApiUrl)
+          .put(
+            `/clusters/${clusterName}/api/v1/namespaces/${namespace}/configmaps/${mockConfigMap.metadata.name}`
+          )
+          .query(query)
+          .reply(200, modifiedConfigMap);
+
+        await expect(apiProxy.apply(mockConfigMap)).rejects.toMatchObject({ status: 409 });
+        expect(discovery.isDone()).toBe(true);
+        expect(post.isDone()).toBe(during === 'post');
+        expect(put.isDone()).toBe(false);
+      }
+    );
+
+    it('rejects apply when API discovery reports a changed connection', async () => {
+      vi.spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision').mockReturnValue(
+        'original:1'
+      );
+      const submit = prepareApply(clusterName);
+      const discovery = nock(baseApiUrl)
+        .get(discoveryPath)
+        .query({ __headlamp_connection_revision: 'original' })
+        .reply(409, { message: DISCOVERY_CONNECTION_CHANGED });
+      const write = nock(baseApiUrl)
+        .post(`/clusters/${clusterName}/api/v1/namespaces/${namespace}/configmaps`)
+        .query({ __headlamp_connection_revision: 'original' })
+        .reply(201, mockConfigMap);
+
+      await expect(submit(mockConfigMap)).rejects.toMatchObject({
+        status: 409,
+        message: expect.stringContaining(DISCOVERY_CONNECTION_CHANGED),
+      });
+      expect(discovery.isDone()).toBe(true);
+      expect(write.isDone()).toBe(false);
+    });
+
+    it('uses the default namespace captured when a deferred apply was confirmed', async () => {
+      const defaultNamespace = vi
+        .spyOn(clusterApi, 'getClusterDefaultNamespace')
+        .mockReturnValue('first');
+      const submit = prepareApply(clusterName);
+      defaultNamespace.mockReturnValue('updated');
+      const scope = nock(baseApiUrl)
+        .post(
+          `/clusters/${clusterName}/api/v1/namespaces/first/configmaps`,
+          body => body.metadata.namespace === 'first'
+        )
+        .reply(201, mockConfigMap);
+
+      await expect(
+        submit({ ...mockConfigMap, metadata: { ...mockConfigMap.metadata, namespace: undefined } })
+      ).resolves.toEqual(mockConfigMap);
+      expect(scope.isDone()).toBe(true);
     });
 
     it('Successfully handles failing POST and PUT requests', async () => {
@@ -1190,6 +1453,48 @@ describe('apiProxy', () => {
         expect(response).toEqual(mockStartResponse);
       });
 
+      it('includes the selected routing revision when starting a port forward', async () => {
+        const revision = vi
+          .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+          .mockReturnValue('original:1');
+        try {
+          await expect(
+            apiProxy.startPortForward(
+              clusterName,
+              namespace,
+              podName,
+              containerPort,
+              service,
+              serviceNamespace
+            )
+          ).resolves.toEqual(mockStartResponse);
+          const [url, options] = vi.mocked(global.fetch).mock.calls[0];
+          expect(new URL(String(url)).searchParams.get('__headlamp_connection_revision')).toBe(
+            'original'
+          );
+          expect(options?.method).toBe('POST');
+        } finally {
+          revision.mockRestore();
+        }
+      });
+
+      it('rejects the previous connection before sending a port forward request', async () => {
+        const revision = vi
+          .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+          .mockReturnValue('replacement:2');
+        try {
+          await expect(
+            startPortForwardForConnection(
+              { cluster: clusterName, revision: 'original:1' },
+              { id: mockId, namespace, pod: podName, targetPort: '80', service, serviceNamespace }
+            )
+          ).rejects.toMatchObject({ status: 409 });
+          expect(global.fetch).not.toHaveBeenCalled();
+        } finally {
+          revision.mockRestore();
+        }
+      });
+
       it('Normalizes leading-zero port numbers before sending', async () => {
         await apiProxy.startPortForward(
           clusterName,
@@ -1277,6 +1582,21 @@ describe('apiProxy', () => {
           'desktop-token'
         );
         expect(options.body).toEqual(JSON.stringify({ cluster: clusterName, nodeName }));
+      });
+
+      it('pins a drain requested by name to the current discovered connection', async () => {
+        const revision = vi
+          .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+          .mockReturnValue('original:1');
+        try {
+          await expect(apiProxy.drainNode(clusterName, nodeName)).resolves.toEqual(mockResponse);
+          const [path] = (fetch as Mock).mock.lastCall!;
+          expect(path).toBe(
+            `${baseApiUrl}clusters/${clusterName}/drain-node?__headlamp_connection_revision=original`
+          );
+        } finally {
+          revision.mockRestore();
+        }
       });
 
       it('Successfully handles drainNode with error', async () => {

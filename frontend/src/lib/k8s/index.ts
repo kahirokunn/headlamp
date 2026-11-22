@@ -22,6 +22,8 @@ import { useTypedSelector } from '../../redux/hooks';
 import { getCluster } from '../cluster';
 import { clusterRequest } from './api/v1/clusterRequests';
 import { ApiError } from './api/v2/ApiError';
+import { useDiscoveredConnectionRevisions } from './api/v2/discoveredConnectionRevisions';
+import type { DiscoveryConnectionRequest } from './api/v2/discoveryConnection';
 import { Cluster, LabelSelector, StringDict } from './cluster';
 export { ResourceClasses } from './resourceClasses';
 import { matchExpressionSimplifier, matchLabelsSimplifier } from './labelSelector';
@@ -65,8 +67,14 @@ export type { CancellablePromise } from './api/v1/hooks';
  * @param clusterName - the name of the cluster to query, or the currently selected cluster.
  * @returns a promise that resolves to a dictionary containing version info.
  */
-export function getVersion(clusterName: string = ''): Promise<StringDict> {
-  return clusterRequest('/version', { cluster: clusterName || getCluster() });
+export function getVersion(
+  clusterName: string = '',
+  expectedDiscoveryConnection?: DiscoveryConnectionRequest
+): Promise<StringDict> {
+  return clusterRequest('/version', {
+    cluster: clusterName || getCluster(),
+    expectedDiscoveryConnection,
+  });
 }
 
 /**
@@ -108,6 +116,7 @@ export function useClustersVersion(clusters: Cluster[]) {
       .map(c => c.name)
       .sort()
   );
+  const revisions = useDiscoveredConnectionRevisions();
 
   // clusters gets a new array reference on every render; only update clusterNames when
   // the actual set of names changes to avoid unnecessary query resets.
@@ -120,15 +129,18 @@ export function useClustersVersion(clusters: Cluster[]) {
 
   const queries = React.useMemo(
     () =>
-      clusterNames.map(clusterName => ({
-        queryKey: ['clusterVersion', clusterName],
-        queryFn: () => getVersion(clusterName),
-        refetchInterval: versionFetchInterval,
-        refetchIntervalInBackground: false,
-        refetchOnWindowFocus: 'always' as const,
-        retry: false, // surface errors immediately rather than hammering unreachable clusters
-      })),
-    [clusterNames]
+      clusterNames.map(clusterName => {
+        const revision = revisions.get(clusterName);
+        return {
+          queryKey: ['clusterVersion', clusterName, revision],
+          queryFn: () => getVersion(clusterName, { revision }),
+          refetchInterval: versionFetchInterval,
+          refetchIntervalInBackground: false,
+          refetchOnWindowFocus: 'always' as const,
+          retry: false, // surface errors immediately rather than hammering unreachable clusters
+        };
+      }),
+    [clusterNames, revisions]
   );
 
   const results = useQueries({ queries });

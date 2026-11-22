@@ -21,6 +21,19 @@
 import { Base64 } from 'js-base64';
 import { getHeadlampAPIHeaders } from '../helpers/getHeadlampAPIHeaders';
 import store from '../redux/stores/store';
+import { findKubeconfigByClusterName } from '../stateless/findKubeconfigByClusterName';
+import { getUserIdFromLocalStorage } from '../stateless/getUserIdFromLocalStorage';
+import { getImportRevisionKey, IMPORT_REVISION_KEY_HEADER } from '../stateless/importRevisionKey';
+import { getDiscoveredConnectionRevision } from './k8s/api/v2/discoveredConnectionRevisions';
+import {
+  assertCurrentDiscoveryConnection,
+  createDiscoveryConnectionChangedError,
+  DISCOVERY_CONNECTION_REVISION_HEADER,
+  type DiscoveryConnectionRequest,
+  getRoutingRevision,
+  isDiscoveryConnectionChanged,
+  UNVERSIONED_DISCOVERY_CONNECTION,
+} from './k8s/api/v2/discoveryConnection';
 import { backendFetch } from './k8s/api/v2/fetch';
 import { canLogoutFromProvider } from './k8s/clusterAuthType';
 import { encodeClusterPath, redirectToOIDCLogout } from './oidcLogout';
@@ -87,18 +100,42 @@ export function hasToken(cluster: string) {
  * @param token
  * @returns
  */
-async function setCookieToken(cluster: string, token: string | null) {
+async function setCookieToken(
+  cluster: string,
+  token: string | null,
+  connection: DiscoveryConnectionRequest & { preserveIDToken?: boolean }
+) {
   try {
     const endpoint = token
       ? `/clusters/${encodeURIComponent(cluster)}/set-token`
       : `/encoded-clusters/${encodeClusterPath(cluster)}/clear-token`;
+    const currentImport = () => store.getState().config.statelessClusters?.[cluster];
+    const selectedImport = currentImport();
+    const kubeconfig = selectedImport?.kubeconfigRecordId
+      ? await findKubeconfigByClusterName(cluster, undefined, selectedImport.kubeconfigRecordId)
+      : null;
+    if (selectedImport !== currentImport() || (selectedImport && !kubeconfig)) {
+      throw createDiscoveryConnectionChangedError();
+    }
+
+    const statelessHeaders: Record<string, string> = kubeconfig
+      ? {
+          KUBECONFIG: kubeconfig,
+          [IMPORT_REVISION_KEY_HEADER]: await getImportRevisionKey(),
+          'X-HEADLAMP-USER-ID': getUserIdFromLocalStorage(connection.revision),
+        }
+      : {};
+    assertCurrentDiscoveryConnection(cluster, connection.revision);
     const response = await backendFetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        [DISCOVERY_CONNECTION_REVISION_HEADER]:
+          getRoutingRevision(connection.revision) || UNVERSIONED_DISCOVERY_CONNECTION,
         ...getHeadlampAPIHeaders(),
+        ...statelessHeaders,
       },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify({ token, preserveIDToken: connection.preserveIDToken || undefined }),
     });
 
     if (!response.ok) {
@@ -119,17 +156,25 @@ async function setCookieToken(cluster: string, token: string | null) {
  * @param token - The authentication token to set. Pass null to clear the token.
  * @throws {Error} When cluster name is invalid or backend request fails
  */
-export function setToken(cluster: string, token: string | null) {
+export async function setToken(
+  cluster: string,
+  token: string | null,
+  connection: DiscoveryConnectionRequest & { preserveIDToken?: boolean } = {
+    revision: getDiscoveredConnectionRevision(cluster),
+  }
+) {
+  assertCurrentDiscoveryConnection(cluster, connection.revision);
   const setTokenMethodToUse = store.getState().ui.functionsToOverride.setToken;
   if (setTokenMethodToUse) {
     return Promise.resolve(setTokenMethodToUse(cluster, token));
   }
 
-  return setCookieToken(cluster, token).then(result => {
+  return setCookieToken(cluster, token, connection).then(result => {
+    assertCurrentDiscoveryConnection(cluster, connection.revision);
     if (token) {
-      queryClient.invalidateQueries({ queryKey: ['clusterMe', cluster], exact: true });
+      queryClient.invalidateQueries({ queryKey: ['clusterMe', cluster], exact: false });
     } else {
-      queryClient.removeQueries({ queryKey: ['clusterMe', cluster], exact: true });
+      queryClient.removeQueries({ queryKey: ['clusterMe', cluster], exact: false });
     }
 
     return result;
@@ -145,19 +190,24 @@ export function setToken(cluster: string, token: string | null) {
  * @returns {Promise<void>}
  * @throws {Error} When logout request fails
  */
-export async function logout(cluster: string, skipRedirect = false): Promise<void> {
+export async function logout(
+  cluster: string,
+  skipRedirect = false,
+  preserveProviderLogout = !skipRedirect
+): Promise<void> {
+  const connection = { revision: getDiscoveredConnectionRevision(cluster) };
   // For OIDC auth, redirect to the backend OIDC logout endpoint which will
   // redirect to the IdP's end_session_endpoint to properly terminate the session.
   if (canLogoutFromProvider(cluster)) {
     // Clear local state first
     queryClient.removeQueries({ queryKey: ['auth'], exact: false });
-    queryClient.removeQueries({ queryKey: ['clusterMe', cluster], exact: true });
+    queryClient.removeQueries({ queryKey: ['clusterMe', cluster], exact: false });
 
     // Clear the cluster auth cookie before redirecting (cookie path is cluster-scoped).
     try {
-      await setToken(cluster, null);
+      await setToken(cluster, null, { ...connection, preserveIDToken: preserveProviderLogout });
     } catch (error) {
-      if (skipRedirect) {
+      if (skipRedirect || isDiscoveryConnectionChanged(error)) {
         throw error;
       }
     }
@@ -166,13 +216,13 @@ export async function logout(cluster: string, skipRedirect = false): Promise<voi
       return;
     }
 
-    await redirectToOIDCLogout(cluster);
+    await redirectToOIDCLogout(cluster, connection);
     return;
   }
 
-  await setToken(cluster, null);
+  await setToken(cluster, null, connection);
   queryClient.removeQueries({ queryKey: ['auth'], exact: false });
-  queryClient.removeQueries({ queryKey: ['clusterMe', cluster], exact: true });
+  queryClient.removeQueries({ queryKey: ['clusterMe', cluster], exact: false });
 }
 
 /**
@@ -184,10 +234,15 @@ export async function deleteTokens(): Promise<void[]> {
   const clusters = Object.keys(store.getState().config.allClusters ?? {});
 
   const oidcClusterToRedirect = clusters.find(canLogoutFromProvider);
-  const results = await Promise.allSettled(clusters.map(cluster => logout(cluster, true)));
+  const oidcConnection = {
+    revision: oidcClusterToRedirect && getDiscoveredConnectionRevision(oidcClusterToRedirect),
+  };
+  const results = await Promise.allSettled(
+    clusters.map(cluster => logout(cluster, true, cluster === oidcClusterToRedirect))
+  );
 
   if (oidcClusterToRedirect) {
-    await redirectToOIDCLogout(oidcClusterToRedirect);
+    await redirectToOIDCLogout(oidcClusterToRedirect, oidcConnection);
   }
 
   const failures = results.flatMap((result, index) =>

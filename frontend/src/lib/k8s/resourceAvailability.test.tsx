@@ -20,6 +20,7 @@ import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../../App';
 import { useSelectedClusters } from './api/v1/hooks';
+import * as discoveredConnections from './api/v2/discoveredConnectionRevisions';
 import { isResourceServed, useClustersServing, useIsResourceServed } from './resourceAvailability';
 
 const { mockRequest } = vi.hoisted(() => ({ mockRequest: vi.fn() }));
@@ -53,7 +54,10 @@ describe('isResourceServed', () => {
     await expect(isResourceServed('dra', 'resource.k8s.io/v1', 'deviceclasses')).resolves.toBe(
       true
     );
-    expect(mockRequest).toHaveBeenCalledWith('/apis/resource.k8s.io/v1', { cluster: 'dra' });
+    expect(mockRequest).toHaveBeenCalledWith('/apis/resource.k8s.io/v1', {
+      cluster: 'dra',
+      expectedDiscoveryConnection: { revision: undefined },
+    });
   });
 
   it('is false when the version does not list the resource', async () => {
@@ -84,9 +88,11 @@ describe('isResourceServed', () => {
     ).resolves.toBe(true);
     expect(mockRequest).toHaveBeenNthCalledWith(1, '/apis/scheduling.k8s.io/v1beta1', {
       cluster: 'gang',
+      expectedDiscoveryConnection: { revision: undefined },
     });
     expect(mockRequest).toHaveBeenNthCalledWith(2, '/apis/scheduling.k8s.io/v1alpha3', {
       cluster: 'gang',
+      expectedDiscoveryConnection: { revision: undefined },
     });
   });
 
@@ -94,7 +100,39 @@ describe('isResourceServed', () => {
     mockRequest.mockResolvedValue({ resources: [{ name: 'pods' }] });
 
     await expect(isResourceServed('any', 'v1', 'pods')).resolves.toBe(true);
-    expect(mockRequest).toHaveBeenCalledWith('/api/v1', { cluster: 'any' });
+    expect(mockRequest).toHaveBeenCalledWith('/api/v1', {
+      cluster: 'any',
+      expectedDiscoveryConnection: { revision: undefined },
+    });
+  });
+
+  it('does not probe a second version on a replacement connection', async () => {
+    const revision = vi
+      .spyOn(discoveredConnections, 'getDiscoveredConnectionRevision')
+      .mockReturnValue('original:1');
+    const pending = Promise.withResolvers<unknown>();
+    mockRequest
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValue({ resources: [{ name: 'podgroups' }] });
+
+    try {
+      const served = isResourceServed(
+        'workload',
+        ['scheduling.k8s.io/v1beta1', 'scheduling.k8s.io/v1alpha2'],
+        'podgroups'
+      );
+      revision.mockReturnValue('replacement:2');
+      pending.reject(new Error('404'));
+
+      await expect(served).resolves.toBe(false);
+      expect(mockRequest).toHaveBeenCalledOnce();
+      expect(mockRequest).toHaveBeenCalledWith('/apis/scheduling.k8s.io/v1beta1', {
+        cluster: 'workload',
+        expectedDiscoveryConnection: { revision: 'original:1' },
+      });
+    } finally {
+      revision.mockRestore();
+    }
   });
 });
 
@@ -114,6 +152,32 @@ describe('useClustersServing', () => {
     const { result } = renderHook(() => useClustersServing(deviceClasses), { wrapper });
 
     await waitFor(() => expect(result.current).toEqual(['dra', 'other-dra']));
+  });
+
+  it('detects a resource served only by a same-named replacement connection', async () => {
+    vi.mocked(useSelectedClusters).mockReturnValue(['workload']);
+    let revision = 'original:1';
+    vi.spyOn(discoveredConnections, 'getDiscoveredConnectionRevision').mockImplementation(
+      () => revision
+    );
+    const revisions = vi
+      .spyOn(discoveredConnections, 'useDiscoveredConnectionRevisions')
+      .mockReturnValue(new Map([['workload', revision]]));
+    const resource = {
+      apiVersion: 'resource.k8s.io/v1',
+      apiName: 'deviceclasses',
+      isEnabled: vi.fn(async () => false),
+    };
+    const { result, rerender } = renderHook(() => useClustersServing(resource), { wrapper });
+    await waitFor(() => expect(result.current).toEqual([]));
+
+    revision = 'replacement:2';
+    revisions.mockReturnValue(new Map([['workload', revision]]));
+    resource.isEnabled.mockResolvedValue(true);
+    rerender();
+
+    await waitFor(() => expect(result.current).toEqual(['workload']));
+    expect(resource.isEnabled).toHaveBeenCalledTimes(2);
   });
 
   it('is unknown while nothing is selected, without probing', () => {

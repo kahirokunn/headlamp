@@ -14,7 +14,10 @@
  * limitations under the License.
  */
 
-import { renderHook } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
+import cloneDeep from 'lodash/cloneDeep';
+import React from 'react';
+import { MemoryRouter } from 'react-router-dom';
 import { vi } from 'vitest';
 
 vi.mock('../cluster', () => ({
@@ -22,7 +25,8 @@ vi.mock('../cluster', () => ({
   getCluster: vi.fn(),
   getSelectedClusters: vi.fn(),
 }));
-vi.mock('../../helpers/clusterSettings', () => ({
+vi.mock('../../helpers/clusterSettings', async importOriginal => ({
+  ...(await importOriginal<typeof import('../../helpers/clusterSettings')>()),
   loadClusterSettings: vi.fn(),
   getCombinedAllowedNamespaces: vi.fn(),
   hasAllowedNamespacesRestriction: vi.fn(),
@@ -34,13 +38,19 @@ vi.mock('./api/v1/factories', () => ({
   apiFactory: vi.fn(),
   apiFactoryWithNamespace: vi.fn(),
 }));
-vi.mock('./api/v1/hooks', () => ({
-  useConnectApi: vi.fn(),
+vi.mock('./api/v1/hooks', async importOriginal => ({
+  ...(await importOriginal<typeof import('./api/v1/hooks')>()),
   useSelectedClusters: vi.fn(),
 }));
+vi.mock('./api/v2/discoveredConnectionRevisions', () => ({
+  getDiscoveredConnectionRevision: vi.fn(),
+  useDiscoveredConnectionRevisions: vi.fn(),
+}));
 vi.mock('./api/v2/hooks', () => ({ useKubeObject: vi.fn() }));
-vi.mock('./api/v2/useKubeObjectList', () => ({
-  makeListRequests: vi.fn(),
+vi.mock('./api/v2/useKubeObjectList', async importOriginal => ({
+  makeListRequests: vi.fn(
+    (await importOriginal<typeof import('./api/v2/useKubeObjectList')>()).makeListRequests
+  ),
   useKubeObjectList: vi.fn(),
 }));
 vi.mock('./patchUtils', () => ({
@@ -48,12 +58,24 @@ vi.mock('./patchUtils', () => ({
   computeRawPatchCount: vi.fn(),
 }));
 
-import { getCombinedAllowedNamespaces } from '../../helpers/clusterSettings';
+import {
+  getCombinedAllowedNamespaces,
+  hasAllowedNamespacesRestriction,
+  storeResolvedAllowedNamespaces,
+} from '../../helpers/clusterSettings';
 import { getCluster } from '../cluster';
 import { post } from './api/v1/clusterRequests';
 import { ApiClient, ApiWithNamespaceClient } from './api/v1/factories';
-import { useConnectApi, useSelectedClusters } from './api/v1/hooks';
+import { useSelectedClusters } from './api/v1/hooks';
 import { ScaleApi } from './api/v1/scaleApi';
+import {
+  getDiscoveredConnectionRevision,
+  useDiscoveredConnectionRevisions,
+} from './api/v2/discoveredConnectionRevisions';
+import {
+  getResourceDiscoveryConnection,
+  recordDiscoveryConnection,
+} from './api/v2/discoveryConnection';
 import { makeListRequests, useKubeObjectList } from './api/v2/useKubeObjectList';
 import { KubeObject, KubeObjectInterface } from './KubeObject';
 import { computePatchOperations, computeRawPatchCount } from './patchUtils';
@@ -61,6 +83,7 @@ import { computePatchOperations, computeRawPatchCount } from './patchUtils';
 describe('KubeObject', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getDiscoveredConnectionRevision).mockReset();
     vi.mocked(useSelectedClusters).mockReturnValue([]);
     vi.mocked(useKubeObjectList).mockReturnValue({} as any);
   });
@@ -85,10 +108,14 @@ describe('KubeObject', () => {
       spec: { replicas: 1 },
     };
     let endpoint: ApiWithNamespaceClient<KubeObjectInterface>;
+    const wrapper = ({ children }: React.PropsWithChildren) =>
+      React.createElement(MemoryRouter, null, children);
 
     beforeEach(() => {
       vi.resetAllMocks();
+      vi.mocked(getCombinedAllowedNamespaces).mockReturnValue([]);
       vi.mocked(getCluster).mockReturnValue('selected');
+      vi.mocked(useDiscoveredConnectionRevisions).mockReturnValue(new Map());
       endpoint = {
         isNamespaced: true,
         apiInfo: [
@@ -133,9 +160,7 @@ describe('KubeObject', () => {
     it('uses allowed namespaces when a namespaced list has no explicit namespace', async () => {
       vi.mocked(getCombinedAllowedNamespaces).mockReturnValue(['permitted']);
       vi.mocked(endpoint.list).mockResolvedValue(vi.fn());
-      renderHook(() => Widget.useApiList(vi.fn(), undefined, { cluster: 'selected' }));
-
-      await vi.mocked(useConnectApi).mock.calls[0][0]();
+      renderHook(() => Widget.useApiList(vi.fn(), undefined, { cluster: 'selected' }), { wrapper });
 
       expect(getCombinedAllowedNamespaces).toHaveBeenCalledWith('selected');
       expect(endpoint.list).toHaveBeenCalledWith(
@@ -151,40 +176,38 @@ describe('KubeObject', () => {
       const cancel = vi.fn();
       const onError = vi.fn();
       vi.mocked(endpoint.list).mockResolvedValue(cancel);
-      renderHook(() =>
-        Widget.useApiList(vi.fn(), onError, {
-          namespace: ['one', 'two'],
-          labelSelector: 'app=example',
-          fieldSelector: 'metadata.name=sample',
-          limit: 5,
-          cluster: 'east',
-        })
+      const { unmount } = renderHook(
+        () =>
+          Widget.useApiList(vi.fn(), onError, {
+            namespace: ['one', 'two'],
+            labelSelector: 'app=example',
+            fieldSelector: 'metadata.name=sample',
+            limit: 5,
+            cluster: 'east',
+          }),
+        { wrapper }
       );
-
-      for (const request of vi.mocked(useConnectApi).mock.calls[0]) {
-        const stop = await request();
-        stop();
-      }
-
       expect(getCombinedAllowedNamespaces).not.toHaveBeenCalled();
-      expect(cancel).toHaveBeenCalledTimes(2);
       for (const namespace of ['one', 'two']) {
         expect(endpoint.list).toHaveBeenCalledWith(
           namespace,
           expect.any(Function),
-          onError,
+          expect.any(Function),
           { labelSelector: 'app=example', fieldSelector: 'metadata.name=sample', limit: 5 },
           'east'
         );
       }
+      const error = new Error('List failed');
+      vi.mocked(endpoint.list).mock.calls[0][2]?.(error, cancel);
+      expect(onError).toHaveBeenCalledWith(error, cancel);
+      unmount();
+      await waitFor(() => expect(cancel).toHaveBeenCalledTimes(2));
     });
 
     it('uses an all-namespace request when no cluster or restriction is selected', async () => {
       vi.mocked(getCluster).mockReturnValue(null);
       vi.mocked(endpoint.list).mockResolvedValue(vi.fn());
-      renderHook(() => Widget.useApiList(vi.fn()));
-
-      await vi.mocked(useConnectApi).mock.calls[0][0]();
+      renderHook(() => Widget.useApiList(vi.fn()), { wrapper });
 
       expect(endpoint.list).toHaveBeenCalledWith(
         '',
@@ -196,6 +219,39 @@ describe('KubeObject', () => {
       expect(getCombinedAllowedNamespaces).not.toHaveBeenCalled();
     });
 
+    it.each([
+      { currentRevision: 'original:1', recordedRevision: 'original:1' },
+      { currentRevision: 'replacement:2', recordedRevision: 'original' },
+    ])(
+      'keeps the guarded LIST origin when the current revision is $currentRevision',
+      async ({ currentRevision, recordedRevision }) => {
+        vi.mocked(getDiscoveredConnectionRevision).mockReturnValue(currentRevision);
+        const onList = vi.fn<(items: Widget[]) => void>();
+        await Widget.apiList(onList, undefined, {
+          cluster: 'east',
+          namespace: 'apps',
+          queryParams: { __headlamp_connection_revision: 'original' },
+        })();
+
+        const [, callback, , query, cluster] = vi.mocked(endpoint.list).mock.calls[0];
+        expect(query).toEqual({ __headlamp_connection_revision: 'original' });
+        expect(cluster).toBe('east');
+        vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('replacement:3');
+        vi.mocked(getCluster).mockReturnValue('selected-later');
+        // The streaming list callback receives an array.
+        const onResults = callback as unknown as (items: KubeObjectInterface[]) => void;
+        onResults([data]);
+
+        const [item] = onList.mock.calls[0][0];
+        expect(getResourceDiscoveryConnection(item)).toEqual({
+          cluster: 'east',
+          revision: recordedRevision,
+        });
+        await expect(item.update(data)).rejects.toMatchObject({ status: 409 });
+        expect(endpoint.put).not.toHaveBeenCalled();
+      }
+    );
+
     it('wraps a get response and forwards request errors and cancellation', async () => {
       const cancel = vi.fn();
       const onError = vi.fn();
@@ -204,18 +260,200 @@ describe('KubeObject', () => {
         return cancel;
       });
       const onGet = vi.fn();
-      renderHook(() => Widget.useApiGet(onGet, 'sample', 'apps', onError, { cluster: 'east' }));
-
-      expect(await vi.mocked(useConnectApi).mock.calls[0][0]()).toBe(cancel);
+      const { unmount } = renderHook(
+        () => Widget.useApiGet(onGet, 'sample', 'apps', onError, { cluster: 'east' }),
+        { wrapper }
+      );
       expect(endpoint.get).toHaveBeenCalledWith(
         'apps',
         'sample',
         expect.any(Function),
-        onError,
-        undefined,
+        expect.any(Function),
+        {},
         'east'
       );
       expect(onGet).toHaveBeenCalledWith(expect.objectContaining({ jsonData: data }));
+      const error = new Error('Get failed');
+      vi.mocked(endpoint.get).mock.calls[0][3]?.(error, cancel);
+      expect(onError).toHaveBeenCalledWith(error, cancel);
+      unmount();
+      await waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+    });
+
+    it('clears and restarts legacy reads when their explicit cluster is replaced', async () => {
+      const select = (revision: string) => {
+        vi.mocked(getDiscoveredConnectionRevision).mockImplementation(cluster =>
+          cluster === 'east' ? revision : undefined
+        );
+        vi.mocked(useDiscoveredConnectionRevisions).mockReturnValue(new Map([['east', revision]]));
+      };
+      const cancel = vi.fn();
+      const onError = vi.fn();
+      vi.mocked(endpoint.list).mockResolvedValue(cancel);
+      vi.mocked(endpoint.get).mockResolvedValue(cancel);
+      const onGet = vi.fn();
+      const onList = vi.fn();
+      select('original:1');
+      const options = { cluster: 'east' };
+      const { rerender } = renderHook(
+        () => {
+          Widget.useApiGet(onGet, 'sample', 'apps', onError, options);
+          Widget.useApiList(onList, onError, { ...options, namespace: ['one', 'two'] });
+        },
+        { wrapper }
+      );
+      const getCalls = vi.mocked(endpoint.get).mock.calls;
+      const listCalls = vi.mocked(endpoint.list).mock.calls;
+      getCalls[0][2](data);
+      const sendList = (index: number, items: KubeObjectInterface[]) => {
+        (listCalls[index][1] as unknown as (items: KubeObjectInterface[]) => void)(items);
+      };
+      sendList(0, [data]);
+      sendList(1, [data]);
+      expect(onList.mock.lastCall?.[0]).toHaveLength(2);
+
+      select('replacement:2');
+      rerender();
+      expect(onList.mock.lastCall?.[0]).toEqual([]);
+      expect(onGet.mock.lastCall?.[0]).toBeNull();
+      expect(getCalls[1][4]).toEqual({ __headlamp_connection_revision: 'replacement' });
+      expect(listCalls[2][3]).toEqual({ __headlamp_connection_revision: 'replacement' });
+      expect(listCalls[3][3]).toEqual({ __headlamp_connection_revision: 'replacement' });
+
+      getCalls[0][2](data);
+      getCalls[0][3]?.(new Error('Old GET failed'), cancel);
+      sendList(1, [data]);
+      expect(onList.mock.lastCall?.[0]).toEqual([]);
+      expect(onGet.mock.lastCall?.[0]).toBeNull();
+      expect(onError).not.toHaveBeenCalled();
+      getCalls[1][2](data);
+      sendList(2, [data]);
+      expect(onGet.mock.lastCall?.[0]).toBeInstanceOf(Widget);
+      expect(onList.mock.lastCall?.[0]).toHaveLength(1);
+      await waitFor(() => expect(cancel).toHaveBeenCalledTimes(3));
+    });
+
+    it('combines callback lists across the explicitly selected clusters and clears an empty selection', async () => {
+      vi.mocked(endpoint.list).mockResolvedValue(vi.fn());
+      const onList = vi.fn<(items: Widget[]) => void>();
+      const { rerender } = renderHook(
+        ({ clusters }: { clusters: string[] }) =>
+          Widget.useApiList(onList, undefined, { cluster: 'ignored', clusters, namespace: 'apps' }),
+        { wrapper, initialProps: { clusters: ['east', 'west'] } }
+      );
+      const calls = vi.mocked(endpoint.list).mock.calls;
+      expect(calls.map(call => call[4])).toEqual(['east', 'west']);
+      const send = (i: number) =>
+        (calls[i][1] as unknown as (items: KubeObjectInterface[]) => void)([data]);
+      send(1);
+      send(0);
+      expect(onList.mock.lastCall?.[0].map(item => item.cluster)).toEqual(['east', 'west']);
+      rerender({ clusters: [] });
+      send(1);
+      expect(onList.mock.lastCall?.[0]).toEqual([]);
+      expect(calls).toHaveLength(2);
+    });
+
+    it('waits for the selected cluster’s allowed namespaces and clears rows when the selector becomes empty', () => {
+      let allowed: string[] = [];
+      vi.mocked(hasAllowedNamespacesRestriction).mockReturnValue(true);
+      vi.mocked(getCombinedAllowedNamespaces).mockImplementation(() => allowed);
+      vi.mocked(endpoint.list).mockResolvedValue(vi.fn());
+      const onList = vi.fn();
+      renderHook(() => Widget.useApiList(onList, undefined, { cluster: 'east' }), { wrapper });
+      expect(onList).toHaveBeenLastCalledWith([]);
+      expect(endpoint.list).not.toHaveBeenCalled();
+      allowed = ['apps'];
+      act(() => storeResolvedAllowedNamespaces('east', 'team=a', allowed));
+      expect(vi.mocked(endpoint.list).mock.calls.map(args => args[0])).toEqual(['apps']);
+      allowed = [];
+      act(() => storeResolvedAllowedNamespaces('east', 'team=a', allowed));
+      expect(onList).toHaveBeenLastCalledWith([]);
+      expect(endpoint.list).toHaveBeenCalledTimes(1);
+    });
+
+    it('ignores the earlier GET during the layout phase of a new selection', () => {
+      vi.mocked(endpoint.get).mockResolvedValue(vi.fn());
+      const onGet = vi.fn();
+      const { rerender } = renderHook(
+        ({ name }) => {
+          Widget.useApiGet(onGet, name, 'apps', undefined, { cluster: 'east' });
+          React.useLayoutEffect(() => {
+            if (name === 'second') vi.mocked(endpoint.get).mock.calls[0][2](data);
+          }, [name]);
+        },
+        { wrapper, initialProps: { name: 'first' } }
+      );
+      rerender({ name: 'second' });
+      expect(onGet.mock.calls.flat().filter(Boolean)).toEqual([]);
+    });
+
+    it('restarts legacy reads when their request inputs change on the same cluster', async () => {
+      const cancel = vi.fn();
+      vi.mocked(endpoint.list).mockResolvedValue(cancel);
+      vi.mocked(endpoint.get).mockResolvedValue(cancel);
+      const onGet = vi.fn();
+      const onList = vi.fn();
+      const initial = { name: 'first', namespace: 'one', labelSelector: 'app=first' };
+      const { rerender } = renderHook(
+        ({ name, namespace, labelSelector }) => {
+          const queryParams = { labelSelector };
+          Widget.useApiGet(onGet, name, namespace, undefined, { cluster: 'east', queryParams });
+          Widget.useApiList(onList, undefined, {
+            ...queryParams,
+            namespace: [namespace],
+            cluster: 'east',
+          });
+        },
+        { wrapper, initialProps: initial }
+      );
+      const getCalls = vi.mocked(endpoint.get).mock.calls;
+      const listCalls = vi.mocked(endpoint.list).mock.calls;
+
+      rerender({ ...initial });
+      expect(getCalls).toHaveLength(1);
+      expect(listCalls).toHaveLength(1);
+      rerender({ name: 'second', namespace: 'two', labelSelector: 'app=second' });
+      expect(onList.mock.lastCall?.[0]).toEqual([]);
+      expect(onGet.mock.lastCall?.[0]).toBeNull();
+      expect(getCalls[1]).toEqual([
+        'two',
+        'second',
+        expect.any(Function),
+        undefined,
+        { labelSelector: 'app=second' },
+        'east',
+      ]);
+      expect(listCalls[1]).toEqual([
+        'two',
+        expect.any(Function),
+        undefined,
+        { labelSelector: 'app=second' },
+        'east',
+      ]);
+      getCalls[0][2](data);
+      expect(onGet.mock.lastCall?.[0]).toBeNull();
+      await waitFor(() => expect(cancel).toHaveBeenCalledTimes(2));
+    });
+
+    it('keeps the connection selected when an implicit GET starts', async () => {
+      vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('original:1');
+      const onGet = vi.fn<(item: Widget) => void>();
+      await Widget.apiGet(onGet, 'sample', 'apps')();
+
+      const [, , onResult, , query, cluster] = vi.mocked(endpoint.get).mock.calls[0];
+      expect(query).toEqual({ __headlamp_connection_revision: 'original' });
+      expect(cluster).toBe('selected');
+      vi.mocked(getCluster).mockReturnValue('selected-later');
+      onResult(data);
+
+      const [item] = onGet.mock.calls[0];
+      await item.update(data);
+      expect(endpoint.put).toHaveBeenCalledWith(
+        data,
+        { __headlamp_connection_revision: 'original' },
+        'selected'
+      );
     });
 
     it('sets background propagation and immediate deletion for a forced Job deletion', () => {
@@ -253,6 +491,52 @@ describe('KubeObject', () => {
       expect(endpoint.jsonPatch).toHaveBeenCalledWith(operations, 'apps', 'sample', {}, 'east');
     });
 
+    it('rejects mutations on a resource constructed before its cluster is replaced', async () => {
+      const revision = vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('original:1');
+      const resource = Widget.create(data, 'east');
+      revision.mockReturnValue('replacement:2');
+
+      await expect(resource.patch({ spec: { replicas: 3 } })).rejects.toMatchObject({
+        status: 409,
+      });
+      await expect(cloneDeep(resource).delete()).rejects.toMatchObject({ status: 409 });
+      expect(endpoint.patch).not.toHaveBeenCalled();
+      expect(endpoint.delete).not.toHaveBeenCalled();
+    });
+
+    it('uses the originating route for mutations of a retained discovered resource', async () => {
+      const widget = new Widget(data, 'east');
+      vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('original:2');
+      recordDiscoveryConnection(widget, 'east', 'original:2');
+      const query = { __headlamp_connection_revision: 'original' };
+      const operations = [{ op: 'replace' as const, path: '/spec/replicas', value: 3 }];
+      vi.mocked(computePatchOperations).mockReturnValue(operations);
+
+      await widget.delete(true);
+      expect(endpoint.delete).toHaveBeenCalledWith(
+        'apps',
+        'sample',
+        { ...query, gracePeriodSeconds: 0 },
+        'east'
+      );
+      await widget.update(data);
+      expect(endpoint.put).toHaveBeenCalledWith(data, query, 'east');
+      await widget.patch({ spec: { replicas: 3 } });
+      expect(endpoint.patch).toHaveBeenCalledWith(
+        { spec: { replicas: 3 } },
+        'apps',
+        'sample',
+        query,
+        'east'
+      );
+      await widget.patchUpdate(data, data);
+      expect(endpoint.jsonPatch).toHaveBeenCalledWith(operations, 'apps', 'sample', query, 'east');
+
+      widget.cluster = 'west';
+      await expect(widget.delete()).rejects.toMatchObject({ status: 409 });
+      expect(endpoint.delete).toHaveBeenCalledTimes(1);
+    });
+
     it('rejects edits limited to server-managed fields rather than silently discarding them', async () => {
       vi.mocked(computePatchOperations).mockReturnValue([]);
       vi.mocked(computeRawPatchCount).mockReturnValue(2);
@@ -284,7 +568,24 @@ describe('KubeObject', () => {
 
       await new Widget(data, 'east').scale(3);
 
-      expect(patch).toHaveBeenCalledWith({ spec: { replicas: 3 } }, data.metadata, 'east');
+      expect(patch).toHaveBeenCalledWith({ spec: { replicas: 3 } }, data.metadata, 'east', {});
+    });
+
+    it('rejects scaling a retained resource reassigned to another cluster', async () => {
+      const patch = vi.fn<ScaleApi['patch']>().mockResolvedValue(data);
+      Widget.apiEndpoint = { ...endpoint, scale: { get: vi.fn(), put: vi.fn(), patch } };
+      const widget = new Widget(data, 'east');
+      vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('original:2');
+      recordDiscoveryConnection(widget, 'east', 'original:2');
+
+      await widget.scale(3);
+      expect(patch).toHaveBeenCalledWith({ spec: { replicas: 3 } }, data.metadata, 'east', {
+        __headlamp_connection_revision: 'original',
+      });
+
+      widget.cluster = 'west';
+      await expect(widget.scale(3)).rejects.toMatchObject({ status: 409 });
+      expect(patch).toHaveBeenCalledTimes(1);
     });
 
     it('does not insert a namespace into a cluster-scoped JSON patch request', async () => {
@@ -328,7 +629,7 @@ describe('KubeObject', () => {
           spec: { resourceAttributes: { verb: 'get', resource: 'widgets' } },
         },
         false,
-        { cluster: 'east' }
+        { cluster: 'east', expectedDiscoveryConnection: { revision: undefined } }
       );
     });
 
@@ -338,6 +639,56 @@ describe('KubeObject', () => {
 
       await expect(Widget.fetchAuthorization({ verb: 'get' }, 'east')).rejects.toBe(error);
       expect(post).toHaveBeenCalledOnce();
+    });
+
+    it('does not try another authorization API after the connection changes', async () => {
+      const revision = vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('original:1');
+      vi.mocked(post).mockImplementationOnce(async () => {
+        revision.mockReturnValue('replacement:2');
+        throw { status: 404 };
+      });
+
+      await expect(Widget.fetchAuthorization({ verb: 'get' }, 'east')).rejects.toMatchObject({
+        status: 409,
+      });
+      expect(vi.mocked(post).mock.calls.map(([path]) => path)).toEqual([
+        '/apis/authorization.k8s.io/v1/selfsubjectaccessreviews?__headlamp_connection_revision=original',
+      ]);
+    });
+
+    it('discards a successful authorization result from a replaced connection', async () => {
+      const revision = vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('original:1');
+      const late = Promise.withResolvers<{ status: { allowed: boolean } }>();
+      vi.mocked(post).mockReturnValueOnce(late.promise);
+      const review = Widget.fetchAuthorization({ verb: 'get' }, 'east');
+      revision.mockReturnValue('replacement:2');
+      late.resolve({ status: { allowed: true } });
+
+      await expect(review).rejects.toMatchObject({ status: 409 });
+    });
+
+    it('rejects an ordinary authorization override after discovery replaces the source', async () => {
+      const widget = new Widget(data, 'east');
+      vi.mocked(getDiscoveredConnectionRevision).mockImplementation(cluster =>
+        cluster === 'east' ? 'replacement:1' : undefined
+      );
+
+      await expect(widget.getAuthorization('get', {}, 'west')).rejects.toMatchObject({
+        status: 409,
+      });
+      expect(post).not.toHaveBeenCalled();
+    });
+
+    it('does not ask another connection about a retained resource', async () => {
+      vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('replacement:2');
+      const widget = new Widget(data, 'east');
+      recordDiscoveryConnection(widget, 'east', 'original:1');
+
+      await expect(widget.getAuthorization('update')).rejects.toMatchObject({ status: 409 });
+      await expect(widget.getAuthorization('update', {}, 'west')).rejects.toMatchObject({
+        status: 409,
+      });
+      expect(post).not.toHaveBeenCalled();
     });
 
     it('propagates a missing authorization API after both supported versions fail', async () => {

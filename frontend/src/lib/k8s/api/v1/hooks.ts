@@ -18,6 +18,10 @@ import React, { useContext } from 'react';
 import { useHistory, useLocation } from 'react-router-dom';
 import { getCluster, getSelectedClusters } from '../../../cluster';
 import { SelectedClustersContext } from '../../SelectedClustersContext';
+import {
+  getDiscoveredConnectionRevision,
+  useDiscoveredConnectionRevisions,
+} from '../v2/discoveredConnectionRevisions';
 
 export type CancellablePromise = Promise<() => void>;
 
@@ -77,23 +81,61 @@ export function useSelectedClusters(): string[] {
  * @param apiCalls - functions returning cancellable promises for API calls.
  */
 export function useConnectApi(...apiCalls: (() => CancellablePromise)[]) {
-  // Use the location to make sure the API calls are changed, as they may depend on the cluster
-  // (defined in the URL ATM).
-  const cluster = useCluster();
+  useConnectionRequests(undefined, () => apiCalls.map(call => call()));
+}
 
-  React.useEffect(
-    () => {
-      const cancellables = apiCalls.map(func => func());
-
-      return function cleanup() {
-        for (const cancellablePromise of cancellables) {
-          cancellablePromise.then(cancellable => cancellable());
-        }
-      };
-    },
-    // If we add the apiCalls to the dependency list, then it actually
-    // results in undesired reloads.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [cluster]
+/** Keep callback-based reads bound to their effective cluster connection. */
+export function useConnectionRequests(
+  explicitCluster: string | undefined,
+  start: (
+    cluster: string | undefined,
+    isCurrent: () => boolean,
+    changed: boolean
+  ) => CancellablePromise[],
+  requestKey?: string
+) {
+  const routeCluster = useCluster();
+  useClusterListRequests(
+    [explicitCluster || routeCluster || undefined],
+    ([cluster], isCurrent, changed) => start(cluster, isCurrent, changed),
+    requestKey
   );
+}
+
+/** Start and cancel one group of reads when its cluster selection or any connection changes. */
+export function useClusterListRequests(
+  clusters: Array<string | undefined>,
+  start: (
+    clusters: Array<string | undefined>,
+    isCurrent: () => boolean,
+    changed: boolean
+  ) => CancellablePromise[],
+  requestKey?: string
+) {
+  const revisions = useDiscoveredConnectionRevisions();
+  const connections = clusters.map(cluster => ({
+    cluster,
+    revision: cluster ? revisions.get(cluster) : undefined,
+  }));
+  const key = JSON.stringify([connections, requestKey]);
+  const previous = React.useRef(key);
+
+  React.useLayoutEffect(() => {
+    const changed = previous.current !== key;
+    previous.current = key;
+    let active = true;
+    const isCurrent = () =>
+      active &&
+      connections.every(
+        ({ cluster, revision }) => !cluster || getDiscoveredConnectionRevision(cluster) === revision
+      );
+    const cancellables = start(clusters, isCurrent, changed);
+
+    return () => {
+      active = false;
+      for (const promise of cancellables) promise.then(cancel => cancel());
+    };
+    // Callers recreate the callback and arrays on render. The key describes the selected requests.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
 }

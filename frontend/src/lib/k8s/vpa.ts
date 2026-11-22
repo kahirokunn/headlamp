@@ -15,6 +15,7 @@
  */
 
 import { request } from './api/v1/clusterRequests';
+import { inheritResourceConnection } from './api/v2/discoveryConnection';
 import type { KubeObjectClass, KubeObjectInterface } from './KubeObject';
 import { KubeObject } from './KubeObject';
 import { ResourceClasses } from './resourceClasses';
@@ -156,7 +157,7 @@ class VPA extends KubeObject<KubeVPA> {
         this.cluster
       );
     }
-    return objInstance;
+    return objInstance && inheritResourceConnection(objInstance, this);
   }
 
   get targetRecommendations(): RecommendationValue | null | undefined {

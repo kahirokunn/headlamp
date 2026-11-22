@@ -19,6 +19,7 @@ import { renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import App from '../../App';
 import { useSelectedClusters } from './api/v1/hooks';
+import * as discoveredConnections from './api/v2/discoveredConnectionRevisions';
 import PodGroup from './podGroup';
 import {
   useCompositePodGroupClusters,
@@ -84,6 +85,27 @@ describe('usePodGroupClustersByVersion', () => {
     await waitFor(() =>
       expect(result.current).toEqual({ [V1BETA1]: ['beta', 'both'], [V1ALPHA2]: ['older'] })
     );
+  });
+
+  it('uses the API version served by a same-named replacement connection', async () => {
+    vi.mocked(useSelectedClusters).mockReturnValue(['workload']);
+    let revision = 'original:1';
+    vi.spyOn(discoveredConnections, 'getDiscoveredConnectionRevision').mockImplementation(
+      () => revision
+    );
+    const revisions = vi
+      .spyOn(discoveredConnections, 'useDiscoveredConnectionRevisions')
+      .mockReturnValue(new Map([['workload', revision]]));
+    serve({ workload: [V1BETA1] });
+    const { result, rerender } = renderHook(() => usePodGroupClustersByVersion(), { wrapper });
+    await waitFor(() => expect(result.current).toEqual({ [V1BETA1]: ['workload'] }));
+
+    revision = 'replacement:2';
+    revisions.mockReturnValue(new Map([['workload', revision]]));
+    serve({ workload: [V1ALPHA2] });
+    rerender();
+
+    await waitFor(() => expect(result.current).toEqual({ [V1ALPHA2]: ['workload'] }));
   });
 
   it('is empty while nothing is selected, without probing', () => {

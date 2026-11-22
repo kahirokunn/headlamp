@@ -17,7 +17,14 @@
 import { addBackstageAuthHeaders } from '../../../../helpers/addBackstageAuthHeaders';
 import { findKubeconfigByClusterName } from '../../../../stateless/findKubeconfigByClusterName';
 import { getUserIdFromLocalStorage } from '../../../../stateless/getUserIdFromLocalStorage';
+import { getDiscoveredConnectionRevision } from '../v2/discoveredConnectionRevisions';
+import {
+  assertCurrentDiscoveryConnection,
+  getRoutingRevision,
+  withDiscoveryConnectionRevision,
+} from '../v2/discoveryConnection';
 import { clusterFetch } from '../v2/fetch';
+import { makeUrl } from '../v2/makeUrl';
 import { JSON_HEADERS } from './constants';
 
 export interface PortForward {
@@ -27,10 +34,15 @@ export interface PortForward {
   serviceNamespace: string;
   namespace: string;
   cluster: string;
+  connectionRevision?: string;
   port: string;
   targetPort: string;
   status?: string;
   error?: string;
+}
+
+export function isPortForwardOnConnection(forward: PortForward, revision?: string) {
+  return (forward.connectionRevision || undefined) === (getRoutingRevision(revision) || undefined);
 }
 
 export interface PortForwardRequest {
@@ -70,33 +82,38 @@ export async function startPortForward(
   address: string = '',
   id: string = ''
 ): Promise<PortForward> {
-  const kubeconfig = await findKubeconfigByClusterName(cluster);
-  const headers = new Headers(addBackstageAuthHeaders(JSON_HEADERS));
+  return startPortForwardForConnection(
+    { cluster, revision: getDiscoveredConnectionRevision(cluster) },
+    {
+      id,
+      namespace,
+      pod: podname,
+      service,
+      serviceNamespace,
+      targetPort: containerPort.toString(),
+      port,
+      address,
+    }
+  );
+}
 
-  // This means cluster is dynamically configured.
-  if (kubeconfig !== null) {
-    headers.set('X-HEADLAMP-USER-ID', getUserIdFromLocalStorage());
-  }
-  const trimmedPort = port?.trim();
-  const normalizedPort =
-    trimmedPort && /^[0-9]+$/.test(trimmedPort) ? String(Number(trimmedPort)) : port;
-
-  const request: PortForwardRequest = {
-    namespace,
-    pod: podname,
-    service,
-    targetPort: containerPort.toString(),
-    serviceNamespace,
-    id: id,
-    address,
-    port: normalizedPort,
-  };
-  return clusterFetch('/portforward', {
-    method: 'POST',
-    headers: headers,
-    body: JSON.stringify(request),
-    cluster,
-  }).then(async (response: Response) => {
+export async function startPortForwardForConnection(
+  { cluster, revision }: { cluster: string; revision?: string },
+  request: PortForwardRequest
+): Promise<PortForward> {
+  const headers = await portForwardHeaders(cluster, revision);
+  const trimmedPort = request.port?.trim();
+  const port =
+    trimmedPort && /^[0-9]+$/.test(trimmedPort) ? String(Number(trimmedPort)) : request.port;
+  const url = makeUrl('/portforward', withDiscoveryConnectionRevision({}, revision));
+  try {
+    const response = await clusterFetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ ...request, port }),
+      cluster,
+      expectedDiscoveryConnection: { revision },
+    });
     const contentType = response.headers.get('content-type');
 
     // Check if the response is JSON
@@ -120,7 +137,9 @@ export async function startPortForward(
         throw new Error('Invalid response format from server');
       }
     }
-  });
+  } finally {
+    assertCurrentDiscoveryConnection(cluster, revision);
+  }
 }
 
 // @todo: stopOrDelete true is confusing, rename this param to justStop?
@@ -139,29 +158,24 @@ export async function stopOrDeletePortForward(
   id: string,
   stopOrDelete: boolean = true
 ): Promise<string> {
-  const kubeconfig = await findKubeconfigByClusterName(cluster);
-  const headers = new Headers(addBackstageAuthHeaders(JSON_HEADERS));
-
-  // This means cluster is dynamically configured.
-  if (kubeconfig !== null) {
-    headers.set('X-HEADLAMP-USER-ID', getUserIdFromLocalStorage());
-  }
-
-  return clusterFetch(`/portforward`, {
-    method: 'DELETE',
-    headers: headers,
-    body: JSON.stringify({
-      id,
-      stopOrDelete,
-    }),
-    cluster,
-  }).then(async response => {
+  const revision = getDiscoveredConnectionRevision(cluster);
+  const headers = await portForwardHeaders(cluster, revision);
+  try {
+    const response = await clusterFetch('/portforward', {
+      method: 'DELETE',
+      headers,
+      body: JSON.stringify({ id, stopOrDelete }),
+      cluster,
+      expectedDiscoveryConnection: { revision },
+    });
     const text = await response.text();
     if (!response.ok) {
       throw new Error(text || 'Error deleting port forward');
     }
     return text;
-  });
+  } finally {
+    assertCurrentDiscoveryConnection(cluster, revision);
+  }
 }
 
 /**
@@ -172,16 +186,28 @@ export async function stopOrDeletePortForward(
  * @returns the list of port forwards for the cluster.
  */
 export async function listPortForward(cluster: string): Promise<PortForward[]> {
+  const revision = getDiscoveredConnectionRevision(cluster);
+  const headers = await portForwardHeaders(cluster, revision);
+  try {
+    const response = await clusterFetch('/portforward/list', {
+      headers,
+      cluster,
+      expectedDiscoveryConnection: { revision },
+    });
+    return await response.json();
+  } finally {
+    assertCurrentDiscoveryConnection(cluster, revision);
+  }
+}
+
+async function portForwardHeaders(cluster: string, revision?: string) {
   const kubeconfig = await findKubeconfigByClusterName(cluster);
+  assertCurrentDiscoveryConnection(cluster, revision);
   const headers = new Headers(addBackstageAuthHeaders(JSON_HEADERS));
 
-  // This means cluster is dynamically configured.
   if (kubeconfig !== null) {
-    headers.set('X-HEADLAMP-USER-ID', getUserIdFromLocalStorage());
+    headers.set('X-HEADLAMP-USER-ID', getUserIdFromLocalStorage(revision));
   }
 
-  return clusterFetch(`/portforward/list`, {
-    headers: headers,
-    cluster,
-  }).then(response => response.json());
+  return headers;
 }

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import { inheritResourceConnection } from './api/v2/discoveryConnection';
 import type { KubeMetadata } from './KubeMetadata';
 import { KubeObject, type KubeObjectClass, type KubeObjectInterface } from './KubeObject';
 import { ResourceClasses } from './resourceClasses';
@@ -385,7 +386,7 @@ class HPA extends KubeObject<KubeHPA> {
       );
     }
 
-    return objInstance;
+    return objInstance && inheritResourceConnection(objInstance, this);
   }
 }
 

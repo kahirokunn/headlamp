@@ -107,7 +107,10 @@ describe('DeviceClass', () => {
       mockRequest.mockResolvedValue({ resources: [{ name: 'deviceclasses' }] });
 
       await expect(DeviceClass.isEnabled('dra')).resolves.toBe(true);
-      expect(mockRequest).toHaveBeenCalledWith('/apis/resource.k8s.io/v1', { cluster: 'dra' });
+      expect(mockRequest).toHaveBeenCalledWith('/apis/resource.k8s.io/v1', {
+        cluster: 'dra',
+        expectedDiscoveryConnection: { revision: undefined },
+      });
     });
 
     it('is false when the cluster does not serve the DRA API', async () => {

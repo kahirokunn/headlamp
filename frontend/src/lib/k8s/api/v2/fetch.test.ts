@@ -19,7 +19,9 @@ import { afterEach, beforeEach, describe, expect, it, Mock, vi } from 'vitest';
 import { setBackendToken } from '../../../../helpers/getHeadlampAPIHeaders';
 import { findKubeconfigByClusterName } from '../../../../stateless/findKubeconfigByClusterName';
 import { getUserIdFromLocalStorage } from '../../../../stateless/getUserIdFromLocalStorage';
+import * as importKey from '../../../../stateless/importRevisionKey';
 import { getClusterAuthType } from '../../clusterAuthType';
+import * as discoveredRevisions from './discoveredConnectionRevisions';
 import { BASE_HTTP_URL, clusterFetch } from './fetch';
 
 vi.mock('../../../auth', () => ({
@@ -72,11 +74,125 @@ describe('clusterFetch', () => {
     expect(responseBody).toEqual(mockResponse);
   });
 
+  it('checks the local connection again after looking up kubeconfig', async () => {
+    const revision = vi
+      .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+      .mockReturnValue('same:1');
+    const lookup = Promise.withResolvers<string>();
+    vi.mocked(findKubeconfigByClusterName).mockReturnValueOnce(lookup.promise);
+    const request = nock(BASE_HTTP_URL).post(`/clusters/${clusterName}${testUrl}`).reply(200, {});
+    try {
+      const response = clusterFetch(testUrl, {
+        cluster: clusterName,
+        method: 'POST',
+        expectedDiscoveryConnection: { revision: 'same:1' },
+      });
+      revision.mockReturnValue('same:2');
+      lookup.resolve(kubeconfig);
+
+      await expect(response).rejects.toMatchObject({ status: 409 });
+      expect(request.isDone()).toBe(false);
+    } finally {
+      revision.mockRestore();
+    }
+  });
+
+  it('does not send a write when the connection changes during import-key lookup', async () => {
+    const lookup = Promise.withResolvers<string>();
+    const started = Promise.withResolvers<void>();
+    const key = vi.spyOn(importKey, 'getImportRevisionKey').mockImplementationOnce(() => {
+      started.resolve();
+      return lookup.promise;
+    });
+    const revision = vi
+      .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+      .mockReturnValue('same:1');
+    const upstream = nock(BASE_HTTP_URL).post(`/clusters/${clusterName}${testUrl}`).reply(200, {});
+    try {
+      const response = clusterFetch(testUrl, { cluster: clusterName, method: 'POST' });
+      await started.promise;
+      revision.mockReturnValue('same:2');
+      lookup.resolve('key');
+      await expect(response).rejects.toMatchObject({ status: 409 });
+      expect(upstream.isDone()).toBe(false);
+    } finally {
+      key.mockRestore();
+      revision.mockRestore();
+    }
+  });
+
+  it('keeps an ordinary request bound while looking up its kubeconfig', async () => {
+    const revision = vi
+      .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+      .mockReturnValue(undefined);
+    const lookup = Promise.withResolvers<null>();
+    vi.mocked(findKubeconfigByClusterName).mockReturnValueOnce(lookup.promise);
+    const upstream = nock(BASE_HTTP_URL).get(`/clusters/${clusterName}${testUrl}`).reply(200, {});
+    try {
+      const response = clusterFetch(testUrl, { cluster: clusterName });
+      revision.mockReturnValue('replacement:1');
+      lookup.resolve(null);
+      await expect(response).rejects.toMatchObject({ status: 409 });
+      expect(upstream.isDone()).toBe(false);
+    } finally {
+      revision.mockRestore();
+    }
+  });
+
+  it('returns an accepted write when its connection is replaced during the request', async () => {
+    const revision = vi
+      .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+      .mockReturnValue(undefined);
+    try {
+      nock(BASE_HTTP_URL)
+        .post(`/clusters/${clusterName}${testUrl}`)
+        .reply(() => {
+          revision.mockReturnValue('replacement:1');
+          return [202, {}];
+        });
+      const result = await clusterFetch(testUrl, { cluster: clusterName, method: 'POST' });
+      expect(result.status).toBe(202);
+    } finally {
+      revision.mockRestore();
+    }
+  });
+
+  it('rejects a successful GET if its connection changed after dispatch', async () => {
+    const revision = vi
+      .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+      .mockReturnValue('first:1');
+    try {
+      nock(BASE_HTTP_URL)
+        .get(`/clusters/${clusterName}${testUrl}`)
+        .query(true)
+        .reply(() => {
+          revision.mockReturnValue('replacement:2');
+          return [200, {}];
+        });
+      await expect(clusterFetch(testUrl, { cluster: clusterName })).rejects.toMatchObject({
+        status: 409,
+      });
+    } finally {
+      revision.mockRestore();
+    }
+  });
+
+  it('identifies an ordinary connection to the backend', async () => {
+    nock(BASE_HTTP_URL)
+      .get(`/clusters/${clusterName}${testUrl}`)
+      .matchHeader('X-Headlamp-Connection-Revision', 'unversioned')
+      .reply(200, mockResponse);
+
+    await expect(clusterFetch(testUrl, { cluster: clusterName })).resolves.toBeDefined();
+  });
+
   it('does not add backend credentials to non-cluster requests', async () => {
     let backendTokenHeader: string | string[] | undefined;
+    let importKeyHeader: string | string[] | undefined;
     nock(BASE_HTTP_URL)
       .get(testUrl)
       .reply(function () {
+        importKeyHeader = this.req.headers['x-headlamp-import-key'];
         backendTokenHeader = this.req.headers['x-headlamp_backend-token'];
         return [200, mockResponse];
       });
@@ -84,12 +200,14 @@ describe('clusterFetch', () => {
     await clusterFetch(testUrl, { cluster: '' });
 
     expect(backendTokenHeader).toBeUndefined();
+    expect(importKeyHeader).toBeUndefined();
   });
 
   it('Sets KUBECONFIG and X-HEADLAMP-USER-ID headers if kubeconfig exists', async () => {
     nock(BASE_HTTP_URL)
       .get(`/clusters/${clusterName}${testUrl}`)
       .matchHeader('KUBECONFIG', kubeconfig)
+      .matchHeader('X-Headlamp-Import-Key', /^[0-9a-f]{64}$/)
       .matchHeader('X-HEADLAMP-USER-ID', userID)
       .matchHeader('X-HEADLAMP_BACKEND-TOKEN', 'desktop-token')
       .reply(200, mockResponse);

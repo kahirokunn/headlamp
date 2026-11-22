@@ -101,7 +101,10 @@ describe('ResourcePoolStatusRequest', () => {
   it('is served only when its alpha version lists it', async () => {
     mockRequest.mockResolvedValueOnce({ resources: [{ name: 'resourcepoolstatusrequests' }] });
     await expect(ResourcePoolStatusRequest.isEnabled(cluster)).resolves.toBe(true);
-    expect(mockRequest).toHaveBeenCalledWith('/apis/resource.k8s.io/v1alpha3', { cluster });
+    expect(mockRequest).toHaveBeenCalledWith('/apis/resource.k8s.io/v1alpha3', {
+      cluster,
+      expectedDiscoveryConnection: { revision: undefined },
+    });
 
     mockRequest.mockRejectedValueOnce(new Error('Not found'));
     await expect(ResourcePoolStatusRequest.isEnabled(cluster)).resolves.toBe(false);

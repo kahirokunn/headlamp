@@ -14,22 +14,26 @@
  * limitations under the License.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import App from '../../App';
-import HPA from './hpa';
+import * as discoveredRevisions from './api/v2/discoveredConnectionRevisions';
+import Event from './event';
+import HPA, { type KubeHPA } from './hpa';
 
 // cyclic imports fix
 // eslint-disable-next-line no-unused-vars
 const _dont_delete_me = App;
 
 describe('HPA class', () => {
-  const mockHpaData = {
+  const mockHpaData: KubeHPA = {
     apiVersion: 'autoscaling/v2',
     kind: 'HorizontalPodAutoscaler',
     metadata: {
       name: 'test-hpa',
       namespace: 'default',
       resourceVersion: '123',
+      uid: 'hpa-uid',
+      creationTimestamp: '2020-01-01T00:00:00Z',
     },
     spec: {
       maxReplicas: 10,
@@ -71,6 +75,23 @@ describe('HPA class', () => {
       ],
     },
   };
+
+  it('keeps the original connection when resolving a retained autoscaler target', async () => {
+    const revision = vi
+      .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+      .mockReturnValue('old:1');
+    try {
+      const hpa = new HPA(structuredClone(mockHpaData), 'east');
+      revision.mockReturnValue('new:2');
+
+      const target = hpa.referenceObject!;
+      expect(target.cluster).toBe('east');
+      await expect(target.delete()).rejects.toMatchObject({ status: 409 });
+      await expect(Event.objectEvents(target)).rejects.toMatchObject({ status: 409 });
+    } finally {
+      revision.mockRestore();
+    }
+  });
 
   it('correctly handles averageUtilization of 0 in metrics', () => {
     const data = JSON.parse(JSON.stringify(mockHpaData));

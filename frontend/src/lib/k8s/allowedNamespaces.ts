@@ -21,7 +21,11 @@ import {
   loadResolvedAllowedNamespaces,
   storeResolvedAllowedNamespaces,
 } from '../../helpers/clusterSettings';
-import type { ApiError } from './api/v2/ApiError';
+import { type ApiError, ListWatchError } from './api/v2/ApiError';
+import {
+  getDiscoveredConnectionRevision,
+  useDiscoveredConnectionRevisions,
+} from './api/v2/discoveredConnectionRevisions';
 import Namespace from './namespace';
 
 function sortedNamespaceNames(items: Namespace[] | null): string[] {
@@ -37,7 +41,7 @@ function sameNamespaces(a: string[], b: string[]): boolean {
 
 /**
  * Resolves the namespaces matching a cluster's label selector and keeps the
- * localStorage cache read by getCombinedAllowedNamespaces in sync.
+ * cache read by getCombinedAllowedNamespaces in sync.
  *
  * The resolution goes through Namespace.useList so it benefits from react-query
  * caching, retry and websocket watching. Because the query is keyed on the
@@ -60,16 +64,19 @@ export function useAllowedNamespacesFromSelector(
 ): { namespaces: string[]; isFetching: boolean; isSuccess: boolean; error: ApiError | null } {
   const trimmedSelector = (selector ?? '').trim();
   const enabled = Boolean(cluster && trimmedSelector);
+  const revision = useDiscoveredConnectionRevisions().get(cluster);
 
   const { items, error, isError, isFetching } = Namespace.useList({
     clusters: enabled ? [cluster] : [],
     labelSelector: enabled ? trimmedSelector : undefined,
   });
+  // A rejected watch does not invalidate the namespaces returned by LIST.
+  const resolutionFailed = isError && !(error instanceof ListWatchError);
 
   const namespaces = React.useMemo(() => sortedNamespaceNames(items), [items]);
 
   React.useEffect(() => {
-    if (!cluster) {
+    if (!cluster || getDiscoveredConnectionRevision(cluster) !== revision) {
       return;
     }
     // No selector: drop any list left over from a previously configured one.
@@ -78,7 +85,7 @@ export function useAllowedNamespacesFromSelector(
       return;
     }
     // Failed resolution (after retries): fail closed rather than keep a stale list.
-    if (isError) {
+    if (resolutionFailed) {
       clearResolvedAllowedNamespaces(cluster);
       return;
     }
@@ -93,12 +100,12 @@ export function useAllowedNamespacesFromSelector(
     if (changed || isResolvedAllowedNamespacesStale(cluster)) {
       storeResolvedAllowedNamespaces(cluster, trimmedSelector, namespaces);
     }
-  }, [cluster, trimmedSelector, isError, items, namespaces]);
+  }, [cluster, revision, trimmedSelector, resolutionFailed, items, namespaces]);
 
   return {
     namespaces: enabled ? namespaces : [],
     isFetching: enabled && isFetching,
-    isSuccess: enabled && items !== null && !isError,
-    error: isError ? error : null,
+    isSuccess: enabled && items !== null && !resolutionFailed,
+    error: resolutionFailed ? error : null,
   };
 }

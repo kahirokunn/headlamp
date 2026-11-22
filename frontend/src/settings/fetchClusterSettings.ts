@@ -14,10 +14,15 @@
  * limitations under the License.
  */
 
-import { useQuery } from '@tanstack/react-query';
-import { useEffect, useMemo } from 'react';
+import { useQueries } from '@tanstack/react-query';
+import { useEffect } from 'react';
 import { useDispatch } from 'react-redux';
 import { decodeBase64 } from '../helpers/base64';
+import {
+  getDiscoveredConnectionRevision,
+  useDiscoveredConnectionRevisions,
+} from '../lib/k8s/api/v2/discoveredConnectionRevisions';
+import { assertCurrentDiscoveryConnection } from '../lib/k8s/api/v2/discoveryConnection';
 import { clusterFetch } from '../lib/k8s/api/v2/fetch';
 import { useTypedSelector } from '../redux/hooks';
 import type { SettingsSource } from './adminSettingsSlice';
@@ -67,7 +72,8 @@ function deepMerge(target: Record<string, any>, source: Record<string, any>): Re
  */
 export async function fetchSource(
   clusterName: string,
-  source: SettingsSource
+  source: SettingsSource,
+  revision?: string
 ): Promise<Record<string, any> | null> {
   const ns = source.namespace ?? 'headlamp-tools';
   const isSecret = source.type?.toLowerCase() === 'secret';
@@ -75,7 +81,11 @@ export async function fetchSource(
   const url = `/api/v1/namespaces/${ns}/${resourceType}/${source.name}`;
 
   try {
-    const response = await clusterFetch(url, { cluster: clusterName, method: 'GET' });
+    const response = await clusterFetch(url, {
+      cluster: clusterName,
+      method: 'GET',
+      expectedDiscoveryConnection: { revision },
+    });
     const resource = await response.json();
 
     let raw: string | undefined;
@@ -104,17 +114,20 @@ export async function fetchSource(
  */
 async function fetchClusterSources(
   clusterName: string,
-  sources: SettingsSource[]
+  sources: SettingsSource[],
+  revision?: string
 ): Promise<Record<string, any> | null> {
   let merged: Record<string, any> | null = null;
 
   for (const source of sources) {
-    const data = await fetchSource(clusterName, source);
+    assertCurrentDiscoveryConnection(clusterName, revision);
+    const data = await fetchSource(clusterName, source, revision);
     if (data !== null) {
       merged = merged ? deepMerge(merged, data) : structuredClone(data);
     }
   }
 
+  assertCurrentDiscoveryConnection(clusterName, revision);
   return merged;
 }
 
@@ -158,7 +171,11 @@ export async function fetchAllClusterSettings(
 
   const entries = await Promise.all(
     targets.map(async ({ clusterName, clusterSources }) => {
-      const data = await fetchClusterSources(clusterName, clusterSources);
+      const data = await fetchClusterSources(
+        clusterName,
+        clusterSources,
+        getDiscoveredConnectionRevision(clusterName)
+      );
       return data !== null ? ([clusterName, data] as const) : null;
     })
   );
@@ -181,21 +198,25 @@ export function useClusterDefinedSettings() {
   const dispatch = useDispatch();
   const sources = useTypedSelector(state => state.adminSettings.sources);
   const clusters = useTypedSelector(state => state.config.clusters);
+  const revisions = useDiscoveredConnectionRevisions();
+  const targets = resolveClusterNames(sources, Object.keys(clusters ?? {}));
 
-  const knownClusterNames = useMemo(() => (clusters ? Object.keys(clusters) : []), [clusters]);
-
-  const hasSources = Object.keys(sources).length > 0;
-
-  const { data } = useQuery({
-    queryKey: ['cluster-defined-settings', sources, knownClusterNames],
-    queryFn: () => fetchAllClusterSettings(sources, knownClusterNames),
-    enabled: hasSources && knownClusterNames.length > 0,
-    refetchInterval: REFETCH_INTERVAL,
+  const data = useQueries({
+    queries: targets.map(({ clusterName, clusterSources }) => {
+      const revision = revisions.get(clusterName);
+      return {
+        queryKey: ['cluster-defined-settings', clusterName, revision, clusterSources],
+        queryFn: () => fetchClusterSources(clusterName, clusterSources, revision),
+        refetchInterval: REFETCH_INTERVAL,
+      };
+    }),
+    combine: results =>
+      Object.fromEntries(
+        results.flatMap(({ data }, index) => (data ? [[targets[index].clusterName, data]] : []))
+      ),
   });
 
   useEffect(() => {
-    if (data) {
-      dispatch(setClusterSettings(data));
-    }
+    dispatch(setClusterSettings(data));
   }, [data, dispatch]);
 }

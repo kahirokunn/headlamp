@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+import { getDiscoveredConnectionRevision } from '../lib/k8s/api/v2/discoveredConnectionRevisions';
+import { resolvedAllowedNamespacesKey } from './resolvedAllowedNamespacesKey';
+
 /**
  * ClusterSettings defines the structure of the cluster settings object.
  */
@@ -49,6 +52,18 @@ export const DEFAULT_NODE_SHELL_LINUX_IMAGE = 'docker.io/library/busybox:latest'
 export const DEFAULT_NODE_SHELL_NAMESPACE = 'default';
 export const DEFAULT_POD_DEBUG_IMAGE = 'docker.io/library/busybox:latest';
 
+const namespaceSettingsChanged = 'headlamp:namespace-settings-changed';
+
+/** Observe namespace policy edits and selector results, including writes in another tab. */
+export function subscribeToNamespaceSettings(listener: () => void) {
+  window.addEventListener(namespaceSettingsChanged, listener);
+  window.addEventListener('storage', listener);
+  return () => {
+    window.removeEventListener(namespaceSettingsChanged, listener);
+    window.removeEventListener('storage', listener);
+  };
+}
+
 /**
  * Stores the cluster settings in local storage.
  *
@@ -61,6 +76,7 @@ export function storeClusterSettings(clusterName: string, settings: ClusterSetti
     return;
   }
   localStorage.setItem(`cluster_settings.${clusterName}`, JSON.stringify(settings));
+  window.dispatchEvent(new Event(namespaceSettingsChanged));
 }
 
 /**
@@ -88,10 +104,9 @@ export function loadClusterSettings(clusterName: string): ClusterSettings {
 }
 
 /**
- * Namespaces resolved from a cluster's allowedNamespacesSelector, cached in
- * localStorage. This is derived data (the source of truth is the API server), so
- * it lives under its own key instead of inside the user's cluster settings blob
- * and carries the selector it was resolved for plus a timestamp to signal staleness.
+ * Namespaces resolved from a cluster's allowedNamespacesSelector. Ordinary
+ * connections share the derived list through localStorage. Discovered connections
+ * keep it in memory because their connection generation is specific to this tab.
  */
 export interface ResolvedAllowedNamespacesCache {
   /** The label selector this list was resolved from. */
@@ -102,15 +117,16 @@ export interface ResolvedAllowedNamespacesCache {
   resolvedAt: number;
 }
 
+const discoveredNamespacesCache = new Map<
+  string,
+  { revision: string; entry: ResolvedAllowedNamespacesCache }
+>();
+
 /**
  * How long a resolved-namespaces cache entry is considered fresh. Past this age
  * it is treated as stale and refreshed the next time the selector is resolved.
  */
 export const ALLOWED_NAMESPACES_SELECTOR_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
-
-function resolvedAllowedNamespacesKey(clusterName: string): string {
-  return `cluster_allowed_namespaces_selector_cache.${clusterName}`;
-}
 
 /**
  * Loads the cached namespaces resolved from a cluster's label selector.
@@ -123,6 +139,11 @@ export function loadResolvedAllowedNamespaces(
 ): ResolvedAllowedNamespacesCache | null {
   if (!clusterName) {
     return null;
+  }
+  const revision = getDiscoveredConnectionRevision(clusterName);
+  if (revision !== undefined) {
+    const cached = discoveredNamespacesCache.get(clusterName);
+    return cached?.revision === revision ? cached.entry : null;
   }
   const raw = localStorage.getItem(resolvedAllowedNamespacesKey(clusterName));
   if (!raw) {
@@ -166,7 +187,18 @@ export function storeResolvedAllowedNamespaces(
     namespaces: [...new Set(namespaces)].sort(),
     resolvedAt: Date.now(),
   };
-  localStorage.setItem(resolvedAllowedNamespacesKey(clusterName), JSON.stringify(entry));
+  const revision = getDiscoveredConnectionRevision(clusterName);
+  if (revision !== undefined) {
+    for (const [name, cached] of discoveredNamespacesCache) {
+      if (cached.revision !== getDiscoveredConnectionRevision(name)) {
+        discoveredNamespacesCache.delete(name);
+      }
+    }
+    discoveredNamespacesCache.set(clusterName, { revision, entry });
+  } else {
+    localStorage.setItem(resolvedAllowedNamespacesKey(clusterName), JSON.stringify(entry));
+  }
+  window.dispatchEvent(new Event(namespaceSettingsChanged));
 }
 
 /**
@@ -178,7 +210,9 @@ export function clearResolvedAllowedNamespaces(clusterName: string) {
   if (!clusterName) {
     return;
   }
+  discoveredNamespacesCache.delete(clusterName);
   localStorage.removeItem(resolvedAllowedNamespacesKey(clusterName));
+  window.dispatchEvent(new Event(namespaceSettingsChanged));
 }
 
 /**

@@ -32,18 +32,26 @@
 
 import { afterEach, expect, it, vi } from 'vitest';
 import { getAppUrl } from '../helpers/getAppUrl';
+import { getDiscoveredConnectionRevision } from './k8s/api/v2/discoveredConnectionRevisions';
 import { backendFetch } from './k8s/api/v2/fetch';
 import { redirectToOIDCLogout } from './oidcLogout';
 
 vi.mock('../helpers/getAppUrl', () => ({ getAppUrl: vi.fn() }));
+vi.mock('./k8s/api/v2/discoveredConnectionRevisions', () => ({
+  getDiscoveredConnectionRevision: vi.fn(),
+}));
 vi.mock('./k8s/api/v2/fetch', () => ({ backendFetch: vi.fn() }));
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.mocked(getDiscoveredConnectionRevision).mockReset();
+});
 
 it('uses trusted desktop IPC rather than navigating the file renderer', async () => {
   const oidcLogout = vi.fn().mockResolvedValue(undefined);
   vi.stubGlobal('desktopApi', { oidcLogout });
+  vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('original:2');
   await redirectToOIDCLogout('team/cluster');
-  expect(oidcLogout).toHaveBeenCalledWith('team/cluster');
+  expect(oidcLogout).toHaveBeenCalledWith('team/cluster', 'original');
   expect(backendFetch).not.toHaveBeenCalled();
 });
 
@@ -60,6 +68,29 @@ it('resolves a backend-relative transition against the application backend origi
   expect(window.location.href).toBe(
     'https://headlamp.example/base/encoded-clusters/bWFpbg/oidc-logout/redirect?state=signed'
   );
+});
+
+it('ignores a provider redirect returned after the connection changed', async () => {
+  vi.stubGlobal('desktopApi', undefined);
+  vi.stubGlobal('location', { href: '' });
+  vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('original:1');
+  const redirect = Promise.withResolvers<Response>();
+  vi.mocked(backendFetch).mockReturnValueOnce(redirect.promise);
+
+  const pending = redirectToOIDCLogout('workload');
+  expect(backendFetch).toHaveBeenCalledWith(
+    '/encoded-clusters/d29ya2xvYWQ/oidc-logout',
+    expect.objectContaining({
+      headers: expect.objectContaining({ 'X-Headlamp-Connection-Revision': 'original' }),
+    })
+  );
+  vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('replacement:2');
+  redirect.resolve({
+    json: async () => ({ redirectURL: 'https://idp.example/logout' }),
+  } as Response);
+
+  await expect(pending).rejects.toMatchObject({ status: 409 });
+  expect(window.location.href).toBe('');
 });
 
 it('rejects redirect URLs with unsupported protocols', async () => {

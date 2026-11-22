@@ -17,10 +17,11 @@
 import { useQuery } from '@tanstack/react-query';
 import { useMemo } from 'react';
 import { useSelectedClusters } from '.';
-import { request } from './api/v1/clusterRequests';
+import { useDiscoveredConnectionRevisions } from './api/v2/discoveredConnectionRevisions';
 import CompositePodGroup from './compositePodGroup';
 import type { KubeObject, KubeObjectClass } from './KubeObject';
 import PodGroup from './podGroup';
+import { getServedResourceVersion } from './resourceAvailability';
 import SchedulingWorkload from './schedulingWorkload';
 
 /** The selected clusters that serve a resource, keyed by the group version each serves. */
@@ -31,45 +32,23 @@ const NO_CLUSTERS: string[] = [];
 const NO_ITEMS: KubeObject[] = [];
 
 /**
- * The newest of a class's declared versions that a cluster serves the resource under.
- *
- * Each version's discovery document is asked directly, because discovery only reports the
- * preferred version of a group and scheduling.k8s.io also serves v1.
- * @param cluster - The cluster to check.
- * @param resourceClass - The class whose declared versions are tried, newest first.
- * @returns The version, or undefined when the cluster serves none of them.
- */
-async function getServedVersion(
-  cluster: string,
-  resourceClass: KubeObjectClass
-): Promise<string | undefined> {
-  const { apiVersion, apiName } = resourceClass;
-  for (const version of Array.isArray(apiVersion) ? apiVersion : [apiVersion]) {
-    try {
-      const response = await request(`/apis/${version}`, { cluster });
-      if (response?.resources?.some((resource: { name?: string }) => resource.name === apiName)) {
-        return version;
-      }
-    } catch {
-      continue;
-    }
-  }
-  return undefined;
-}
-
-/**
  * The selected clusters that serve a resource, grouped by the version each serves it under.
  * @param resourceClass - The class whose declared versions are probed.
  * @returns The serving clusters per version, empty while none is known.
  */
 function useClustersByVersion(resourceClass: KubeObjectClass): ClustersByVersion {
   const selectedClusters = useSelectedClusters();
+  const revisions = useDiscoveredConnectionRevisions();
+  const connections = selectedClusters.map(cluster => [cluster, revisions.get(cluster)] as const);
+  const { apiName, apiVersion } = resourceClass;
 
   const { data: clustersByVersion = NO_VERSIONS } = useQuery({
-    queryKey: ['servedSchedulingVersions', resourceClass.apiName, ...selectedClusters],
+    queryKey: ['servedSchedulingVersions', apiName, ...connections],
     queryFn: async () => {
       const versions = await Promise.all(
-        selectedClusters.map(cluster => getServedVersion(cluster, resourceClass))
+        connections.map(([cluster, revision]) =>
+          getServedResourceVersion(cluster, apiVersion, apiName, { revision })
+        )
       );
       const byVersion: ClustersByVersion = {};
       selectedClusters.forEach((cluster, index) => {

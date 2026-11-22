@@ -24,7 +24,17 @@ import { storeStatelessClusterKubeconfig } from '../../../../stateless';
 import { deleteClusterKubeconfig } from '../../../../stateless/deleteClusterKubeconfig';
 import { findKubeconfigByClusterName } from '../../../../stateless/findKubeconfigByClusterName';
 import { getUserIdFromLocalStorage } from '../../../../stateless/getUserIdFromLocalStorage';
+import { assertUnambiguousImport, importedClusterFromRecord } from '../../../../stateless/records';
+import { retireImportedConnection } from '../../../../stateless/retireConnections';
+import { rollbackKubeconfigImport } from '../../../../stateless/rollbackKubeconfigImport';
 import { getCluster, getSelectedClusters } from '../../../cluster';
+import type { Cluster } from '../../cluster';
+import { getDiscoveredConnectionRevision } from '../v2/discoveredConnectionRevisions';
+import {
+  assertCurrentDiscoveryConnection,
+  type DiscoveryConnectionRequest,
+  isDiscoveryConnectionChanged,
+} from '../v2/discoveryConnection';
 import type { ClusterRequest } from './clusterRequests';
 import { clusterRequest, post, request } from './clusterRequests';
 import { JSON_HEADERS } from './constants';
@@ -33,14 +43,26 @@ import { JSON_HEADERS } from './constants';
  * Test authentication for the given cluster.
  * Will throw an error if the user is not authenticated.
  */
-export async function testAuth(cluster = '', namespace = 'default') {
+export async function testAuth(
+  cluster = '',
+  namespace = 'default',
+  expectedConnection?: DiscoveryConnectionRequest
+) {
   const spec = { namespace };
   const clusterName = cluster || getCluster();
+  const connection = expectedConnection ?? {
+    revision: clusterName ? getDiscoveredConnectionRevision(clusterName) : undefined,
+  };
 
-  return post('/apis/authorization.k8s.io/v1/selfsubjectrulesreviews', { spec }, false, {
-    timeout: 5 * 1000,
-    cluster: clusterName,
-  });
+  try {
+    return await post('/apis/authorization.k8s.io/v1/selfsubjectrulesreviews', { spec }, false, {
+      timeout: 5 * 1000,
+      cluster: clusterName,
+      expectedDiscoveryConnection: connection,
+    });
+  } finally {
+    assertCurrentDiscoveryConnection(clusterName ?? undefined, connection.revision);
+  }
 }
 
 /**
@@ -65,18 +87,27 @@ export interface ClusterUserInfo {
  * @param cluster - The name of the cluster (optional).
  * @returns Promise resolving to user info
  */
-export async function getClusterUserInfo(cluster = ''): Promise<ClusterUserInfo> {
+export async function getClusterUserInfo(
+  cluster = '',
+  expectedConnection?: DiscoveryConnectionRequest
+): Promise<ClusterUserInfo> {
   const clusterName = cluster || getCluster() || '';
 
   if (!clusterName) {
     return { username: 'unknown' };
   }
+  const connection = expectedConnection ?? {
+    revision: getDiscoveredConnectionRevision(clusterName),
+  };
+  const options = {
+    timeout: 5 * 1000,
+    cluster: clusterName,
+    expectedDiscoveryConnection: connection,
+  };
 
   try {
-    const res = await clusterRequest('/me', {
-      timeout: 5 * 1000,
-      cluster: clusterName,
-    });
+    const res = await clusterRequest('/me', options);
+    assertCurrentDiscoveryConnection(clusterName, connection.revision);
     if (res && res.username) {
       return {
         username: res.username,
@@ -84,11 +115,13 @@ export async function getClusterUserInfo(cluster = ''): Promise<ClusterUserInfo>
       };
     }
   } catch (error) {
+    if (isDiscoveryConnectionChanged(error)) throw error;
     if (isDebugVerbose('k8s/api/v1/clusterApi@getClusterUserInfo')) {
       console.debug('Failed to get user info from /me for cluster', clusterName, error);
     }
   }
 
+  assertCurrentDiscoveryConnection(clusterName, connection.revision);
   try {
     // Try SelfSubjectReview API (available in K8s 1.28+)
     const response = await post(
@@ -98,12 +131,10 @@ export async function getClusterUserInfo(cluster = ''): Promise<ClusterUserInfo>
         kind: 'SelfSubjectReview',
       },
       false,
-      {
-        timeout: 5 * 1000,
-        cluster: clusterName,
-      }
+      options
     );
 
+    assertCurrentDiscoveryConnection(clusterName, connection.revision);
     if (response?.status?.userInfo) {
       return response.status.userInfo;
     }
@@ -111,6 +142,8 @@ export async function getClusterUserInfo(cluster = ''): Promise<ClusterUserInfo>
     // Fallback: return cluster name as username
     return { username: clusterName };
   } catch (error) {
+    if (isDiscoveryConnectionChanged(error)) throw error;
+    assertCurrentDiscoveryConnection(clusterName, connection.revision);
     // If SelfSubjectReview is not available, return cluster name
     if (isDebugVerbose('k8s/api/v1/clusterApi@getClusterUserInfo')) {
       console.debug('SelfSubjectReview not available for cluster', clusterName, error);
@@ -135,27 +168,48 @@ export async function testClusterHealth(cluster?: string) {
   return Promise.all(healthChecks);
 }
 
+async function parseAndStoreKubeconfig(kubeconfig: string, pending: boolean) {
+  const headers = addBackstageAuthHeaders(JSON_HEADERS);
+  const parsed = await request(
+    '/parseKubeConfig',
+    {
+      method: 'POST',
+      body: JSON.stringify({ kubeconfigs: [kubeconfig] }),
+      headers: { ...headers, ...getHeadlampAPIHeaders() },
+    },
+    false,
+    false
+  );
+  assertUnambiguousImport(parsed);
+  if (pending && !parsed?.clusters?.length) throw new Error('No clusters found in kubeconfig');
+
+  let recordId: number | undefined;
+  const onStored = (id: number) => {
+    recordId = id;
+  };
+  if (pending) {
+    await storeStatelessClusterKubeconfig(kubeconfig, onStored, true);
+  } else {
+    await storeStatelessClusterKubeconfig(kubeconfig, onStored);
+  }
+  return {
+    ...parsed,
+    clusters: parsed?.clusters?.map((cluster: Cluster) =>
+      importedClusterFromRecord(cluster, recordId)
+    ),
+    ...(pending ? { pendingRecordId: recordId } : {}),
+  };
+}
+
+export function stageClusterImport(kubeconfig: string) {
+  return parseAndStoreKubeconfig(kubeconfig, true);
+}
+
 export async function setCluster(clusterReq: ClusterRequest) {
   const kubeconfig = clusterReq.kubeconfig;
+  if (kubeconfig) return parseAndStoreKubeconfig(kubeconfig, false);
+
   const headers = addBackstageAuthHeaders(JSON_HEADERS);
-
-  if (kubeconfig) {
-    await storeStatelessClusterKubeconfig(kubeconfig);
-    return request(
-      '/parseKubeConfig',
-      {
-        method: 'POST',
-        body: JSON.stringify({ kubeconfigs: [kubeconfig] }),
-        headers: {
-          ...headers,
-          ...getHeadlampAPIHeaders(),
-        },
-      },
-      false,
-      false
-    );
-  }
-
   return request(
     '/cluster',
     {
@@ -207,9 +261,21 @@ export async function deleteCluster(
   }
 
   if (cluster) {
-    const kubeconfig = await findKubeconfigByClusterName(cluster, clusterID);
+    const revision = getDiscoveredConnectionRevision(cluster);
+    const selected = store.getState().config.statelessClusters?.[cluster];
+    const recordId = selected?.kubeconfigRecordId;
+    const kubeconfig = await findKubeconfigByClusterName(cluster, clusterID, recordId);
+    assertCurrentDiscoveryConnection(cluster, revision);
     if (kubeconfig !== null) {
-      await deleteClusterKubeconfig(cluster, clusterID);
+      await retireImportedConnection(selected);
+      assertCurrentDiscoveryConnection(cluster, revision);
+      try {
+        await deleteClusterKubeconfig(cluster, clusterID, recordId);
+      } catch (error) {
+        await rollbackKubeconfigImport(undefined, [selected]);
+        throw error;
+      }
+      assertCurrentDiscoveryConnection(cluster, revision);
       window.location.reload();
       return { clusters: {} };
     }
@@ -278,12 +344,15 @@ export async function renameCluster(
   /** The ID for a cluster, composed of the kubeconfig path and cluster name */
   clusterID?: string
 ) {
+  const revision = getDiscoveredConnectionRevision(cluster);
+  const selectedImport = store.getState().config.statelessClusters?.[cluster];
   let stateless = false;
   let kubeconfig;
   let renameURL = `/cluster/${cluster}`;
 
   if (cluster) {
     kubeconfig = await findKubeconfigByClusterName(cluster, clusterID);
+    assertCurrentDiscoveryConnection(cluster, revision);
 
     renameURL = `/cluster/${cluster}`;
 
@@ -294,20 +363,28 @@ export async function renameCluster(
 
   const headers = addBackstageAuthHeaders(JSON_HEADERS);
 
-  return request(
-    renameURL,
-    {
-      method: 'PUT',
-      headers: {
-        ...headers,
-        ...getHeadlampAPIHeaders(),
-        ...(stateless ? { 'X-HEADLAMP-USER-ID': getUserIdFromLocalStorage() } : {}),
+  try {
+    return await request(
+      renameURL,
+      {
+        method: 'PUT',
+        headers: {
+          ...headers,
+          ...getHeadlampAPIHeaders(),
+          ...(stateless ? { 'X-HEADLAMP-USER-ID': getUserIdFromLocalStorage(revision) } : {}),
+        },
+        body: JSON.stringify({ newClusterName, source, stateless }),
       },
-      body: JSON.stringify({ newClusterName, source, stateless }),
-    },
-    false,
-    false
-  );
+      false,
+      false
+    );
+  } catch (error) {
+    const status = (error as { status?: number } | null)?.status;
+    if (stateless && (status === undefined || status === 408 || status >= 500)) {
+      await rollbackKubeconfigImport(undefined, [selectedImport]);
+    }
+    throw error;
+  }
 }
 
 /**

@@ -238,6 +238,14 @@ export const initialState: ConfigState = {
   userSettings: storedSettings,
 };
 
+export function getEffectiveCluster(config: ConfigState, clusterName: string) {
+  return (
+    config.statelessClusters?.[clusterName] ??
+    config.clusters?.[clusterName] ??
+    config.allClusters?.[clusterName]
+  );
+}
+
 const configSlice = createSlice({
   name: 'config',
   initialState,
@@ -305,6 +313,11 @@ const configSlice = createSlice({
     ) {
       state.statelessClusters = action.payload.statelessClusters;
     },
+    setClusterUseToken(state, action: PayloadAction<{ clusterName: string; useToken: boolean }>) {
+      const { clusterName, useToken } = action.payload;
+      const cluster = getEffectiveCluster(state, clusterName);
+      if (cluster) cluster.useToken = useToken;
+    },
     /**
      * Save the settings. To both the store, and localStorage.
      * @param state - The current state.
@@ -320,6 +333,7 @@ const configSlice = createSlice({
   },
 });
 
-export const { setConfig, setAppSettings, setStatelessConfig } = configSlice.actions;
+export const { setConfig, setAppSettings, setStatelessConfig, setClusterUseToken } =
+  configSlice.actions;
 
 export default configSlice.reducer;

@@ -23,6 +23,7 @@ import { afterEach, beforeEach, vi } from 'vitest';
 import { createRouteURL } from '../router/createRouteURL';
 import { labelSelectorToQuery, ResourceClasses, useClustersVersion } from '.';
 import { clusterRequest } from './api/v1/clusterRequests';
+import * as discoveredConnections from './api/v2/discoveredConnectionRevisions';
 import { Cluster, LabelSelector } from './cluster';
 import { KubeObjectClass } from './KubeObject';
 import Namespace from './namespace';
@@ -279,6 +280,26 @@ describe('useClustersVersion', () => {
 
     expect(result.current[0]).toEqual({ available: { gitVersion: 'v1.32.0' } });
     expect(result.current[1].available).toBeNull();
+  });
+
+  test('refreshes versions when the selected name now identifies another connection', async () => {
+    const revisions = vi
+      .spyOn(discoveredConnections, 'useDiscoveredConnectionRevisions')
+      .mockReturnValue(new Map([['workload', 'original:1']]));
+    const request = vi.mocked(clusterRequest).mockResolvedValue({ gitVersion: 'v1.31.0' });
+    const clusters = [{ name: 'workload' }] as Cluster[];
+    const { result, rerender } = renderHook(() => useClustersVersion(clusters), { wrapper });
+    await waitFor(() => expect(result.current[0].workload).toEqual({ gitVersion: 'v1.31.0' }));
+
+    revisions.mockReturnValue(new Map([['workload', 'replacement:2']]));
+    request.mockResolvedValue({ gitVersion: 'v1.34.0' });
+    rerender();
+
+    await waitFor(() => expect(result.current[0].workload).toEqual({ gitVersion: 'v1.34.0' }));
+    expect(request).toHaveBeenLastCalledWith('/version', {
+      cluster: 'workload',
+      expectedDiscoveryConnection: { revision: 'replacement:2' },
+    });
   });
 
   test('pauses polling while hidden and refetches immediately when visible', async () => {

@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+import * as discoveredConnections from '../lib/k8s/api/v2/discoveredConnectionRevisions';
+import { setStatelessConfig } from '../redux/configSlice';
+import store from '../redux/stores/store';
 import {
   ALLOWED_NAMESPACES_SELECTOR_MAX_AGE_MS,
   clearResolvedAllowedNamespaces,
@@ -30,6 +33,25 @@ import {
 describe('clusterSettings', () => {
   beforeEach(() => {
     localStorage.clear();
+  });
+
+  it('requires a new namespace result when an ordinary connection returns after an import', () => {
+    const original = store.getState().config.statelessClusters;
+    try {
+      storeResolvedAllowedNamespaces('reused', 'visible=yes', ['old']);
+      store.dispatch(
+        setStatelessConfig({
+          statelessClusters: {
+            ...original,
+            reused: { name: 'reused', auth_type: 'token', importRevision: 'import-one' },
+          },
+        })
+      );
+      store.dispatch(setStatelessConfig({ statelessClusters: original }));
+      expect(loadResolvedAllowedNamespaces('reused')).toBeNull();
+    } finally {
+      store.dispatch(setStatelessConfig({ statelessClusters: original }));
+    }
   });
 
   describe('storeClusterSettings', () => {
@@ -201,6 +223,29 @@ describe('clusterSettings', () => {
   });
 
   describe('getCombinedAllowedNamespaces', () => {
+    it('considers only the current connection when the configured selector stays the same', () => {
+      const revision = vi
+        .spyOn(discoveredConnections, 'getDiscoveredConnectionRevision')
+        .mockReturnValue('original:1');
+      try {
+        storeClusterSettings('prod', {
+          allowedNamespaces: ['manual'],
+          allowedNamespacesSelector: 'team=frontend',
+        });
+        storeResolvedAllowedNamespaces('prod', 'team=frontend', ['original']);
+        expect(getCombinedAllowedNamespaces('prod')).toEqual(['manual', 'original']);
+
+        revision.mockReturnValue('replacement:2');
+        expect(getCombinedAllowedNamespaces('prod')).toEqual(['manual']);
+        expect(isResolvedAllowedNamespacesStale('prod')).toBe(true);
+
+        storeResolvedAllowedNamespaces('prod', 'team=frontend', ['replacement']);
+        expect(getCombinedAllowedNamespaces('prod')).toEqual(['manual', 'replacement']);
+      } finally {
+        revision.mockRestore();
+      }
+    });
+
     it('returns an empty list when nothing is configured', () => {
       expect(getCombinedAllowedNamespaces('prod')).toEqual([]);
     });

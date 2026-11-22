@@ -18,6 +18,10 @@ import { useMemo } from 'react';
 import { request } from './api/v1/clusterRequests';
 import type { QueryParameters } from './api/v1/queryParameters';
 import type { ApiError } from './api/v2/ApiError';
+import {
+  getResourceConnectionQuery,
+  inheritResourceConnection,
+} from './api/v2/discoveryConnection';
 import type { KubeMetadata } from './KubeMetadata';
 import type { KubeObjectClass } from './KubeObject';
 import { KubeObject } from './KubeObject';
@@ -170,9 +174,10 @@ class Event extends KubeObject<KubeEvent> {
       limit: this.maxLimit,
     };
 
-    const response = await request(path, { cluster }, true, true, queryParams);
+    const query = getResourceConnectionQuery(object, cluster, queryParams);
+    const response = await request(path, { cluster }, true, true, query);
 
-    return response.items;
+    return response.items.map((event: KubeEvent) => inheritResourceConnection(event, object));
   }
 
   get involvedObjectInstance(): KubeObject | null {
@@ -199,7 +204,7 @@ class Event extends KubeObject<KubeEvent> {
       );
     }
 
-    return objInstance;
+    return objInstance && inheritResourceConnection(objInstance, this);
   }
 }
 

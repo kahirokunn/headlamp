@@ -14,10 +14,10 @@
  * limitations under the License.
  */
 
-import { request } from './api/v1/clusterRequests';
 import type { KubeCondition } from './cluster';
 import type { KubeObjectInterface } from './KubeObject';
 import { KubeObject } from './KubeObject';
+import { isResourceServed } from './resourceAvailability';
 
 /**
  * Condition reporting whether the group's scheduling requirement has been satisfied.
@@ -166,17 +166,7 @@ export async function isSchedulingResourceServed(
   apiVersions: string[],
   apiName: string
 ): Promise<boolean> {
-  for (const version of apiVersions) {
-    try {
-      const response = await request(`/apis/${version}`, { cluster });
-      if (response?.resources?.some((resource: { name?: string }) => resource.name === apiName)) {
-        return true;
-      }
-    } catch {
-      continue;
-    }
-  }
-  return false;
+  return isResourceServed(cluster, apiVersions, apiName);
 }
 
 class PodGroup extends KubeObject<KubePodGroup> {

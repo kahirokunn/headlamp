@@ -22,6 +22,17 @@ import { getUserIdFromLocalStorage } from '../../../../stateless/getUserIdFromLo
 import { getCluster } from '../../../cluster';
 import type { KubeObjectInterface } from '../../KubeObject';
 import type { ApiError } from '../v2/ApiError';
+import {
+  getDiscoveredConnectionRevision,
+  getImportedConnectionRevision,
+} from '../v2/discoveredConnectionRevisions';
+import type { DiscoveryConnectionRequest } from '../v2/discoveryConnection';
+import {
+  assertCurrentDiscoveryConnection,
+  getDiscoveryRequestBinding,
+  isDiscoveryConnectionChanged,
+  withDiscoveryConnectionPath,
+} from '../v2/discoveryConnection';
 import { clusterRequest } from './clusterRequests';
 import { CLUSTERS_PREFIX } from './constants';
 import { asQuery, combinePath } from './formatUrl';
@@ -42,6 +53,15 @@ export type StreamUpdate<T = any> = {
 export type StreamResultsCb<T = any> = (data: T) => void;
 export type StreamUpdatesCb<T = any> = (data: T | StreamUpdate<T>) => void;
 export type StreamErrCb = (err: Error & { status?: number }, cancelStreamFunc?: () => void) => void;
+
+function streamRequestOptions(cluster: string, queryParams?: QueryParameters) {
+  return {
+    cluster,
+    expectedDiscoveryConnection: getDiscoveryRequestBinding(queryParams) ?? {
+      revision: getDiscoveredConnectionRevision(cluster),
+    },
+  };
+}
 
 /**
  * Fetches the data and watches for changes to the data.
@@ -65,6 +85,7 @@ export function streamResult<T extends KubeObjectInterface>(
   let isCancelled = false;
   let socket: ReturnType<typeof stream>;
   const clusterName = cluster || getCluster() || '';
+  const options = streamRequestOptions(clusterName, queryParams);
 
   if (isDebugVerbose('k8s/apiProxy@streamResult')) {
     console.debug('k8s/apiProxy@streamResult', { url, name, queryParams });
@@ -76,11 +97,10 @@ export function streamResult<T extends KubeObjectInterface>(
 
   async function run() {
     try {
-      const item = await clusterRequest(`${url}/${name}` + asQuery(queryParams), {
-        cluster: clusterName,
-      });
+      const item = await clusterRequest(`${url}/${name}` + asQuery(queryParams), options);
 
       if (isCancelled) return;
+      assertCurrentDiscoveryConnection(clusterName, options.expectedDiscoveryConnection.revision);
 
       if (isDebugVerbose('k8s/apiProxy@streamResult run cb(item)')) {
         console.debug('k8s/apiProxy@streamResult run cb(item)', { item });
@@ -95,7 +115,7 @@ export function streamResult<T extends KubeObjectInterface>(
         url +
         asQuery({ ...queryParams, ...{ watch: '1', fieldSelector: `metadata.name=${name}` } });
 
-      socket = stream(watchUrl, (x: any) => cb(x.object), { isJson: true, cluster: clusterName });
+      socket = stream(watchUrl, (x: any) => cb(x.object), { isJson: true, ...options });
     } catch (err) {
       console.error('Error in api request', { err, url });
       // @todo: sometimes errCb is {}, the typing for apiProxy needs improving.
@@ -159,6 +179,7 @@ export function streamResultsForCluster(
 ): Promise<() => void> {
   const { cb, errCb, cluster = '' } = params;
   const clusterName = cluster || getCluster() || '';
+  const options = streamRequestOptions(clusterName, queryParams);
 
   const results: Record<string, any> = {};
   let isCancelled = false;
@@ -180,11 +201,10 @@ export function streamResultsForCluster(
 
   async function run() {
     try {
-      const { kind, items, metadata } = await clusterRequest(url + asQuery(queryParams), {
-        cluster: clusterName,
-      });
+      const { kind, items, metadata } = await clusterRequest(url + asQuery(queryParams), options);
 
       if (isCancelled) return;
+      assertCurrentDiscoveryConnection(clusterName, options.expectedDiscoveryConnection.revision);
 
       add(items, kind);
 
@@ -194,7 +214,7 @@ export function streamResultsForCluster(
       const watchUrl =
         url +
         asQuery({ ...queryParams, ...{ watch: '1', resourceVersion: metadata.resourceVersion } });
-      socket = stream(watchUrl, update, { isJson: true, cluster: clusterName });
+      socket = stream(watchUrl, update, { isJson: true, ...options });
     } catch (err) {
       console.error('Error in api request', { err, url });
       if (errCb && typeof errCb === 'function') {
@@ -310,6 +330,7 @@ export interface StreamArgs {
   stdout?: boolean;
   stderr?: boolean;
   cluster?: string;
+  expectedDiscoveryConnection?: DiscoveryConnectionRequest;
 }
 
 /**
@@ -326,7 +347,15 @@ export interface StreamArgs {
 export function stream<T>(url: string, cb: StreamResultsCb<T>, args: StreamArgs) {
   let connection: StreamConnection | null = null;
   let isCancelled = false;
-  const { failCb, cluster = '' } = args;
+  const { failCb } = args;
+  const cluster = args.cluster || getCluster() || '';
+  const expectedDiscoveryConnection = args.expectedDiscoveryConnection ?? {
+    revision: getDiscoveredConnectionRevision(cluster),
+  };
+  const streamUrl = withDiscoveryConnectionPath(
+    url,
+    cluster ? expectedDiscoveryConnection : undefined
+  );
   // We only set reconnectOnFailure as true by default if the failCb has not been provided.
   const { isJson = false, additionalProtocols, connectCb, reconnectOnFailure = !failCb } = args;
 
@@ -348,10 +377,24 @@ export function stream<T>(url: string, cb: StreamResultsCb<T>, args: StreamArgs)
   }
 
   async function connect() {
-    if (connectCb) connectCb();
+    if (isCancelled) return;
     try {
-      connection = await connectStream(url, cb, onFail, isJson, additionalProtocols, cluster);
+      assertCurrentDiscoveryConnection(cluster, expectedDiscoveryConnection.revision);
+      if (connectCb) connectCb();
+      const next = await connectStreamWithParams(streamUrl, cb, onFail, {
+        cluster,
+        isJson,
+        additionalProtocols,
+        expectedDiscoveryConnection,
+      });
+      if (isCancelled) next.close();
+      else connection = next;
     } catch (error) {
+      if (isDiscoveryConnectionChanged(error)) {
+        cancel();
+        failCb?.();
+        return;
+      }
       console.error('Error connecting stream:', error);
       onFail();
     }
@@ -370,13 +413,15 @@ export function stream<T>(url: string, cb: StreamResultsCb<T>, args: StreamArgs)
   }
 
   function onFail() {
-    if (!!failCb) {
-      failCb();
+    if (isCancelled) return;
+    if (getDiscoveredConnectionRevision(cluster) !== expectedDiscoveryConnection.revision) {
+      cancel();
+      failCb?.();
+      return;
     }
 
-    if (reconnectOnFailure) {
-      retryOnFail();
-    }
+    failCb?.();
+    retryOnFail();
   }
 }
 
@@ -417,6 +462,7 @@ interface StreamParams {
   isJson?: boolean;
   /** Additional WebSocket protocols to use when connecting. */
   additionalProtocols?: string[];
+  expectedDiscoveryConnection?: DiscoveryConnectionRequest;
 }
 
 /**
@@ -442,10 +488,18 @@ export async function connectStreamWithParams<T>(
   onFail: () => void,
   params?: StreamParams
 ): Promise<StreamConnection> {
-  const { isJson = false, additionalProtocols = [], cluster = '' } = params || {};
+  const {
+    isJson = false,
+    additionalProtocols = [],
+    cluster = '',
+    expectedDiscoveryConnection: boundConnection,
+  } = params || {};
   let isClosing = false;
 
-  const userID = getUserIdFromLocalStorage();
+  const importRevision = getImportedConnectionRevision(cluster);
+  const expectedDiscoveryConnection =
+    boundConnection ?? (importRevision ? { revision: importRevision } : undefined);
+  const userID = getUserIdFromLocalStorage(expectedDiscoveryConnection?.revision);
 
   const protocols = ['base64.binary.k8s.io', ...additionalProtocols];
   const backendTokenProtocol = getHeadlampWebSocketProtocol();
@@ -472,9 +526,16 @@ export async function connectStreamWithParams<T>(
     }
   }
 
+  if (expectedDiscoveryConnection) {
+    assertCurrentDiscoveryConnection(cluster, expectedDiscoveryConnection.revision);
+  }
+
   let socket: WebSocket | null = null;
   try {
-    socket = new WebSocket(url, protocols);
+    socket = new WebSocket(
+      withDiscoveryConnectionPath(url, expectedDiscoveryConnection),
+      protocols
+    );
     socket.binaryType = 'arraybuffer';
     socket.addEventListener('message', onMessage);
     socket.addEventListener('close', onClose);
@@ -496,6 +557,14 @@ export async function connectStreamWithParams<T>(
 
   function onMessage(body: MessageEvent) {
     if (isClosing) return;
+    if (
+      expectedDiscoveryConnection &&
+      getDiscoveredConnectionRevision(cluster) !== expectedDiscoveryConnection.revision
+    ) {
+      close();
+      onFail();
+      return;
+    }
 
     const item = isJson ? JSON.parse(body.data) : body.data;
     if (isDebugVerbose('k8s/apiProxy@connectStream onMessage cb(item)')) {

@@ -17,6 +17,15 @@
 import { useQuery } from '@tanstack/react-query';
 import { request } from './api/v1/clusterRequests';
 import { useSelectedClusters } from './api/v1/hooks';
+import {
+  getDiscoveredConnectionRevision,
+  useDiscoveredConnectionRevisions,
+} from './api/v2/discoveredConnectionRevisions';
+import {
+  assertCurrentDiscoveryConnection,
+  type DiscoveryConnectionRequest,
+  isDiscoveryConnectionChanged,
+} from './api/v2/discoveryConnection';
 
 /**
  * Whether a cluster serves a resource under one of the given group versions.
@@ -34,21 +43,33 @@ export async function isResourceServed(
   apiVersions: string | string[],
   apiName: string
 ): Promise<boolean> {
+  return (await getServedResourceVersion(cluster, apiVersions, apiName)) !== undefined;
+}
+
+/** Finds the first declared version that serves this resource on the selected connection. */
+export async function getServedResourceVersion(
+  cluster: string,
+  apiVersions: string | string[],
+  apiName: string,
+  connection: DiscoveryConnectionRequest = { revision: getDiscoveredConnectionRevision(cluster) }
+): Promise<string | undefined> {
   const versions = Array.isArray(apiVersions) ? apiVersions : [apiVersions];
 
   for (const version of versions) {
     // The core group has no group name and lives under /api instead of /apis.
     const path = version.includes('/') ? `/apis/${version}` : `/api/${version}`;
     try {
-      const response = await request(path, { cluster });
+      assertCurrentDiscoveryConnection(cluster, connection.revision);
+      const response = await request(path, { cluster, expectedDiscoveryConnection: connection });
+      assertCurrentDiscoveryConnection(cluster, connection.revision);
       if (response?.resources?.some((resource: { name?: string }) => resource.name === apiName)) {
-        return true;
+        return version;
       }
-    } catch {
-      continue;
+    } catch (error) {
+      if (isDiscoveryConnectionChanged(error)) return undefined;
     }
   }
-  return false;
+  return undefined;
 }
 
 /** The parts of a resource class needed to ask whether a cluster serves it. */
@@ -71,17 +92,19 @@ export interface ServedResourceClass {
  */
 export function useClustersServing(resourceClass: ServedResourceClass): string[] | undefined {
   const selectedClusters = useSelectedClusters();
+  const revisions = useDiscoveredConnectionRevisions();
+  const connections = selectedClusters.map(cluster => [cluster, revisions.get(cluster)] as const);
 
   const { data: servingClusters } = useQuery({
-    queryKey: [
-      'clustersServing',
-      resourceClass.apiVersion,
-      resourceClass.apiName,
-      ...selectedClusters,
-    ],
+    queryKey: ['clustersServing', resourceClass.apiVersion, resourceClass.apiName, ...connections],
     queryFn: async () => {
       const servedPerCluster = await Promise.all(
-        selectedClusters.map(cluster => resourceClass.isEnabled(cluster))
+        connections.map(async ([cluster, revision]) => {
+          assertCurrentDiscoveryConnection(cluster, revision);
+          const enabled = await resourceClass.isEnabled(cluster);
+          assertCurrentDiscoveryConnection(cluster, revision);
+          return enabled;
+        })
       );
       return selectedClusters.filter((_, index) => servedPerCluster[index]);
     },

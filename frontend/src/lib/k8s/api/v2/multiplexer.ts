@@ -17,9 +17,22 @@
 import { useCallback, useEffect, useMemo } from 'react';
 import { getHeadlampWebSocketProtocol } from '../../../../helpers/getHeadlampAPIHeaders';
 import { getUserIdFromLocalStorage } from '../../../../stateless/getUserIdFromLocalStorage';
+import { ApiError } from './ApiError';
+import { getDiscoveredConnectionRevision } from './discoveredConnectionRevisions';
+import {
+  assertCurrentDiscoveryConnection,
+  withDiscoveryConnectionPath,
+} from './discoveryConnection';
 import { getBaseWsUrl } from './webSocket';
 
 const MULTIPLEXER_PROTOCOL = 'headlamp.multiplexer.k8s.io';
+
+function subscriptionQuery(query: string, revision?: string) {
+  const params = new URLSearchParams(withDiscoveryConnectionPath(`?${query}`, { revision }));
+  // Keep a separate stream even when the same backend routing revision is restored.
+  if (revision) params.set('__headlamp_connection_epoch', revision);
+  return params.toString();
+}
 
 /**
  * WebSocket manager to handle connections across the application.
@@ -47,7 +60,10 @@ export const WebSocketManager = {
   completedPaths: new Set<string>(),
 
   /** Map of active WebSocket subscriptions with their details */
-  activeSubscriptions: new Map<string, { clusterId: string; path: string; query: string }>(),
+  activeSubscriptions: new Map<
+    string,
+    { clusterId: string; path: string; query: string; revision?: string; userId: string }
+  >(),
 
   /** Map to track pending unsubscribe operations for debouncing */
   pendingUnsubscribes: new Map<string, NodeJS.Timeout>(),
@@ -151,8 +167,8 @@ export const WebSocketManager = {
    * @param socket - WebSocket connection to subscribe to
    */
   resubscribeAll(socket: WebSocket): void {
-    this.activeSubscriptions.forEach(({ clusterId, path, query }) => {
-      const userId = getUserIdFromLocalStorage();
+    this.activeSubscriptions.forEach(({ clusterId, path, query, revision, userId }) => {
+      if (getDiscoveredConnectionRevision(clusterId) !== revision) return;
       const requestMsg: WebSocketMessage = {
         clusterId,
         path,
@@ -180,10 +196,25 @@ export const WebSocketManager = {
     onMessage: (data: any) => void,
     onError?: (err: Error) => void
   ): Promise<() => void> {
-    const key = this.createKey(clusterId, path, query);
+    const revision = getDiscoveredConnectionRevision(clusterId);
+    const wireQuery = subscriptionQuery(query, revision);
+    const key = this.createKey(clusterId, path, wireQuery);
 
-    // Add to active subscriptions
-    this.activeSubscriptions.set(key, { clusterId, path, query });
+    // Register listeners only after the request can be sent. A failed connection
+    // must not leave a subscription for a later socket to replay.
+    const socket = await this.connect();
+    assertCurrentDiscoveryConnection(clusterId, revision);
+    const userId = getUserIdFromLocalStorage(revision);
+    const requestMsg: WebSocketMessage = {
+      clusterId,
+      path,
+      query: wireQuery,
+      userId: userId || '',
+      type: 'REQUEST',
+    };
+    socket.send(JSON.stringify(requestMsg));
+
+    this.activeSubscriptions.set(key, { clusterId, path, query: wireQuery, revision, userId });
 
     // Add message listener
     const listeners = this.listeners.get(key) || new Set();
@@ -197,20 +228,8 @@ export const WebSocketManager = {
       this.errorListeners.set(key, errListeners);
     }
 
-    // Establish connection and send REQUEST
-    const socket = await this.connect();
-    const userId = getUserIdFromLocalStorage();
-    const requestMsg: WebSocketMessage = {
-      clusterId,
-      path,
-      query,
-      userId: userId || '',
-      type: 'REQUEST',
-    };
-    socket.send(JSON.stringify(requestMsg));
-
     // Return cleanup function
-    return () => this.unsubscribe(key, clusterId, path, query, onMessage, onError);
+    return () => this.unsubscribe(key, clusterId, path, wireQuery, onMessage, onError);
   },
 
   /**
@@ -263,11 +282,12 @@ export const WebSocketManager = {
         const timeout = setTimeout(() => {
           // Only unsubscribe if there are still no listeners
           if (!this.listeners.has(key)) {
+            const subscription = this.activeSubscriptions.get(key);
             this.activeSubscriptions.delete(key);
             this.completedPaths.delete(key);
 
             if (this.socketMultiplexer?.readyState === WebSocket.OPEN) {
-              const userId = getUserIdFromLocalStorage();
+              const userId = subscription?.userId ?? getUserIdFromLocalStorage();
               const closeMsg: WebSocketMessage = {
                 clusterId,
                 path,
@@ -323,6 +343,12 @@ export const WebSocketManager = {
       }
 
       const key = this.createKey(data.clusterId, data.path, data.query || '');
+      const subscription = this.activeSubscriptions.get(key);
+      if (
+        subscription &&
+        getDiscoveredConnectionRevision(subscription.clusterId) !== subscription.revision
+      )
+        return;
 
       // Handle COMPLETE messages
       if (data.type === 'COMPLETE') {
@@ -333,16 +359,18 @@ export const WebSocketManager = {
       // Handle ERROR messages from backend
       if (data.type === 'ERROR') {
         let errorMessage = 'Unknown error';
+        let status: number | undefined;
         try {
           const parsedData = data.data ? JSON.parse(data.data) : {};
           errorMessage = parsedData.error || errorMessage;
+          if (typeof parsedData.status === 'number') status = parsedData.status;
         } catch (e) {
           errorMessage = data.data || errorMessage;
         }
 
         const errListeners = this.errorListeners.get(key);
         if (errListeners && errListeners.size > 0) {
-          const errorObj = new Error(errorMessage);
+          const errorObj = new ApiError(errorMessage, { status });
           for (const errListener of errListeners) {
             try {
               errListener(errorObj);
@@ -357,6 +385,7 @@ export const WebSocketManager = {
             object: {
               kind: 'Status',
               status: 'Failure',
+              code: status,
               message: errorMessage,
               metadata: {
                 uid: `${key}:ERROR:${errorMessage}`,
@@ -465,25 +494,19 @@ export function useWebSocket<T>({
 
     let cleanup: (() => void) | undefined;
     let isCancelled = false;
-    let subscriptionPath: string | undefined;
-    let subscriptionQuery = '';
 
     const connectWebSocket = async () => {
-      let stableOnError: ((err: Error) => void) | undefined;
       try {
         const parsedUrl = new URL(url, getBaseWsUrl());
-        subscriptionPath = parsedUrl.pathname;
-        subscriptionQuery = parsedUrl.search.slice(1);
-        stableOnError = (err: Error) => {
-          console.error('WebSocket error for', subscriptionPath, err);
-          onError?.(err);
-        };
         const unsubscribe = await WebSocketManager.subscribe(
           cluster,
-          subscriptionPath,
-          subscriptionQuery,
+          parsedUrl.pathname,
+          parsedUrl.search.slice(1),
           stableOnMessage,
-          stableOnError
+          err => {
+            console.error('WebSocket error for', parsedUrl.pathname, err);
+            onError?.(err);
+          }
         );
         if (isCancelled) {
           unsubscribe();
@@ -491,17 +514,6 @@ export function useWebSocket<T>({
           cleanup = unsubscribe;
         }
       } catch (err) {
-        if (subscriptionPath) {
-          const key = WebSocketManager.createKey(cluster, subscriptionPath, subscriptionQuery);
-          WebSocketManager.unsubscribe(
-            key,
-            cluster,
-            subscriptionPath,
-            subscriptionQuery,
-            stableOnMessage,
-            stableOnError
-          );
-        }
         if (isCancelled) {
           return;
         }

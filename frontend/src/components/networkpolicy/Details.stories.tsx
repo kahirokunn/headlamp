@@ -40,9 +40,10 @@ const Template: StoryFn = () => {
   return <NetworkPolicyDetails />;
 };
 
-const detailsUrl = `${API_BASE}/apis/networking.k8s.io/v1/namespaces/default/networkpolicies/allow-frontend-traffic`;
+const listUrl = `${API_BASE}/apis/networking.k8s.io/v1/namespaces/default/networkpolicies`;
+const detailsUrl = `${listUrl}/allow-frontend-traffic`;
 const commonHandlers = [
-  http.get(`${API_BASE}/apis/networking.k8s.io/v1/namespaces/default/networkpolicies`, () =>
+  http.get(listUrl, () =>
     HttpResponse.json({ kind: 'NetworkPolicyList', items: NETWORK_POLICY_ITEMS, metadata: {} })
   ),
   http.get(`${API_BASE}/api/v1/namespaces/default/events`, () =>
@@ -104,13 +105,13 @@ Loading.parameters = {
 };
 
 export const Error = Template.bind({});
+const accessDenied = () => HttpResponse.json({ message: 'Access denied' }, { status: 403 });
 Error.parameters = {
   msw: {
     handlers: {
       story: [
-        http.get(detailsUrl, () =>
-          HttpResponse.json({ message: 'Access denied' }, { status: 403 })
-        ),
+        http.get(detailsUrl, accessDenied),
+        http.get(listUrl, accessDenied),
         ...commonHandlers,
       ],
     },

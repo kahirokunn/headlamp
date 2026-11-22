@@ -17,6 +17,7 @@
 import { isDebugVerbose } from '../../../../helpers/debugVerbose';
 import { getCluster } from '../../../cluster';
 import type { ApiError } from './ApiError';
+import { getDiscoveredConnectionRevision } from './discoveredConnectionRevisions';
 import { clusterFetch } from './fetch';
 
 export interface KubeNodeSummaryStats {
@@ -49,17 +50,30 @@ export async function nodeSummaryStats(
     return () => {};
   }
 
-  const handle = setInterval(getNodeSummaryStats, 10000);
+  const request = new AbortController();
   const clusterName = cluster || getCluster() || '';
+  const revision = clusterName ? getDiscoveredConnectionRevision(clusterName) : undefined;
+  const url = `/api/v1/nodes/${encodeURIComponent(nodeName)}/proxy/stats/summary`;
+  const isCurrent = () =>
+    !request.signal.aborted &&
+    (!clusterName || getDiscoveredConnectionRevision(clusterName) === revision);
+  const handle = setInterval(getNodeSummaryStats, 10000);
 
   async function getNodeSummaryStats() {
+    if (!isCurrent()) {
+      cancel();
+      return;
+    }
+
     try {
-      const summary: KubeNodeSummaryStats = await clusterFetch(
-        `/api/v1/nodes/${encodeURIComponent(nodeName)}/proxy/stats/summary`,
-        { cluster: clusterName }
-      ).then(response => response.json());
-      onStats(summary);
+      const summary: KubeNodeSummaryStats = await clusterFetch(url, {
+        cluster: clusterName,
+        expectedDiscoveryConnection: { revision },
+        signal: request.signal,
+      }).then(response => response.json());
+      if (isCurrent()) onStats(summary);
     } catch (err) {
+      if (!isCurrent()) return;
       if (isDebugVerbose('k8s/apiProxy@nodeSummaryStats')) {
         console.debug('k8s/apiProxy@nodeSummaryStats', { err, nodeName });
       }
@@ -72,6 +86,7 @@ export async function nodeSummaryStats(
 
   function cancel() {
     clearInterval(handle);
+    request.abort();
   }
 
   getNodeSummaryStats();

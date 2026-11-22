@@ -17,7 +17,18 @@
 import { Base64 } from 'js-base64';
 import { getAppUrl } from '../helpers/getAppUrl';
 import { getHeadlampAPIHeaders } from '../helpers/getHeadlampAPIHeaders';
+import { IMPORT_REVISION_KEY_HEADER } from '../stateless/importRevisionKey';
+import { getDiscoveredConnectionRevision } from './k8s/api/v2/discoveredConnectionRevisions';
+import {
+  assertCurrentDiscoveryConnection,
+  createDiscoveryConnectionChangedError,
+  DISCOVERY_CONNECTION_REVISION_HEADER,
+  type DiscoveryConnectionRequest,
+  getRoutingRevision,
+  UNVERSIONED_DISCOVERY_CONNECTION,
+} from './k8s/api/v2/discoveryConnection';
 import { backendFetch } from './k8s/api/v2/fetch';
+import { getOIDCImportHeaders } from './oidcLogin';
 
 export function encodeClusterPath(cluster: string): string {
   return Base64.encodeURI(cluster);
@@ -27,11 +38,32 @@ export function encodeClusterPath(cluster: string): string {
  * Requests an OIDC logout transition URL through the authenticated backend and navigates to it.
  *
  * @param cluster - The OIDC cluster whose provider session should be ended.
+ * @param connection - The connection to keep through the logout transition.
  * @throws {Error} When the backend request fails or returns an invalid redirect URL.
  */
-export async function redirectToOIDCLogout(cluster: string): Promise<void> {
+export async function redirectToOIDCLogout(
+  cluster: string,
+  connection: DiscoveryConnectionRequest = { revision: getDiscoveredConnectionRevision(cluster) }
+): Promise<void> {
+  assertCurrentDiscoveryConnection(cluster, connection.revision);
+  const routingRevision =
+    getRoutingRevision(connection.revision) || UNVERSIONED_DISCOVERY_CONNECTION;
+  const imported = routingRevision.startsWith('import-')
+    ? await getOIDCImportHeaders(cluster, connection.revision)
+    : undefined;
+  assertCurrentDiscoveryConnection(cluster, connection.revision);
   if (window.desktopApi?.oidcLogout) {
-    await window.desktopApi.oidcLogout(cluster);
+    if (imported) {
+      await window.desktopApi.oidcLogout(
+        cluster,
+        routingRevision,
+        imported.KUBECONFIG,
+        imported['X-HEADLAMP-USER-ID'],
+        imported[IMPORT_REVISION_KEY_HEADER]
+      );
+    } else {
+      await window.desktopApi.oidcLogout(cluster, routingRevision);
+    }
     return;
   }
   const response = await backendFetch(
@@ -40,12 +72,16 @@ export async function redirectToOIDCLogout(cluster: string): Promise<void> {
       method: 'POST',
       headers: {
         Accept: 'application/json',
+        [DISCOVERY_CONNECTION_REVISION_HEADER]: routingRevision,
         'Content-Type': 'application/json',
         ...getHeadlampAPIHeaders(),
+        ...imported,
       },
     }
   );
+  if (response.status === 409) throw createDiscoveryConnectionChangedError();
   const result: unknown = await response.json();
+  assertCurrentDiscoveryConnection(cluster, connection.revision);
 
   if (
     !result ||

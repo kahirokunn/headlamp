@@ -19,7 +19,19 @@ import { getAppUrl } from '../../../../helpers/getAppUrl';
 import { getHeadlampAPIHeaders } from '../../../../helpers/getHeadlampAPIHeaders';
 import { findKubeconfigByClusterName } from '../../../../stateless/findKubeconfigByClusterName';
 import { getUserIdFromLocalStorage } from '../../../../stateless/getUserIdFromLocalStorage';
+import {
+  getImportRevisionKey,
+  IMPORT_REVISION_KEY_HEADER,
+} from '../../../../stateless/importRevisionKey';
 import { ApiError } from './ApiError';
+import { getDiscoveredConnectionRevision } from './discoveredConnectionRevisions';
+import type { DiscoveryConnectionRequest } from './discoveryConnection';
+import {
+  assertCurrentDiscoveryConnection,
+  DISCOVERY_CONNECTION_REVISION_HEADER,
+  UNVERSIONED_DISCOVERY_CONNECTION,
+  withDiscoveryConnectionPath,
+} from './discoveryConnection';
 import { makeUrl } from './makeUrl';
 
 // @deprecated BASE_HTTP_URL is deprecated for Electron apps with custom ports.
@@ -40,6 +52,11 @@ export async function backendFetch(url: string | URL, init: RequestInit = {}) {
   // Always include credentials
   init.credentials = 'include';
   init.headers = addBackstageAuthHeaders(init.headers);
+  const headers = new Headers(init.headers);
+  if (headers.has('KUBECONFIG') && !headers.has(IMPORT_REVISION_KEY_HEADER)) {
+    headers.set(IMPORT_REVISION_KEY_HEADER, await getImportRevisionKey());
+    init.headers = headers;
+  }
   const response = await fetch(makeUrl([getAppUrl(), url]), init);
 
   // The backend signals through this header that it wants a reload.
@@ -102,32 +119,66 @@ export async function backendFetch(url: string | URL, init: RequestInit = {}) {
  *
  * @returns fetch Response
  */
-export async function clusterFetch(url: string | URL, init: RequestInit & { cluster: string }) {
+export async function clusterFetch(
+  url: string | URL,
+  {
+    cluster,
+    expectedDiscoveryConnection: boundConnection,
+    ...init
+  }: RequestInit & {
+    cluster: string;
+    expectedDiscoveryConnection?: DiscoveryConnectionRequest;
+  }
+) {
   init.headers = new Headers(init.headers);
-  if (init.cluster) {
+  if (cluster) {
     for (const [name, value] of Object.entries(getHeadlampAPIHeaders())) {
       init.headers.set(name, value);
     }
   }
 
+  const expectedDiscoveryConnection =
+    boundConnection ??
+    (cluster ? { revision: getDiscoveredConnectionRevision(cluster) } : undefined);
+
   // Set stateless kubeconfig if exists
-  const kubeconfig = await findKubeconfigByClusterName(init.cluster);
+  const kubeconfig = cluster ? await findKubeconfigByClusterName(cluster) : null;
   if (kubeconfig !== null) {
-    const userID = getUserIdFromLocalStorage();
+    const userID = getUserIdFromLocalStorage(expectedDiscoveryConnection?.revision);
     init.headers.set('KUBECONFIG', kubeconfig);
     init.headers.set('X-HEADLAMP-USER-ID', userID);
   }
 
-  const urlParts = init.cluster ? ['clusters', init.cluster, url] : [url];
+  if (init.headers.has('KUBECONFIG')) {
+    init.headers.set(IMPORT_REVISION_KEY_HEADER, await getImportRevisionKey());
+  }
+
+  if (expectedDiscoveryConnection) {
+    assertCurrentDiscoveryConnection(cluster, expectedDiscoveryConnection.revision);
+    if (cluster && expectedDiscoveryConnection.revision === undefined) {
+      init.headers.set(DISCOVERY_CONNECTION_REVISION_HEADER, UNVERSIONED_DISCOVERY_CONNECTION);
+    }
+  }
+
+  const urlParts = cluster ? ['clusters', cluster, url] : [url];
 
   try {
-    const response = await backendFetch(makeUrl(urlParts), init);
+    const path = withDiscoveryConnectionPath(
+      makeUrl(urlParts),
+      expectedDiscoveryConnection?.revision === undefined ? undefined : expectedDiscoveryConnection
+    );
+    const response = await backendFetch(path, init);
 
     return response;
   } catch (e) {
     if (e instanceof ApiError) {
-      e.cluster = init.cluster;
+      e.cluster = cluster;
     }
     throw e;
+  } finally {
+    const method = (init.method ?? 'GET').toUpperCase();
+    if (expectedDiscoveryConnection && (method === 'GET' || method === 'HEAD')) {
+      assertCurrentDiscoveryConnection(cluster, expectedDiscoveryConnection.revision);
+    }
   }
 }

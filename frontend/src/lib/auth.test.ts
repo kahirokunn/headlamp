@@ -17,7 +17,10 @@
 import { Base64 } from 'js-base64';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import store from '../redux/stores/store';
+import { findKubeconfigByClusterName } from '../stateless/findKubeconfigByClusterName';
+import { getUserIdFromLocalStorage } from '../stateless/getUserIdFromLocalStorage';
 import { deleteTokens, getUserInfo, logout, setToken } from './auth';
+import { getDiscoveredConnectionRevision } from './k8s/api/v2/discoveredConnectionRevisions';
 import { backendFetch } from './k8s/api/v2/fetch';
 import { canLogoutFromProvider } from './k8s/clusterAuthType';
 import { encodeClusterPath } from './oidcLogout';
@@ -25,6 +28,15 @@ import { queryClient } from './queryClient';
 
 // Mock the dependencies
 vi.mock('./k8s/api/v2/fetch');
+vi.mock('../stateless/findKubeconfigByClusterName', () => ({
+  findKubeconfigByClusterName: vi.fn(),
+}));
+vi.mock('../stateless/getUserIdFromLocalStorage', () => ({
+  getUserIdFromLocalStorage: vi.fn(),
+}));
+vi.mock('./k8s/api/v2/discoveredConnectionRevisions', () => ({
+  getDiscoveredConnectionRevision: vi.fn(),
+}));
 vi.mock('../helpers/getHeadlampAPIHeaders');
 vi.mock('../redux/stores/store', () => ({
   default: {
@@ -53,9 +65,20 @@ describe('auth', () => {
       config: { allClusters: {} },
     } as any);
     mockProviderLogout.mockReturnValue(false);
+    vi.mocked(findKubeconfigByClusterName).mockReset().mockResolvedValue(null);
+    vi.mocked(getDiscoveredConnectionRevision).mockReturnValue(undefined);
   });
 
   describe('setToken', () => {
+    it('rejects a login submitted from a superseded connection', async () => {
+      vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('replacement:2');
+
+      await expect(
+        setToken('workload', 'original-user', { revision: 'original:1' })
+      ).rejects.toMatchObject({ status: 409 });
+      expect(mockBackendFetch).not.toHaveBeenCalled();
+    });
+
     it('should successfully set a token for a cluster', async () => {
       const cluster = 'test-cluster';
       const token = 'test-token-123';
@@ -69,12 +92,14 @@ describe('auth', () => {
       const result = await setToken(cluster, token);
 
       expect(result).toBe(true);
+      expect(findKubeconfigByClusterName).not.toHaveBeenCalled();
       expect(mockBackendFetch).toHaveBeenCalledWith(
         `/clusters/${encodeURIComponent(cluster)}/set-token`,
         {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
+            'X-Headlamp-Connection-Revision': 'unversioned',
           },
           body: JSON.stringify({ token }),
         }
@@ -100,10 +125,63 @@ describe('auth', () => {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
+            'X-Headlamp-Connection-Revision': 'unversioned',
           },
           body: JSON.stringify({ token: null }),
         }
       );
+    });
+
+    it.each(['private-token', null])(
+      'routes imported token %s to the imported connection',
+      async token => {
+        vi.mocked(findKubeconfigByClusterName).mockResolvedValue('imported-kubeconfig');
+        vi.mocked(getUserIdFromLocalStorage).mockReturnValue('browser-user');
+        mockBackendFetch.mockResolvedValue({ ok: true } as Response);
+
+        const initial = mockStore.getState();
+        mockStore.getState.mockReturnValue({
+          ...initial,
+          config: {
+            ...initial.config,
+            statelessClusters: { workload: { kubeconfigRecordId: 42 } },
+          },
+        } as any);
+
+        await setToken('workload', token);
+
+        expect(findKubeconfigByClusterName).toHaveBeenCalledWith('workload', undefined, 42);
+
+        expect(mockBackendFetch).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({
+            headers: expect.objectContaining({
+              KUBECONFIG: 'imported-kubeconfig',
+              'X-HEADLAMP-USER-ID': 'browser-user',
+              'X-Headlamp-Connection-Revision': 'unversioned',
+            }),
+          })
+        );
+      }
+    );
+
+    it('does not fall back to a backend-managed connection when the import is missing', async () => {
+      mockStore.getState.mockReturnValue({
+        ...mockStore.getState(),
+        config: {
+          ...mockStore.getState().config,
+          clusters: { workload: {} },
+          statelessClusters: { workload: { kubeconfigRecordId: 42 } },
+        },
+      } as any);
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        await expect(setToken('workload', 'private-token')).rejects.toMatchObject({ status: 409 });
+        expect(mockBackendFetch).not.toHaveBeenCalled();
+      } finally {
+        log.mockRestore();
+      }
     });
 
     it('should throw an error when backend returns error response', async () => {
@@ -202,9 +280,12 @@ describe('auth', () => {
           config: {
             ...state.config,
             clusters: sameName ? { sample: { name: 'sample', auth_type: 'oidc' } } : {},
-            statelessClusters: { sample: { name: 'sample', auth_type: 'oidc' } },
+            statelessClusters: {
+              sample: { name: 'sample', auth_type: 'oidc', kubeconfigRecordId: 42 },
+            },
           },
         });
+        vi.mocked(findKubeconfigByClusterName).mockResolvedValue('sample-kubeconfig');
         mockBackendFetch.mockResolvedValue({ ok: true } as Response);
         await logout('sample');
         expect(mockBackendFetch).toHaveBeenCalledExactlyOnceWith(
@@ -213,6 +294,32 @@ describe('auth', () => {
         );
       }
     );
+
+    it('does not start provider logout on a replacement connection', async () => {
+      mockProviderLogout.mockReturnValue(true);
+      vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('original:1');
+      const clear = Promise.withResolvers<Response>();
+      const requested = Promise.withResolvers<void>();
+      mockBackendFetch.mockImplementationOnce(() => {
+        requested.resolve();
+        return clear.promise;
+      });
+      const oidcLogout = vi.fn();
+      vi.stubGlobal('desktopApi', { oidcLogout });
+
+      try {
+        const pending = logout('workload');
+        await requested.promise;
+        vi.mocked(getDiscoveredConnectionRevision).mockReturnValue('replacement:2');
+        clear.resolve({ ok: true } as Response);
+
+        await expect(pending).rejects.toMatchObject({ status: 409 });
+        expect(mockBackendFetch).toHaveBeenCalledTimes(1);
+        expect(oidcLogout).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
 
     it('should redirect an OIDC cluster with slash and dot segments', async () => {
       const cluster = 'team/../prod';
@@ -237,12 +344,12 @@ describe('auth', () => {
       });
       expect(mockQueryClient.removeQueries).toHaveBeenCalledWith({
         queryKey: ['clusterMe', cluster],
-        exact: true,
+        exact: false,
       });
       expect(mockBackendFetch).toHaveBeenCalledWith(
         `/encoded-clusters/${encodeClusterPath(cluster)}/clear-token`,
         expect.objectContaining({
-          body: JSON.stringify({ token: null }),
+          body: JSON.stringify({ token: null, preserveIDToken: true }),
         })
       );
       expect(mockBackendFetch).toHaveBeenCalledWith(
@@ -281,7 +388,7 @@ describe('auth', () => {
       });
       expect(mockQueryClient.removeQueries).toHaveBeenCalledWith({
         queryKey: ['clusterMe', cluster],
-        exact: true,
+        exact: false,
       });
       expect(mockBackendFetch).toHaveBeenCalledWith(
         `/encoded-clusters/${encodeClusterPath(cluster)}/clear-token`,
@@ -334,7 +441,7 @@ describe('auth', () => {
       });
       expect(mockQueryClient.removeQueries).toHaveBeenCalledWith({
         queryKey: ['clusterMe', cluster],
-        exact: true,
+        exact: false,
       });
       expect(mockLocation.href).toBe('https://idp.example/logout');
     });
@@ -342,6 +449,7 @@ describe('auth', () => {
     it('should clear token and queries for non-OIDC cluster', async () => {
       const cluster = 'test-cluster';
       mockProviderLogout.mockReturnValue(false);
+      vi.mocked(findKubeconfigByClusterName).mockReset().mockResolvedValue(null);
 
       const mockResponse: Partial<Response> = {
         ok: true,
@@ -368,7 +476,7 @@ describe('auth', () => {
       });
       expect(mockQueryClient.removeQueries).toHaveBeenCalledWith({
         queryKey: ['clusterMe', cluster],
-        exact: true,
+        exact: false,
       });
       expect(mockLocation.href).toBe('');
     });
@@ -408,12 +516,12 @@ describe('auth', () => {
       });
       expect(mockQueryClient.removeQueries).toHaveBeenCalledWith({
         queryKey: ['clusterMe', 'oidc-cluster'],
-        exact: true,
+        exact: false,
       });
       expect(mockBackendFetch).toHaveBeenCalledWith(
         `/encoded-clusters/${encodeClusterPath('oidc-cluster')}/clear-token`,
         expect.objectContaining({
-          body: JSON.stringify({ token: null }),
+          body: JSON.stringify({ token: null, preserveIDToken: true }),
         })
       );
       expect(mockBackendFetch).toHaveBeenCalledWith(
@@ -486,7 +594,7 @@ describe('auth', () => {
       expect(mockBackendFetch).toHaveBeenCalledWith(
         `/encoded-clusters/${encodeClusterPath('oidc-cluster')}/clear-token`,
         expect.objectContaining({
-          body: JSON.stringify({ token: null }),
+          body: JSON.stringify({ token: null, preserveIDToken: true }),
         })
       );
       expect(mockBackendFetch).toHaveBeenCalledWith(
@@ -514,6 +622,7 @@ describe('auth', () => {
         config: { allClusters: { 'non-oidc-cluster': {} } },
       } as any);
       mockProviderLogout.mockReturnValue(false);
+      vi.mocked(findKubeconfigByClusterName).mockReset().mockResolvedValue(null);
 
       const mockResponse: Partial<Response> = {
         ok: true,
