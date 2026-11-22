@@ -14,9 +14,28 @@
  * limitations under the License.
  */
 
+import { getDiscoveredConnectionRevision } from '../../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import {
+  assertCurrentDiscoveryConnection,
+  bindDiscoveryConnection,
+  createDiscoveryConnectionChangedError,
+  getResourceDiscoveryConnection,
+  recordDiscoveryConnection,
+} from '../../../lib/k8s/api/v2/discoveryConnection';
 import { KubeObject } from '../../../lib/k8s/KubeObject';
 
-export function fetchLatestKubeObject<K extends KubeObject>(item: K): Promise<K> {
+export async function fetchLatestKubeObject<K extends KubeObject>(
+  item: K,
+  signal?: AbortSignal
+): Promise<K> {
+  signal?.throwIfAborted();
+  const cluster = item.cluster;
+  const connection = getResourceDiscoveryConnection(item);
+  if (connection && connection.cluster !== cluster) {
+    throw createDiscoveryConnectionChangedError();
+  }
+  const revision = connection ? connection.revision : getDiscoveredConnectionRevision(cluster);
+  assertCurrentDiscoveryConnection(cluster, revision);
   return new Promise((resolve, reject) => {
     let cancel: (() => void) | undefined;
     let cancelScheduled = false;
@@ -37,8 +56,17 @@ export function fetchLatestKubeObject<K extends KubeObject>(item: K): Promise<K>
         return;
       }
 
+      try {
+        assertCurrentDiscoveryConnection(cluster, revision);
+      } catch (error) {
+        rejectOnce(error);
+        return;
+      }
+
       settled = true;
-      latestItem.cluster = item.cluster;
+      signal?.removeEventListener('abort', onAbort);
+      latestItem.cluster = cluster;
+      recordDiscoveryConnection(latestItem, cluster, revision);
       scheduleCancel();
       resolve(latestItem as K);
     }
@@ -49,14 +77,21 @@ export function fetchLatestKubeObject<K extends KubeObject>(item: K): Promise<K>
       }
 
       settled = true;
+      signal?.removeEventListener('abort', onAbort);
       scheduleCancel();
       reject(err);
     }
 
+    function onAbort() {
+      rejectOnce(signal?.reason);
+    }
+
+    signal?.addEventListener('abort', onAbort, { once: true });
     const request = item
       ._class()
       .apiGet(resolveOnce, item.getName(), item.getNamespace(), rejectOnce, {
-        cluster: item.cluster,
+        cluster,
+        queryParams: bindDiscoveryConnection({}, revision),
       });
 
     request()

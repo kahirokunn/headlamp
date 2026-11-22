@@ -29,11 +29,22 @@ import { isDockerDesktop } from '../../../helpers/isDockerDesktop';
 import { isElectron } from '../../../helpers/isElectron';
 import { getCluster } from '../../../lib/cluster';
 import {
+  isPortForwardOnConnection,
   listPortForward,
   PortForward as PortForwardState,
-  startPortForward,
+  PortForwardRequest,
+  startPortForwardForConnection,
   stopOrDeletePortForward,
 } from '../../../lib/k8s/api/v1/portForward';
+import {
+  getDiscoveredConnectionRevision,
+  useDiscoveredConnectionRevisions,
+} from '../../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import {
+  createDiscoveryConnectionChangedError,
+  getResourceDiscoveryConnection,
+  isDiscoveryConnectionChanged,
+} from '../../../lib/k8s/api/v2/discoveryConnection';
 import { KubeContainer } from '../../../lib/k8s/cluster';
 import { KubeObject, KubeObjectInterface } from '../../../lib/k8s/KubeObject';
 import Pod from '../../../lib/k8s/pod';
@@ -41,6 +52,12 @@ import Service from '../../../lib/k8s/service';
 import ActionButton from '../ActionButton';
 export { type PortForward as PortForwardState } from '../../../lib/k8s/api/v1/portForward';
 import PortForwardStartDialog from '../../portforward/PortForwardStartDialog';
+import {
+  getPortForwardsFromStorage,
+  PORT_FORWARDS_STORAGE_KEY,
+  removeSavedPortForward,
+  samePortForward,
+} from '../../portforward/storage';
 
 interface PortForwardKubeObjectProps {
   containerPort: number | string;
@@ -55,7 +72,7 @@ interface PortForwardLegacyProps {
 
 type PortForwardProps = PortForwardKubeObjectProps | PortForwardLegacyProps;
 
-export const PORT_FORWARDS_STORAGE_KEY = 'portforwards';
+export { PORT_FORWARDS_STORAGE_KEY } from '../../portforward/storage';
 export const PORT_FORWARD_STOP_STATUS = 'Stopped';
 export const PORT_FORWARD_RUNNING_STATUS = 'Running';
 export const PORT_FORWARD_RECONNECTING_STATUS = 'Reconnecting';
@@ -112,49 +129,17 @@ function checkIfPodPortForwarding(portforwardParam: {
   namespace: string;
   name: string;
   cluster: string;
+  revision?: string;
   numericContainerPort: string | number;
 }) {
-  const { item, namespace, name, cluster, numericContainerPort } = portforwardParam;
+  const { item, namespace, name, cluster, revision, numericContainerPort } = portforwardParam;
   return (
     (item.namespace === namespace || item.serviceNamespace === namespace) &&
     (item.pod === name || item.service === name) &&
     item.cluster === cluster &&
+    isPortForwardOnConnection(item, revision) &&
     item.targetPort === numericContainerPort.toString()
   );
-}
-
-function getPortForwardsFromStorage(): PortForwardState[] {
-  try {
-    const portForwardsInStorage = localStorage.getItem(PORT_FORWARDS_STORAGE_KEY);
-    if (!portForwardsInStorage) {
-      return [];
-    }
-    const parsed = JSON.parse(portForwardsInStorage);
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-    return parsed.filter((pf: unknown): pf is PortForwardState => {
-      if (pf === null || typeof pf !== 'object' || Array.isArray(pf)) {
-        return false;
-      }
-      const r = pf as Record<string, unknown>;
-      return (
-        typeof r.id === 'string' &&
-        typeof r.pod === 'string' &&
-        typeof r.service === 'string' &&
-        typeof r.serviceNamespace === 'string' &&
-        typeof r.namespace === 'string' &&
-        typeof r.cluster === 'string' &&
-        typeof r.port === 'string' &&
-        typeof r.targetPort === 'string' &&
-        (r.status === undefined || typeof r.status === 'string') &&
-        (r.error === undefined || typeof r.error === 'string')
-      );
-    });
-  } catch (err) {
-    console.warn('Failed to parse port forwards from storage', err);
-    return [];
-  }
 }
 
 function PortForwardContent(props: PortForwardProps) {
@@ -165,9 +150,11 @@ function PortForwardContent(props: PortForwardProps) {
   const name = resource?.metadata?.name || '';
 
   const [error, setError] = React.useState<string | null>(null);
-  const [portForward, setPortForward] = React.useState<PortForwardState | null>(null);
+  const [lastPortForward, setPortForward] = React.useState<PortForwardState | null>(null);
   const [loading, setLoading] = React.useState(false);
-  const [startDialogOpen, setStartDialogOpen] = React.useState(false);
+  const [startRequest, setStartRequest] = React.useState<
+    (PortForwardRequest & { cluster: string; revision?: string }) | null
+  >(null);
 
   const { t } = useTranslation(['translation', 'resource']);
 
@@ -175,6 +162,7 @@ function PortForwardContent(props: PortForwardProps) {
     namespace,
     labelSelector: getPodsSelectorFilter(service),
     cluster: resource?.cluster,
+    ...(isPod ? { clusters: [] } : {}),
   });
 
   const cluster = React.useMemo(() => {
@@ -187,16 +175,19 @@ function PortForwardContent(props: PortForwardProps) {
     return getCluster();
   }, [resource]);
 
+  const revision = useDiscoveredConnectionRevisions().get(cluster ?? '');
+  const resourceOrigin = resource && getResourceDiscoveryConnection(resource);
+  const currentResource =
+    !resourceOrigin || (resourceOrigin.cluster === cluster && resourceOrigin.revision === revision);
+  const portForward =
+    currentResource && lastPortForward && isPortForwardOnConnection(lastPortForward, revision)
+      ? lastPortForward
+      : null;
+  const selectedPod = isPod ? (resource as Pod | undefined) : pods?.[0];
   const numericContainerPort =
     typeof containerPort === 'string' && isNaN(parseInt(containerPort))
-      ? !pods || pods.length === 0
-        ? 0
-        : getPortNumberFromPortName(pods[0].spec.containers, containerPort)
+      ? getPortNumberFromPortName(selectedPod?.spec?.containers ?? [], containerPort)
       : containerPort;
-
-  const displayPodName = React.useMemo(() => {
-    return isPod ? name : pods && pods.length > 0 ? pods[0].metadata.name : '';
-  }, [isPod, name, pods]);
 
   const shouldRender =
     isElectron() &&
@@ -205,15 +196,22 @@ function PortForwardContent(props: PortForwardProps) {
     !(isPod && (!resource || (resource as Pod).status.phase === 'Failed'));
 
   React.useEffect(() => {
+    if (!currentResource) {
+      setLoading(false);
+      return;
+    }
     if (!cluster || !shouldRender) {
       return;
     }
     let cancelled = false;
+    const isCurrent = () => !cancelled && getDiscoveredConnectionRevision(cluster) === revision;
     setError(null);
+    setLoading(false);
+    setPortForward(null);
 
     listPortForward(cluster)
       .then(result => {
-        if (cancelled) {
+        if (!isCurrent()) {
           return;
         }
         const portForwards = result || [];
@@ -221,8 +219,10 @@ function PortForwardContent(props: PortForwardProps) {
         const parsedPortForwards = getPortForwardsFromStorage();
 
         parsedPortForwards.forEach((portforward: PortForwardState) => {
-          const isStoragePortForwardAvailableInServer = portForwards.find(
-            (pf: PortForwardState) => pf.id === portforward.id
+          if (portforward.cluster === cluster && !isPortForwardOnConnection(portforward, revision))
+            return;
+          const isStoragePortForwardAvailableInServer = portForwards.some((pf: PortForwardState) =>
+            samePortForward(pf, portforward)
           );
           if (!isStoragePortForwardAvailableInServer) {
             portforward.status = PORT_FORWARD_STOP_STATUS;
@@ -237,6 +237,7 @@ function PortForwardContent(props: PortForwardProps) {
               namespace,
               name,
               cluster,
+              revision,
               numericContainerPort,
             })
           ) {
@@ -244,7 +245,7 @@ function PortForwardContent(props: PortForwardProps) {
           }
         }
 
-        if (!cancelled) {
+        if (isCurrent()) {
           localStorage.setItem(
             PORT_FORWARDS_STORAGE_KEY,
             JSON.stringify(serverAndStoragePortForwards)
@@ -252,7 +253,7 @@ function PortForwardContent(props: PortForwardProps) {
         }
       })
       .catch(err => {
-        if (cancelled) {
+        if (!isCurrent()) {
           return;
         }
         console.error('Failed to list port forwards', err);
@@ -263,31 +264,27 @@ function PortForwardContent(props: PortForwardProps) {
     return () => {
       cancelled = true;
     };
-  }, [cluster, namespace, name, numericContainerPort, shouldRender]);
+  }, [cluster, currentResource, namespace, name, numericContainerPort, revision, shouldRender]);
 
   if (!shouldRender) {
     return null;
   }
 
   function startPortForwardWithSelection(chosenPort?: string) {
-    if (!namespace || !cluster || !pods) {
+    if (!startRequest) return;
+    const { cluster, revision, ...request } = startRequest;
+    if (getDiscoveredConnectionRevision(cluster) !== revision) {
+      setError(createDiscoveryConnectionChangedError().message);
       return;
     }
-
     setError(null);
-
-    const resourceName = name || '';
-    const podNamespace = isPod ? namespace : pods[0].metadata.namespace!;
-    const serviceNamespace = namespace;
-    const serviceName = !isPod ? resourceName : '';
-    const podName = isPod ? resourceName : pods![0].metadata.name;
-    let port = chosenPort || portForward?.port;
+    let port = chosenPort || request.port;
 
     let address = 'localhost';
     if (isDockerDesktop()) {
       address = '0.0.0.0';
 
-      if (!chosenPort && !portForward?.port) {
+      if (!chosenPort && !request.port) {
         const activePorts: string[] = [];
         const parsedPortForwards = getPortForwardsFromStorage();
         parsedPortForwards.forEach((pf: PortForwardState) => {
@@ -318,35 +315,30 @@ function PortForwardContent(props: PortForwardProps) {
     }
 
     setLoading(true);
-    startPortForward(
-      cluster,
-      podNamespace,
-      podName,
-      numericContainerPort,
-      serviceName,
-      serviceNamespace,
-      port,
-      address,
-      portForward?.id
-    )
+    startPortForwardForConnection({ cluster, revision }, { ...request, port, address })
       .then((data: PortForwardState) => {
-        setLoading(false);
-        setPortForward(data);
-
         const parsedPortForwards = getPortForwardsFromStorage();
         parsedPortForwards.push(data);
         localStorage.setItem(PORT_FORWARDS_STORAGE_KEY, JSON.stringify(parsedPortForwards));
+        if (getDiscoveredConnectionRevision(cluster) !== revision) return;
+        setLoading(false);
+        setPortForward(data);
       })
       .catch(error => {
+        if (getDiscoveredConnectionRevision(cluster) !== revision) return;
         const message = getErrorMessage(error);
         setError(message || 'An unexpected error occurred.');
         setLoading(false);
+        if (isDiscoveryConnectionChanged(error)) return;
         setPortForward(null);
 
-        if (portForward?.id) {
+        if (request.id) {
           const parsedPortForwards = getPortForwardsFromStorage();
           const index = parsedPortForwards.findIndex(
-            (pf: PortForwardState) => pf.id === portForward.id
+            pf =>
+              pf.id === request.id &&
+              pf.cluster === cluster &&
+              isPortForwardOnConnection(pf, revision)
           );
           if (index !== -1) {
             parsedPortForwards.splice(index, 1);
@@ -357,54 +349,91 @@ function PortForwardContent(props: PortForwardProps) {
   }
 
   function openStartDialog() {
-    setStartDialogOpen(true);
+    if (!resource || !namespace || !cluster || !selectedPod) return;
+    const origin = getResourceDiscoveryConnection(resource);
+    const podOrigin = getResourceDiscoveryConnection(selectedPod);
+    if (
+      (origin && origin.cluster !== cluster) ||
+      (podOrigin && podOrigin.cluster !== cluster) ||
+      (origin && podOrigin && origin.revision !== podOrigin.revision)
+    ) {
+      setError(createDiscoveryConnectionChangedError().message);
+      return;
+    }
+    const connection = origin ?? podOrigin;
+    setStartRequest({
+      cluster,
+      revision: connection ? connection.revision : getDiscoveredConnectionRevision(cluster),
+      namespace: isPod ? namespace : selectedPod.metadata.namespace!,
+      pod: selectedPod.metadata.name,
+      service: isPod ? '' : name,
+      serviceNamespace: namespace,
+      targetPort: numericContainerPort.toString(),
+      port: portForward?.port,
+      id: portForward?.id ?? '',
+    });
   }
 
   function closeStartDialog() {
-    setStartDialogOpen(false);
+    setStartRequest(null);
   }
 
   function portForwardStopHandler() {
-    if (!portForward || !cluster) {
+    if (
+      !portForward ||
+      !cluster ||
+      getDiscoveredConnectionRevision(cluster) !== revision ||
+      !isPortForwardOnConnection(portForward, revision)
+    ) {
       return;
     }
     setLoading(true);
     stopOrDeletePortForward(cluster, portForward.id, true)
       .then(() => {
+        if (getDiscoveredConnectionRevision(cluster) !== revision) return;
         setPortForward({ ...portForward, status: PORT_FORWARD_STOP_STATUS });
       })
       .catch(error => {
+        if (getDiscoveredConnectionRevision(cluster) !== revision) return;
         const message = getErrorMessage(error);
         setError(message || 'Failed to stop port forward');
         setPortForward(null);
       })
       .finally(() => {
-        setLoading(false);
+        if (getDiscoveredConnectionRevision(cluster) === revision) setLoading(false);
       });
   }
 
   function deletePortForwardHandler() {
-    const id = portForward?.id;
-    if (!cluster || !id) {
+    if (!cluster || !portForward) return;
+    const isCurrent = () => getDiscoveredConnectionRevision(cluster) === revision;
+    if (!isCurrent() || !isPortForwardOnConnection(portForward, revision)) {
+      const error = removeSavedPortForward(portForward);
+      if (error && isCurrent()) setError(error.message);
       return;
     }
+
     setLoading(true);
-    stopOrDeletePortForward(cluster, id, false)
+    stopOrDeletePortForward(cluster, portForward.id, false)
       .then(() => {
-        const parsedPortForwards = getPortForwardsFromStorage();
-        const index = parsedPortForwards.findIndex((pf: PortForwardState) => pf.id === id);
-        if (index !== -1) {
-          parsedPortForwards.splice(index, 1);
-          localStorage.setItem(PORT_FORWARDS_STORAGE_KEY, JSON.stringify(parsedPortForwards));
+        const error = removeSavedPortForward(portForward);
+        if (!isCurrent()) return;
+        if (error) {
+          setError(error.message);
+        } else {
+          setPortForward(null);
         }
-        setPortForward(null);
       })
       .catch(error => {
+        if (!isCurrent()) {
+          removeSavedPortForward(portForward);
+          return;
+        }
         const message = getErrorMessage(error);
         setError(message || 'Failed to delete port forward');
       })
       .finally(() => {
-        setLoading(false);
+        if (isCurrent()) setLoading(false);
       });
   }
 
@@ -507,6 +536,15 @@ function PortForwardContent(props: PortForwardProps) {
             <>
               <MuiLink
                 href={`${forwardBaseURL}:${portForward.port}`}
+                onClick={event => {
+                  if (
+                    !cluster ||
+                    getDiscoveredConnectionRevision(cluster) !== revision ||
+                    !isPortForwardOnConnection(portForward, revision)
+                  ) {
+                    event.preventDefault();
+                  }
+                }}
                 target="_blank"
                 rel="noopener noreferrer"
                 color="primary"
@@ -530,11 +568,11 @@ function PortForwardContent(props: PortForwardProps) {
         </>
       )}
       <PortForwardStartDialog
-        open={startDialogOpen}
-        defaultPort={portForward?.port}
-        podName={displayPodName}
-        namespace={namespace}
-        containerPort={numericContainerPort}
+        open={!!startRequest}
+        defaultPort={startRequest?.port}
+        podName={startRequest?.pod ?? ''}
+        namespace={startRequest?.serviceNamespace ?? ''}
+        containerPort={startRequest?.targetPort ?? ''}
         isDockerDesktop={isDockerDesktop()}
         onCancel={closeStartDialog}
         onConfirm={portInput => {

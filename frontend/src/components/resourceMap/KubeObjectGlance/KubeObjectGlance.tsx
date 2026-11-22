@@ -16,18 +16,18 @@
 
 import { Icon } from '@iconify/react';
 import { Box } from '@mui/system';
-import { memo, useEffect, useState } from 'react';
+import { memo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { KubeObject } from '../../../lib/k8s/cluster';
 import Deployment from '../../../lib/k8s/deployment';
 import Endpoints from '../../../lib/k8s/endpoints';
-import Event, { KubeEvent } from '../../../lib/k8s/event';
 import HPA from '../../../lib/k8s/hpa';
 import Pod from '../../../lib/k8s/pod';
 import ReplicaSet from '../../../lib/k8s/replicaSet';
 import Service from '../../../lib/k8s/service';
 import StatefulSet from '../../../lib/k8s/statefulSet';
 import { DateLabel } from '../../common/Label';
+import { useObjectEvents } from '../../common/ObjectEventList';
 import { LightTooltip } from '../../common/Tooltip';
 import { DeploymentGlance } from './DeploymentGlance';
 import { EndpointsGlance } from './EndpointsGlance';
@@ -41,13 +41,7 @@ import { ServiceGlance } from './ServiceGlance';
  */
 export const KubeObjectGlance = memo(({ resource }: { resource: KubeObject }) => {
   const { t } = useTranslation();
-  const [events, setEvents] = useState<Event[]>([]);
-  useEffect(() => {
-    Event.objectEvents(resource).then(fetchedEvents =>
-      setEvents(fetchedEvents.map((event: KubeEvent) => new Event(event)))
-    );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  const events = useObjectEvents(resource);
 
   const sections = [];
 

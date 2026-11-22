@@ -1,0 +1,219 @@
+/*
+ * Copyright 2026 The Kubernetes Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import React from 'react';
+import { afterEach, expect, it, vi } from 'vitest';
+import * as discoveredRevisions from '../../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import { recordDiscoveryConnection } from '../../../lib/k8s/api/v2/discoveryConnection';
+import Deployment from '../../../lib/k8s/deployment';
+import type { RollbackResult } from '../../../lib/k8s/rollback';
+import { clusterAction } from '../../../redux/clusterActionSlice';
+import { TestContext } from '../../../test';
+import { RollbackDialog } from './index';
+import RollbackButton from './RollbackButton';
+
+vi.mock('./AuthVisible', () => ({
+  default: ({ children }: React.PropsWithChildren) => children,
+}));
+
+vi.mock('../../../redux/clusterActionSlice', async importOriginal => ({
+  ...(await importOriginal<typeof import('../../../redux/clusterActionSlice')>()),
+  clusterAction: vi.fn(() => ({ type: 'clusterAction/test' })),
+}));
+
+afterEach(() => vi.restoreAllMocks());
+
+it('keeps the public dialog label, history, and callbacks on the open target', async () => {
+  const makeTarget = (name: string, revision: number) => {
+    const base = Deployment.getBaseObject();
+    const resource = new Deployment(
+      { ...base, metadata: { ...base.metadata, name } },
+      'discovered'
+    );
+    const rollback = vi
+      .spyOn(resource, 'rollback')
+      .mockResolvedValue({ success: true, message: 'ok' });
+    return {
+      resource,
+      rollback,
+      getRevisionHistory: vi
+        .fn()
+        .mockResolvedValue([
+          { revision, createdAt: '2026-01-01T00:00:00Z', images: [], isCurrent: false },
+        ]),
+      onConfirm: vi.fn(),
+    };
+  };
+  const original = makeTarget('original-workload', 1);
+  const replacement = makeTarget('replacement-workload', 2);
+  const content = ({ resource, getRevisionHistory, onConfirm }: typeof original) => (
+    <TestContext>
+      <RollbackDialog
+        open
+        resourceKind={resource.kind}
+        resourceName={resource.getName()}
+        resource={resource}
+        getRevisionHistory={getRevisionHistory}
+        onClose={vi.fn()}
+        onConfirm={onConfirm}
+      />
+    </TestContext>
+  );
+  const { rerender } = render(content(original));
+  const preview = await screen.findByTestId('preview-button');
+  await waitFor(() => expect(preview).toBeEnabled());
+
+  rerender(content(replacement));
+  expect(screen.getByText(/original-workload/)).toBeInTheDocument();
+  expect(replacement.getRevisionHistory).not.toHaveBeenCalled();
+  fireEvent.click(preview);
+  expect(original.rollback).toHaveBeenCalledWith({ toRevision: 1, dryRun: true });
+  expect(replacement.rollback).not.toHaveBeenCalled();
+  const confirm = screen.getByTestId('confirm-button');
+  await waitFor(() => expect(confirm).toBeEnabled());
+  fireEvent.click(confirm);
+  expect(original.onConfirm).toHaveBeenCalledWith(1);
+  expect(replacement.onConfirm).not.toHaveBeenCalled();
+});
+
+it.each([false, true])(
+  'supports the public dialog resource prop with replacement %s',
+  async replaced => {
+    const revision = vi
+      .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+      .mockReturnValue('same:1');
+    const resource = new Deployment(Deployment.getBaseObject(), 'discovered');
+    const rollback = vi
+      .spyOn(resource, 'rollback')
+      .mockResolvedValue({ success: true, message: 'ok' });
+    const onConfirm = vi.fn();
+    const getRevisionHistory = vi
+      .fn()
+      .mockResolvedValue([
+        { revision: 1, createdAt: '2026-01-01T00:00:00Z', images: [], isCurrent: false },
+      ]);
+    render(
+      <TestContext>
+        <RollbackDialog
+          open
+          resourceKind={resource.kind}
+          resourceName={resource.getName()}
+          resource={resource}
+          getRevisionHistory={getRevisionHistory}
+          onClose={vi.fn()}
+          onConfirm={onConfirm}
+        />
+      </TestContext>
+    );
+    const preview = await screen.findByTestId('preview-button');
+    await waitFor(() => expect(preview).toBeEnabled());
+
+    if (replaced) revision.mockReturnValue('same:2');
+    fireEvent.click(preview);
+
+    if (replaced) {
+      expect(await screen.findByText(/discovered cluster connection changed/i)).toBeInTheDocument();
+      expect(rollback).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByTestId('confirm-button'));
+      expect(onConfirm).not.toHaveBeenCalled();
+    } else {
+      expect(rollback).toHaveBeenCalledWith({ toRevision: 1, dryRun: true });
+      const confirm = screen.getByTestId('confirm-button');
+      await waitFor(() => expect(confirm).toBeEnabled());
+      fireEvent.click(confirm);
+      expect(onConfirm).toHaveBeenCalledWith(1);
+    }
+  }
+);
+
+it.each(['before preview', 'during preview'])(
+  'rejects preview for a retained workload when the connection changes %s',
+  async when => {
+    const revision = vi
+      .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+      .mockReturnValue('same:1');
+    const original = new Deployment(Deployment.getBaseObject(), 'discovered');
+    vi.spyOn(original, 'getRevisionHistory').mockResolvedValue([
+      { revision: 1, createdAt: '2026-01-01T00:00:00Z', images: [], isCurrent: false },
+    ]);
+    const pending = Promise.withResolvers<RollbackResult>();
+    const rollback = vi.spyOn(original, 'rollback').mockReturnValue(pending.promise);
+    render(
+      <TestContext>
+        <RollbackButton item={original} />
+      </TestContext>
+    );
+    fireEvent.click(screen.getByLabelText('Rollback'));
+    const preview = await screen.findByRole('button', { name: /preview/i });
+    await waitFor(() => expect(preview).toBeEnabled());
+
+    if (when === 'before preview') {
+      revision.mockReturnValue('same:2');
+      fireEvent.click(preview);
+      expect(rollback).not.toHaveBeenCalled();
+    } else {
+      fireEvent.click(preview);
+      expect(rollback).toHaveBeenCalledWith({ toRevision: 1, dryRun: true });
+      revision.mockReturnValue('same:2');
+      await act(async () =>
+        pending.resolve({ success: true, message: 'ok', dryRunResult: Deployment.getBaseObject() })
+      );
+    }
+
+    expect(await screen.findByText(/discovered cluster connection changed/i)).toBeInTheDocument();
+  }
+);
+
+it('does not roll back a replacement workload from the already open dialog', async () => {
+  const cluster = 'discovered';
+  const original = new Deployment(Deployment.getBaseObject(), cluster);
+  const replacement = new Deployment(Deployment.getBaseObject(), cluster);
+  recordDiscoveryConnection(original, cluster, 'same:1');
+  recordDiscoveryConnection(replacement, cluster, 'same:2');
+  const revision = vi
+    .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+    .mockReturnValue('same:1');
+  const history = [
+    { revision: 1, createdAt: '2026-01-01T00:00:00Z', images: [], isCurrent: false },
+  ];
+  vi.spyOn(original, 'getRevisionHistory').mockResolvedValue(history);
+  vi.spyOn(replacement, 'getRevisionHistory').mockResolvedValue(history);
+  const rollbackOriginal = vi
+    .spyOn(original, 'rollback')
+    .mockResolvedValue({ success: true, message: 'ok' });
+  const rollbackReplacement = vi
+    .spyOn(replacement, 'rollback')
+    .mockResolvedValue({ success: true, message: 'ok' });
+  const content = (item: Deployment) => (
+    <TestContext>
+      <RollbackButton item={item} />
+    </TestContext>
+  );
+  const { rerender } = render(content(original));
+  fireEvent.click(screen.getByLabelText('Rollback'));
+  await waitFor(() => expect(screen.getByTestId('confirm-button')).toBeEnabled());
+  fireEvent.click(screen.getByTestId('confirm-button'));
+  const [rollback] = vi.mocked(clusterAction).mock.lastCall!;
+
+  revision.mockReturnValue('same:2');
+  rerender(content(replacement));
+  await act(async () => {
+    await expect(rollback()).rejects.toMatchObject({ status: 409 });
+  });
+  expect(rollbackOriginal).not.toHaveBeenCalled();
+  expect(rollbackReplacement).not.toHaveBeenCalled();
+});

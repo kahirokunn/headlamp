@@ -14,8 +14,11 @@
  * limitations under the License.
  */
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import React from 'react';
+import * as discoveredRevisions from '../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import { setConfig } from '../../redux/configSlice';
+import store from '../../redux/stores/store';
 import { TestContext } from '../../test';
 import PortForwardingList from './index';
 vi.mock('react-i18next', async importOriginal => {
@@ -50,9 +53,10 @@ const {
   mockEnqueueSnackbar: vi.fn(),
 }));
 
-vi.mock('../../lib/k8s/api/v1/portForward', () => ({
+vi.mock('../../lib/k8s/api/v1/portForward', async importOriginal => ({
+  ...(await importOriginal<object>()),
   listPortForward: (...args: any[]) => mockListPortForward(...args),
-  startPortForward: (...args: any[]) => mockStartPortForward(...args),
+  startPortForwardForConnection: (...args: any[]) => mockStartPortForward(...args),
   stopOrDeletePortForward: (...args: any[]) => mockStopOrDeletePortForward(...args),
 }));
 
@@ -420,6 +424,163 @@ describe('PortForwardingList', () => {
     );
   });
 
+  it('does not open a local port from a superseded connection', async () => {
+    const pf = makePortForward({ status: PORT_FORWARD_RUNNING_STATUS, port: '8080' });
+    mockListPortForward.mockResolvedValue([pf]);
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null);
+    const revision = vi.spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision');
+
+    try {
+      renderList();
+      await waitFor(() => expect(mockTable).toHaveBeenCalled());
+      const localPortColumn = mockTable.mock.lastCall?.[0].columns.find(
+        (column: { id: string }) => column.id === 'localPort'
+      );
+      const { getByText } = render(localPortColumn.Cell({ row: { original: pf } }));
+
+      revision.mockReturnValue('replacement:1');
+      fireEvent.click(getByText('8080'));
+      expect(open).not.toHaveBeenCalled();
+    } finally {
+      open.mockRestore();
+      revision.mockRestore();
+    }
+  });
+
+  it('displays one session and removes obsolete saved forwards for the active cluster', async () => {
+    const initial = store.getState().config.clusters;
+    const cluster = 'port-forward-scope';
+    mockGetCluster.mockReturnValue(cluster);
+    const original = makePortForward({
+      cluster,
+      connectionRevision: 'original',
+      status: PORT_FORWARD_STOP_STATUS,
+    });
+    const replacement = { ...original, connectionRevision: 'replacement' };
+    store.dispatch(
+      setConfig({
+        clusters: {
+          [cluster]: {
+            name: cluster,
+            auth_type: 'oidc',
+            meta_data: { discoveryOrigin: {}, discoveryConnectionRevision: 'replacement' },
+          } as any,
+        },
+      })
+    );
+    mockListPortForward.mockResolvedValueOnce([replacement]).mockResolvedValue([]);
+    mockStopOrDeletePortForward.mockResolvedValue(undefined);
+    const otherCluster = { ...original, cluster: 'other-cluster' };
+    localStorage.setItem(PORT_FORWARDS_STORAGE_KEY, JSON.stringify([original, otherCluster]));
+
+    const page = renderList();
+    try {
+      fireEvent.click(await screen.findByRole('button', { name: 'Actions' }));
+      fireEvent.click(screen.getByRole('menuitem', { name: 'translation|Delete' }));
+      await waitFor(() => expect(mockListPortForward).toHaveBeenCalledTimes(2));
+
+      const saved = JSON.parse(localStorage.getItem(PORT_FORWARDS_STORAGE_KEY) || '[]');
+      expect(saved).toEqual([otherCluster]);
+    } finally {
+      page.unmount();
+      store.dispatch(setConfig({ clusters: initial }));
+    }
+  });
+
+  it('reports storage errors when deleting an obsolete saved row', async () => {
+    const original = makePortForward({ status: PORT_FORWARD_STOP_STATUS });
+    mockListPortForward.mockResolvedValue([original]);
+    const revision = vi.spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision');
+
+    try {
+      renderList();
+      fireEvent.click(await screen.findByRole('button', { name: 'Actions' }));
+      revision.mockReturnValue('replacement:1');
+      const storage = vi.spyOn(localStorage, 'setItem').mockImplementationOnce(() => {
+        throw new Error('Saved port forwards cannot be written');
+      });
+      try {
+        fireEvent.click(screen.getByRole('menuitem', { name: 'translation|Delete' }));
+        expect(mockStopOrDeletePortForward).not.toHaveBeenCalled();
+        expect(mockEnqueueSnackbar).toHaveBeenCalledWith('Saved port forwards cannot be written', {
+          variant: 'error',
+        });
+      } finally {
+        storage.mockRestore();
+      }
+    } finally {
+      revision.mockRestore();
+    }
+  });
+
+  it('deletes only the original saved forward when the connection changes during delete', async () => {
+    const original = makePortForward({ status: PORT_FORWARD_STOP_STATUS });
+    const replacement = { ...original, connectionRevision: 'replacement' };
+    const deletion = Promise.withResolvers<void>();
+    mockListPortForward.mockResolvedValue([original]);
+    mockStopOrDeletePortForward.mockReturnValueOnce(deletion.promise);
+    const revision = vi.spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision');
+
+    try {
+      renderList();
+      fireEvent.click(await screen.findByRole('button', { name: 'Actions' }));
+      fireEvent.click(screen.getByRole('menuitem', { name: 'translation|Delete' }));
+      expect(mockStopOrDeletePortForward).toHaveBeenCalledTimes(1);
+
+      localStorage.setItem(PORT_FORWARDS_STORAGE_KEY, JSON.stringify([original, replacement]));
+      revision.mockReturnValueOnce('replacement:1').mockReturnValue('replacement:1');
+      await act(async () => {
+        deletion.reject(new Error('Discovered cluster connection changed'));
+        await deletion.promise.catch(() => {});
+      });
+
+      expect(JSON.parse(localStorage.getItem(PORT_FORWARDS_STORAGE_KEY)!)).toEqual([replacement]);
+      expect(mockListPortForward).toHaveBeenCalledTimes(1);
+      expect(mockEnqueueSnackbar).not.toHaveBeenCalled();
+    } finally {
+      revision.mockRestore();
+    }
+  });
+
+  it('rejects a row from a former connection even if rendered after the replacement', async () => {
+    const cluster = 'port-forward-link-scope';
+    const initial = store.getState().config.clusters;
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null);
+    const obsolete = makePortForward({ cluster, connectionRevision: 'original' });
+    mockGetCluster.mockReturnValue(cluster);
+    mockListPortForward.mockResolvedValue([]);
+
+    store.dispatch(
+      setConfig({
+        clusters: {
+          [cluster]: {
+            name: cluster,
+            auth_type: 'oidc',
+            meta_data: {
+              discoveryOrigin: {},
+              discoveryConnectionRevision: 'replacement',
+            },
+          } as any,
+        },
+      })
+    );
+
+    const page = renderList();
+    try {
+      await waitFor(() => expect(mockListPortForward).toHaveBeenCalled());
+      const column = mockTable.mock.lastCall?.[0].columns.find(
+        (column: { id: string }) => column.id === 'localPort'
+      );
+      const cell = render(column.Cell({ row: { original: obsolete } }));
+      fireEvent.click(cell.getByText('8080'));
+      expect(open).not.toHaveBeenCalled();
+    } finally {
+      page.unmount();
+      open.mockRestore();
+      store.dispatch(setConfig({ clusters: initial }));
+    }
+  });
+
   it('deletes a stored forward so a refresh does not resurrect it', async () => {
     const pf = makePortForward({ status: PORT_FORWARD_STOP_STATUS });
     mockListPortForward.mockResolvedValueOnce([pf]).mockResolvedValue([]);
@@ -452,15 +613,17 @@ describe('PortForwardingList', () => {
 
     await waitFor(() =>
       expect(mockStartPortForward).toHaveBeenCalledWith(
-        'test-cluster',
-        'default',
-        'my-pod',
-        '80',
-        '',
-        '',
-        '9090',
-        'localhost',
-        'pf-1'
+        { cluster: 'test-cluster', revision: undefined },
+        {
+          id: 'pf-1',
+          namespace: 'default',
+          pod: 'my-pod',
+          targetPort: '80',
+          service: '',
+          serviceNamespace: '',
+          port: '9090',
+          address: 'localhost',
+        }
       )
     );
     expect(mockListPortForward).toHaveBeenCalledTimes(2);
@@ -494,6 +657,39 @@ describe('PortForwardingList', () => {
     );
     expect(logError).toHaveBeenCalledWith('Error starting port forward:', error);
     logError.mockRestore();
+  });
+
+  it('reports a late start failure while a different forward is stopping', async () => {
+    const start = Promise.withResolvers<never>();
+    const stop = Promise.withResolvers<undefined>();
+    const stopped = makePortForward({ status: PORT_FORWARD_STOP_STATUS });
+    const running = makePortForward({ id: 'pf-2', pod: 'another-pod' });
+    mockListPortForward.mockResolvedValue([stopped, running]);
+    mockStartPortForward.mockReturnValue(start.promise);
+    mockStopOrDeletePortForward.mockReturnValue(stop.promise);
+    const logError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      renderList();
+      const actions = async (id: string) =>
+        within(await screen.findByTestId(`pf-row-${id}`)).findByRole('button', { name: 'Actions' });
+      fireEvent.click(await actions(stopped.id));
+      fireEvent.click(screen.getByRole('menuitem', { name: 'translation|Start' }));
+      fireEvent.click(screen.getByRole('button', { name: 'translation|Start' }));
+      fireEvent.click(await actions(running.id));
+      fireEvent.click(screen.getByRole('menuitem', { name: 'translation|Stop' }));
+      await waitFor(() => expect(mockStopOrDeletePortForward).toHaveBeenCalledOnce());
+
+      const error = new Error('address already in use');
+      await act(async () => start.reject(error));
+      expect(logError).toHaveBeenCalledWith('Error starting port forward:', error);
+      expect(mockEnqueueSnackbar).toHaveBeenCalledWith(
+        'translation|Error starting port forward: address already in use',
+        expect.objectContaining({ variant: 'error' })
+      );
+      await act(async () => stop.resolve(undefined));
+    } finally {
+      logError.mockRestore();
+    }
   });
 
   it('stops a forward, refreshes the list and reports backend errors', async () => {

@@ -33,7 +33,7 @@ import { ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 're
 import { Trans, useTranslation } from 'react-i18next';
 import { useHistory } from 'react-router';
 import { useClustersConf } from '../../lib/k8s';
-import { apply } from '../../lib/k8s/api/v1/apply';
+import { prepareApply } from '../../lib/k8s/api/v1/apply';
 import { ApiError } from '../../lib/k8s/api/v2/ApiError';
 import { KubeObjectInterface } from '../../lib/k8s/KubeObject';
 import Namespace from '../../lib/k8s/namespace';
@@ -270,6 +270,9 @@ function ProjectFromExistingNamespace({ onBack }: { onBack: () => void }) {
   const handleCreate = async () => {
     if (!isReadyToCreate || isCreating) return;
 
+    const applyByCluster = new Map(
+      selectedClusters.map(cluster => [cluster, prepareApply(cluster)] as const)
+    );
     const attempt = beginWrites(projectName);
     if (attempt.isNewDefinition) {
       dispatchCreateProjectEvent({
@@ -288,10 +291,6 @@ function ProjectFromExistingNamespace({ onBack }: { onBack: () => void }) {
       const existingNamespaces =
         namespaces?.filter(it => it.metadata.name === effectiveNamespace) ?? [];
       const clustersWithExistingNamespace = existingNamespaces.map(it => it.cluster);
-      // Create new namespace in all selected clusters that don't already have it
-      const clustersWithoutNamespace = selectedClusters.filter(
-        it => !clustersWithExistingNamespace.includes(it)
-      );
       // Namespaces that already carry the label, e.g. from an earlier attempt, are done
       const namespacesToPatch: Namespace[] = [];
       for (const it of existingNamespaces) {
@@ -321,7 +320,9 @@ function ProjectFromExistingNamespace({ onBack }: { onBack: () => void }) {
         if (failed) throw failed.reason;
       }
 
-      for (const cluster of clustersWithoutNamespace) {
+      // Create the namespace in the selected clusters that do not have it.
+      for (const [cluster, applyToCluster] of applyByCluster) {
+        if (clustersWithExistingNamespace.includes(cluster)) continue;
         const namespace = {
           kind: 'Namespace',
           apiVersion: 'v1',
@@ -332,7 +333,7 @@ function ProjectFromExistingNamespace({ onBack }: { onBack: () => void }) {
             },
           } as any,
         } as KubeObjectInterface;
-        await apply(namespace, cluster);
+        await applyToCluster(namespace);
         attempt.markWritten(cluster);
       }
 

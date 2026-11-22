@@ -16,6 +16,7 @@
 
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { getResourceDiscoveryConnection } from '../../lib/k8s/api/v2/discoveryConnection';
 import Event, { KubeEvent } from '../../lib/k8s/event';
 import { KubeObject } from '../../lib/k8s/KubeObject';
 import { localeDate, timeAgo } from '../../lib/util';
@@ -38,6 +39,7 @@ function getObjectEventsKey(object: KubeObject | null) {
 
   return [
     object.cluster,
+    getResourceDiscoveryConnection(object)?.revision,
     object.kind,
     object.metadata.namespace,
     object.metadata.name,

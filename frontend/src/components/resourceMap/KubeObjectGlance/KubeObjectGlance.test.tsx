@@ -96,7 +96,7 @@ describe('KubeObjectGlance', () => {
     ['StatefulSet', 'set-glance'],
     ['HorizontalPodAutoscaler', 'hpa-glance'],
   ])('dispatches %s resources', (kind, expected) => {
-    render(<KubeObjectGlance resource={{ matches: [kind] } as any} />);
+    render(<KubeObjectGlance resource={{ metadata: {}, matches: [kind] } as any} />);
 
     expect(screen.getByText(expected)).toBeInTheDocument();
   });
@@ -106,6 +106,7 @@ describe('KubeObjectGlance', () => {
       <KubeObjectGlance
         resource={
           {
+            metadata: {},
             matches: [
               'Pod',
               'Deployment',
@@ -129,7 +130,7 @@ describe('KubeObjectGlance', () => {
   });
 
   it('loads events once, converts them, and displays only the first five', async () => {
-    const resource = { matches: [] } as any;
+    const resource = { metadata: {}, matches: [] } as any;
     mocks.objectEvents.mockResolvedValue(
       Array.from({ length: 7 }, (_, index) => ({
         message: `event-${index + 1}`,
@@ -146,13 +147,15 @@ describe('KubeObjectGlance', () => {
     expect(screen.queryByText('time-6:mini')).not.toBeInTheDocument();
     expect(mocks.objectEvents).toHaveBeenCalledWith(resource);
 
-    rerender(<KubeObjectGlance resource={{ matches: ['Pod'] } as any} />);
+    rerender(<KubeObjectGlance resource={{ metadata: {}, matches: ['Pod'] } as any} />);
     expect(mocks.objectEvents).toHaveBeenCalledTimes(1);
   });
 
   it('renders no sections when the resource is unsupported and has no events', async () => {
     mocks.objectEvents.mockResolvedValue([]);
-    const { container } = render(<KubeObjectGlance resource={{ matches: [] } as any} />);
+    const { container } = render(
+      <KubeObjectGlance resource={{ metadata: {}, matches: [] } as any} />
+    );
 
     await waitFor(() => expect(mocks.objectEvents).toHaveBeenCalledTimes(1));
     expect(container).toBeEmptyDOMElement();

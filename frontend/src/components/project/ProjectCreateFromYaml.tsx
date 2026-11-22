@@ -36,7 +36,7 @@ import { useDropzone } from 'react-dropzone';
 import { Trans, useTranslation } from 'react-i18next';
 import { Redirect, useHistory } from 'react-router';
 import { useClustersConf } from '../../lib/k8s';
-import { apply } from '../../lib/k8s/api/v1/apply';
+import { prepareApply } from '../../lib/k8s/api/v1/apply';
 import { ApiError } from '../../lib/k8s/api/v2/ApiError';
 import { KubeObjectInterface } from '../../lib/k8s/KubeObject';
 import Namespace from '../../lib/k8s/namespace';
@@ -104,6 +104,7 @@ async function createProjectFromYaml({
   cluster: string;
   setCreationState: Dispatch<SetStateAction<CreationState>>;
 }) {
+  const applyToCluster = prepareApply(cluster);
   const itemsToCreate = structuredClone(items);
 
   itemsToCreate.forEach(item => {
@@ -128,7 +129,7 @@ async function createProjectFromYaml({
   });
 
   // Nothing else can be created without the namespace, so a failure here stops the creation.
-  await apply(namespace, cluster);
+  await applyToCluster(namespace);
 
   // Like `kubectl apply`, keep applying the other resources when one fails, then report every
   // failure.
@@ -141,7 +142,7 @@ async function createProjectFromYaml({
       creatingResource: item,
     });
     try {
-      await apply(item, cluster);
+      await applyToCluster(item);
       created.push(item);
     } catch (error) {
       failed.push({ resource: item, message: (error as Error).message });

@@ -25,6 +25,12 @@ import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useDispatch } from 'react-redux';
 import { getCluster } from '../../lib/cluster';
+import { getDiscoveredConnectionRevision } from '../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import {
+  assertCurrentDiscoveryConnection,
+  bindDiscoveryConnection,
+  isDiscoveryConnectionChanged,
+} from '../../lib/k8s/api/v2/discoveryConnection';
 import Namespace from '../../lib/k8s/namespace';
 import { clusterAction } from '../../redux/clusterActionSlice';
 import { EventStatus, HeadlampEventType, useEventCallback } from '../../redux/headlampEventSlice';
@@ -36,12 +42,18 @@ export default function CreateNamespaceButton() {
   const { t } = useTranslation(['glossary', 'translation']);
   const [namespaceName, setNamespaceName] = useState('');
   const [namespaceDialogOpen, setNamespaceDialogOpen] = useState(false);
+  const [namespaceConnection, setNamespaceConnection] = useState<{
+    cluster: string;
+    revision?: string;
+  }>();
   const [namespaceExistsError, setNamespaceExistsError] = useState(false);
   const dispatchCreateEvent = useEventCallback(HeadlampEventType.CREATE_RESOURCE);
   const dispatch: AppDispatch = useDispatch();
 
   function createNewNamespace() {
-    const clusterData = getCluster();
+    if (!namespaceConnection) return;
+    const { cluster, revision } = namespaceConnection;
+    const query = bindDiscoveryConnection({}, revision);
     const newNamespaceData = {
       apiVersion: 'v1',
       kind: 'Namespace',
@@ -54,13 +66,14 @@ export default function CreateNamespaceButton() {
 
     async function namespaceRequest() {
       try {
-        const response = await Namespace.apiEndpoint.post(newNamespaceData, {}, clusterData || '');
+        assertCurrentDiscoveryConnection(cluster, revision);
+        const response = await Namespace.apiEndpoint.post(newNamespaceData, query, cluster);
         setNamespaceName('');
         return response;
       } catch (error: any) {
         const statusCode = error?.status;
         console.error('Error creating namespace:', error);
-        if (statusCode === 409) {
+        if (statusCode === 409 && !isDiscoveryConnectionChanged(error)) {
           setNamespaceDialogOpen(true);
           setNamespaceExistsError(true);
         }
@@ -119,6 +132,8 @@ export default function CreateNamespaceButton() {
         description={t('translation|Create Namespace')}
         icon={'mdi:plus-circle'}
         onClick={() => {
+          const cluster = getCluster() || '';
+          setNamespaceConnection({ cluster, revision: getDiscoveredConnectionRevision(cluster) });
           setNamespaceDialogOpen(true);
         }}
       />

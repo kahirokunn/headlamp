@@ -17,6 +17,11 @@
 import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
 import React from 'react';
 import { labelSelectorToQuery } from '../../../lib/k8s';
+import * as discoveredRevisions from '../../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import {
+  getResourceDiscoveryConnection,
+  recordDiscoveryConnection,
+} from '../../../lib/k8s/api/v2/discoveryConnection';
 import Deployment from '../../../lib/k8s/deployment';
 import Job from '../../../lib/k8s/job';
 import Pod from '../../../lib/k8s/pod';
@@ -258,6 +263,7 @@ describe('LogsButton', () => {
   beforeEach(() => {
     originalGetLogs = Pod.prototype.getLogs;
     vi.clearAllMocks();
+    mockClusterFetch.mockReset();
     vi.useRealTimers();
   });
 
@@ -373,6 +379,80 @@ describe('LogsButton', () => {
     });
 
     expect(vi.mocked(labelSelectorToQuery)).not.toHaveBeenCalled();
+  });
+
+  it('lists and streams workload pods on the workload connection', async () => {
+    const item = new Deployment(deploymentData as any, 'east');
+    const revision = vi
+      .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+      .mockReturnValue('original:1');
+    recordDiscoveryConnection(item, 'east', 'original:1');
+    mockClusterFetch.mockResolvedValue({ json: async () => ({ items: [mockPodData] }) });
+    const origins: ReturnType<typeof getResourceDiscoveryConnection>[] = [];
+    const getLogs = vi.spyOn(Pod.prototype, 'getLogs').mockImplementation(function (this: Pod) {
+      origins.push(getResourceDiscoveryConnection(this));
+      return () => {};
+    });
+
+    try {
+      render(
+        <TestContext>
+          <WorkloadLogs item={item} />
+        </TestContext>
+      );
+      await waitFor(() => expect(getLogs).toHaveBeenCalled());
+      expect(mockClusterFetch).toHaveBeenCalledWith(
+        expect.stringContaining('__headlamp_connection_revision=original'),
+        { cluster: 'east', expectedDiscoveryConnection: { revision: 'original:1' } }
+      );
+      expect(origins).toContainEqual({ cluster: 'east', revision: 'original:1' });
+    } finally {
+      getLogs.mockRestore();
+      revision.mockRestore();
+    }
+  });
+
+  it('discards the old workload pod lookup when the same name opens on a replacement connection', async () => {
+    const original = new Deployment(deploymentData as any, 'east');
+    const replacement = new Deployment(deploymentData as any, 'east');
+    const revision = vi
+      .spyOn(discoveredRevisions, 'getDiscoveredConnectionRevision')
+      .mockReturnValue('original:1');
+    recordDiscoveryConnection(original, 'east', 'original:1');
+    recordDiscoveryConnection(replacement, 'east', 'replacement:2');
+    const late = Promise.withResolvers<Response>();
+    mockClusterFetch
+      .mockReturnValueOnce(late.promise)
+      .mockResolvedValueOnce(Response.json({ items: [mockPodData] }));
+    const origins: Array<string | undefined> = [];
+    const getLogs = vi.spyOn(Pod.prototype, 'getLogs').mockImplementation(function (this: Pod) {
+      origins.push(getResourceDiscoveryConnection(this)?.revision);
+      return () => {};
+    });
+    const content = (item: Deployment) => (
+      <TestContext>
+        <WorkloadLogs item={item} />
+      </TestContext>
+    );
+    const { rerender } = render(content(original));
+
+    try {
+      await waitFor(() => expect(mockClusterFetch).toHaveBeenCalledTimes(1));
+      revision.mockReturnValue('replacement:2');
+      rerender(content(replacement));
+      await waitFor(() => expect(origins).toContain('replacement:2'));
+      await act(async () => {
+        late.resolve(Response.json({ items: [mockPodData] }));
+      });
+      expect(origins).not.toContain('original:1');
+      expect(mockClusterFetch).toHaveBeenLastCalledWith(
+        expect.stringContaining('__headlamp_connection_revision=replacement'),
+        { cluster: 'east', expectedDiscoveryConnection: { revision: 'replacement:2' } }
+      );
+    } finally {
+      getLogs.mockRestore();
+      revision.mockRestore();
+    }
   });
 
   it('launches activity with correct metadata on click', () => {

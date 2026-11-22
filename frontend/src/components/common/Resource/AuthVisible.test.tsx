@@ -15,9 +15,15 @@
  */
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from '../../../lib/k8s/api/v2/ApiError';
+import { getDiscoveredConnectionRevision } from '../../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import { recordDiscoveryConnection } from '../../../lib/k8s/api/v2/discoveryConnection';
+import { KubeObject } from '../../../lib/k8s/KubeObject';
+import { setConfig } from '../../../redux/configSlice';
+import store from '../../../redux/stores/store';
 import AuthVisible from './AuthVisible';
 
 describe('AuthVisible', () => {
@@ -35,6 +41,57 @@ describe('AuthVisible', () => {
         },
       },
     });
+  });
+
+  it.each([401, 403])('does not retry an authorization error with status %s', async status => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const getAuthorization = vi
+        .fn()
+        .mockRejectedValue(Object.assign(new Error('Forbidden'), { status }));
+      const onError = vi.fn();
+      render(
+        <QueryClientProvider client={queryClient}>
+          <AuthVisible
+            item={{ apiName: 'pods', apiVersion: 'v1', getAuthorization } as any}
+            authVerb="get"
+            onError={onError}
+          >
+            <div>Authorized Content</div>
+          </AuthVisible>
+        </QueryClientProvider>
+      );
+
+      await act(async () => vi.advanceTimersByTimeAsync(10_000));
+      expect(getAuthorization).toHaveBeenCalledOnce();
+      expect(onError).toHaveBeenCalledWith(expect.objectContaining({ status }));
+      expect(screen.queryByText('Authorized Content')).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports denial immediately for a retained item whose connection is already gone', () => {
+    const item = {
+      _class: () => ({ apiName: 'pods', apiVersion: 'v1' }),
+      cluster: 'inactive-cluster',
+      getName: () => 'retained-pod',
+      getAuthorization: vi.fn(),
+    };
+    recordDiscoveryConnection(item, item.cluster, 'old:1');
+    const onAuthResult = vi.fn();
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <AuthVisible item={item as any} authVerb="delete" onAuthResult={onAuthResult}>
+          <div>Delete retained pod</div>
+        </AuthVisible>
+      </QueryClientProvider>
+    );
+
+    expect(onAuthResult).toHaveBeenCalledWith({ allowed: false, reason: '' });
+    expect(item.getAuthorization).not.toHaveBeenCalled();
+    expect(screen.queryByText('Delete retained pod')).not.toBeInTheDocument();
   });
 
   it('renders children if authorized', async () => {
@@ -105,6 +162,29 @@ describe('AuthVisible', () => {
     });
 
     expect(screen.queryByText('Authorized Content')).toBeNull();
+  });
+
+  it('recovers authorization after a transient error', async () => {
+    queryClient.setDefaultOptions({ queries: { retryDelay: 0 } });
+    const subject = {
+      apiName: 'pods',
+      apiVersion: 'v1',
+      getAuthorization: vi
+        .fn()
+        .mockRejectedValueOnce(new ApiError('Unavailable', { status: 503 }))
+        .mockResolvedValueOnce({ status: { allowed: true } }),
+    };
+    const onError = vi.fn();
+    render(
+      <QueryClientProvider client={queryClient}>
+        <AuthVisible item={subject as any} authVerb="get" onError={onError}>
+          <div>Authorized after retry</div>
+        </AuthVisible>
+      </QueryClientProvider>
+    );
+    expect(await screen.findByText('Authorized after retry')).toBeInTheDocument();
+    expect(subject.getAuthorization).toHaveBeenCalledTimes(2);
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it('isolates authorization results by cluster while sharing them within a cluster', async () => {
@@ -184,27 +264,155 @@ describe('AuthVisible', () => {
     expect(clusterBItem.getAuthorization).toHaveBeenCalledTimes(1);
   });
 
-  it('checks the given cluster instead of the item one', async () => {
-    const mockItem = {
-      _class: () => ({ apiName: 'deviceclasses', apiVersion: 'resource.k8s.io/v1' }),
-      cluster: 'legacy',
-      getAuthorization: vi.fn().mockResolvedValue({ status: { allowed: true, reason: '' } }),
+  it('rechecks permissions on a same-name replacement and hides actions for the retained item', async () => {
+    const cluster = 'discovered';
+    const previousClusters = store.getState().config.clusters;
+    const select = (revision: string) =>
+      store.dispatch(
+        setConfig({
+          clusters: {
+            ...previousClusters,
+            [cluster]: {
+              name: cluster,
+              auth_type: 'oidc',
+              server: 'https://discovered.example.com',
+              meta_data: {
+                discoveryConnectionRevision: revision,
+                discoveryOrigin: {
+                  cluster: 'hub',
+                  resource: {
+                    apiVersion: 'example.test/v1',
+                    kind: 'Cluster',
+                    namespace: 'default',
+                    name: cluster,
+                    uid: 'fixture-uid',
+                  },
+                },
+              },
+            },
+          },
+        })
+      );
+    const lateGrant = Promise.withResolvers<{ status: { allowed: boolean } }>();
+    const subject = {
+      apiName: 'pods',
+      apiVersion: 'v1',
+      getAuthorization: vi
+        .fn()
+        .mockResolvedValueOnce({ status: { allowed: true } })
+        .mockReturnValueOnce(lateGrant.promise)
+        .mockResolvedValueOnce({ status: { allowed: false, reason: 'Denied on replacement' } }),
     };
+    const retained = {
+      _class: () => subject,
+      cluster,
+      getName: () => 'retained-pod',
+      getAuthorization: vi.fn().mockResolvedValue({ status: { allowed: true } }),
+    };
+    select('original');
+    recordDiscoveryConnection(retained, cluster, getDiscoveredConnectionRevision(cluster));
+    const onAuthResult = vi.fn();
+    const onCreateResult = vi.fn();
+    const result = render(
+      <QueryClientProvider client={queryClient}>
+        <AuthVisible
+          item={subject as any}
+          authVerb="create"
+          cluster={cluster}
+          onAuthResult={onCreateResult}
+        >
+          <div>Create pod</div>
+        </AuthVisible>
+        <AuthVisible item={retained as any} authVerb="delete" onAuthResult={onAuthResult}>
+          <div>Delete retained pod</div>
+        </AuthVisible>
+      </QueryClientProvider>
+    );
+    try {
+      await screen.findByText('Create pod');
+      await screen.findByText('Delete retained pod');
+      act(() => {
+        void queryClient.invalidateQueries({
+          predicate: query => query.queryKey[0] === 'authVisible' && query.queryKey[4] === 'create',
+        });
+      });
+      await waitFor(() => expect(subject.getAuthorization).toHaveBeenCalledTimes(2));
+      act(() => {
+        select('replacement');
+      });
+      await waitFor(() =>
+        expect(onCreateResult).toHaveBeenLastCalledWith({
+          allowed: false,
+          reason: 'Denied on replacement',
+        })
+      );
+      expect(subject.getAuthorization).toHaveBeenCalledTimes(3);
+      await act(async () => {
+        lateGrant.resolve({ status: { allowed: true } });
+      });
+      expect(onCreateResult).toHaveBeenLastCalledWith({
+        allowed: false,
+        reason: 'Denied on replacement',
+      });
+      expect(screen.queryByText('Create pod')).not.toBeInTheDocument();
+      expect(screen.queryByText('Delete retained pod')).not.toBeInTheDocument();
+      expect(retained.getAuthorization).toHaveBeenCalledOnce();
+      expect(onAuthResult).toHaveBeenLastCalledWith({ allowed: false, reason: '' });
+    } finally {
+      result.unmount();
+      store.dispatch(setConfig({ clusters: previousClusters }));
+    }
+  });
+
+  it('checks the given cluster instead of the item one', async () => {
+    const item = new KubeObject(
+      {
+        apiVersion: 'resource.k8s.io/v1',
+        kind: 'DeviceClass',
+        metadata: { name: 'device', uid: 'device-uid', creationTimestamp: '2026-01-01T00:00:00Z' },
+      },
+      'legacy'
+    );
+    const check = vi
+      .spyOn(item, 'getAuthorization')
+      .mockResolvedValue({ status: { allowed: true, reason: '' } });
 
     render(
       <QueryClientProvider client={queryClient}>
-        <AuthVisible item={mockItem as any} authVerb="create" cluster="dra">
+        <AuthVisible item={item} authVerb="create" cluster="dra">
           <div>Create</div>
         </AuthVisible>
       </QueryClientProvider>
     );
 
     await waitFor(() => expect(screen.getByText('Create')).toBeInTheDocument());
-    expect(mockItem.getAuthorization).toHaveBeenCalledWith(
+    expect(check).toHaveBeenCalledWith(
       'create',
       { subresource: undefined, namespace: undefined },
       'dra'
     );
+  });
+
+  it('requires the cluster that supplied a discovered resource', async () => {
+    const item = {
+      _class: () => ({ apiName: 'pods', apiVersion: 'v1' }),
+      cluster: 'original',
+      getName: () => 'retained-pod',
+      getAuthorization: vi.fn().mockResolvedValue({ status: { allowed: true } }),
+    };
+    recordDiscoveryConnection(item, 'original', 'original:1');
+
+    await act(async () => {
+      render(
+        <QueryClientProvider client={queryClient}>
+          <AuthVisible item={item as any} authVerb="delete" cluster="other">
+            <div>Delete retained pod</div>
+          </AuthVisible>
+        </QueryClientProvider>
+      );
+    });
+    expect(item.getAuthorization).not.toHaveBeenCalled();
+    expect(screen.queryByText('Delete retained pod')).not.toBeInTheDocument();
   });
 
   it('warns and returns null if authVerb is invalid', () => {

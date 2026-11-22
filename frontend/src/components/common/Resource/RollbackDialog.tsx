@@ -30,6 +30,12 @@ import Radio from '@mui/material/Radio';
 import Typography from '@mui/material/Typography';
 import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { getDiscoveredConnectionRevision } from '../../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import {
+  assertCurrentDiscoveryConnection,
+  type DiscoveryConnectionRequest,
+  getResourceDiscoveryConnection,
+} from '../../../lib/k8s/api/v2/discoveryConnection';
 import type { KubeObjectInterface } from '../../../lib/k8s/KubeObject';
 import type { RevisionInfo } from '../../../lib/k8s/rollback';
 import { DateLabel } from '../Label';
@@ -43,8 +49,10 @@ interface RollbackDialogProps {
   resourceKind: string;
   /** The name of the resource */
   resourceName: string;
-  /** The resource instance (needed for dry-run) */
+  /** The resource instance used for dry run. */
   resource: RollbackableResource;
+  /** The connection already captured by the caller, if available. */
+  expectedDiscoveryConnection?: DiscoveryConnectionRequest;
   /** Function to fetch revision history */
   getRevisionHistory: () => Promise<RevisionInfo[]>;
   /** Callback when dialog is closed (cancelled) */
@@ -61,9 +69,24 @@ interface RollbackDialogProps {
  * and shows the full resulting resource YAML in a read-only editor.
  */
 export default function RollbackDialog(props: RollbackDialogProps) {
-  const { open, resourceKind, resourceName, resource, getRevisionHistory, onClose, onConfirm } =
-    props;
+  const { open, onClose } = props;
   const { t } = useTranslation(['translation']);
+
+  // Keep the displayed resource, its callbacks, and its connection together until close.
+  const [target, setTarget] = useState<{ props: RollbackDialogProps; revision?: string } | null>(
+    null
+  );
+  if (open && !target) {
+    const { resource, expectedDiscoveryConnection } = props;
+    const connection = expectedDiscoveryConnection ?? getResourceDiscoveryConnection(resource);
+    const revision = connection
+      ? connection.revision
+      : getDiscoveredConnectionRevision(resource.cluster);
+    setTarget({ props, revision });
+  } else if (!open && target) {
+    setTarget(null);
+  }
+  const { resourceKind, resourceName } = target?.props ?? props;
 
   const [revisions, setRevisions] = useState<RevisionInfo[]>([]);
   const [selectedRevision, setSelectedRevision] = useState<number | undefined>(undefined);
@@ -77,7 +100,7 @@ export default function RollbackDialog(props: RollbackDialogProps) {
   const [previewError, setPreviewError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!open) {
+    if (!target) {
       // A preview that is still loading belongs to the closed dialog, so drop its result.
       previewRequestId.current++;
       setPreviewLoading(false);
@@ -86,6 +109,8 @@ export default function RollbackDialog(props: RollbackDialogProps) {
       setPreviewOpen(false);
       return;
     }
+    const { resource, getRevisionHistory } = target.props;
+    const { revision } = target;
 
     let isActive = true;
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -98,7 +123,14 @@ export default function RollbackDialog(props: RollbackDialogProps) {
     setPreviewError(null);
     setPreviewOpen(false);
 
-    getRevisionHistory()
+    async function loadHistory() {
+      assertCurrentDiscoveryConnection(resource.cluster, revision);
+      const history = await getRevisionHistory();
+      assertCurrentDiscoveryConnection(resource.cluster, revision);
+      return history;
+    }
+
+    loadHistory()
       .then(history => {
         if (!isActive) {
           return;
@@ -114,14 +146,18 @@ export default function RollbackDialog(props: RollbackDialogProps) {
         if (!isActive) {
           return;
         }
-        setError(err instanceof Error ? err.message : String(err));
+        setError(
+          t('translation|Failed to load revision history: {{ error }}', {
+            error: err instanceof Error ? err.message : String(err),
+          })
+        );
         setLoading(false);
       });
 
     return () => {
       isActive = false;
     };
-  }, [open, getRevisionHistory]);
+  }, [target, t]);
 
   useEffect(() => {
     setPreviewData(null);
@@ -130,12 +166,19 @@ export default function RollbackDialog(props: RollbackDialogProps) {
   }, [selectedRevision]);
 
   function handleConfirm() {
+    if (!target) return;
+    try {
+      assertCurrentDiscoveryConnection(target.props.resource.cluster, target.revision);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      return;
+    }
     previewRequestId.current++;
-    onConfirm(selectedRevision);
+    target.props.onConfirm(selectedRevision);
   }
 
   async function handlePreview() {
-    if (selectedRevision === undefined) {
+    if (selectedRevision === undefined || !target) {
       return;
     }
 
@@ -145,10 +188,10 @@ export default function RollbackDialog(props: RollbackDialogProps) {
     setPreviewData(null);
 
     try {
-      const result = await resource.rollback({
-        toRevision: selectedRevision,
-        dryRun: true,
-      });
+      const { resource } = target.props;
+      assertCurrentDiscoveryConnection(resource.cluster, target.revision);
+      const result = await resource.rollback({ toRevision: selectedRevision, dryRun: true });
+      assertCurrentDiscoveryConnection(resource.cluster, target.revision);
 
       if (currentRequestId !== previewRequestId.current || !open) {
         return;
@@ -188,7 +231,7 @@ export default function RollbackDialog(props: RollbackDialogProps) {
           )}
           {error && (
             <Typography variant="body2" color="error" sx={{ py: 2 }}>
-              {t('translation|Failed to load revision history: {{ error }}', { error })}
+              {error}
             </Typography>
           )}
           {!loading && !error && (

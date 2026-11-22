@@ -15,10 +15,19 @@
  */
 
 import { useQuery } from '@tanstack/react-query';
-import React, { useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { getCluster } from '../../../lib/cluster';
+import {
+  getDiscoveredConnectionRevision,
+  useDiscoveredConnectionRevisions,
+} from '../../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import {
+  canCheckResourceAuthorization,
+  createDiscoveryConnectionChangedError,
+} from '../../../lib/k8s/api/v2/discoveryConnection';
 import { KubeObject } from '../../../lib/k8s/KubeObject';
 import { KubeObjectClass } from '../../../lib/k8s/KubeObject';
+import { shouldRetryQuery } from '../../../lib/queryClient';
 
 /** List of valid request verbs. See https://kubernetes.io/docs/reference/access-authn-authz/authorization/#determine-the-request-verb. */
 const VALID_AUTH_VERBS = [
@@ -71,9 +80,13 @@ export default function AuthVisible(props: AuthVisibleProps) {
   const itemClass: KubeObjectClass | null = (item as KubeObject)?._class?.() ?? item;
   const itemName = (item as KubeObject)?.getName?.();
   const cluster = clusterProp ?? (item as KubeObject)?.cluster ?? getCluster();
+  const revisions = useDiscoveredConnectionRevisions();
+  const revision = cluster ? revisions.get(cluster) : undefined;
+  const currentConnection = !item || canCheckResourceAuthorization(item, cluster, revision);
 
-  const { data } = useQuery<any>({
-    enabled: !!item && isAuthVerbValid,
+  const { data: authorization, error } = useQuery<any, Error>({
+    enabled: !!item && isAuthVerbValid && currentConnection,
+    retry: shouldRetryQuery,
     queryKey: [
       'authVisible',
       itemName,
@@ -83,32 +96,42 @@ export default function AuthVisible(props: AuthVisibleProps) {
       subresource,
       namespace,
       cluster,
+      revision,
     ],
-    queryFn: async () => {
-      try {
-        const res = await item!.getAuthorization(
-          authVerb,
-          { subresource, namespace },
-          cluster ?? undefined
-        );
-        return res;
-      } catch (e: any) {
-        onError?.(e);
+    queryFn: async ({ signal }) => {
+      if (cluster && getDiscoveredConnectionRevision(cluster) !== revision) {
+        throw createDiscoveryConnectionChangedError();
       }
+      signal.throwIfAborted();
+      const result = await item!.getAuthorization(
+        authVerb,
+        { subresource, namespace },
+        cluster ?? undefined
+      );
+      signal.throwIfAborted();
+      return result ?? null;
     },
   });
 
+  useEffect(() => {
+    if (error && currentConnection) onError?.(error);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [error, currentConnection]);
+
+  const data = currentConnection && !error ? authorization : undefined;
   const visible = data?.status?.allowed ?? false;
+  const wasAllowed = useRef(false);
 
   useEffect(() => {
-    if (data) {
+    if (!currentConnection || data || wasAllowed.current) {
       onAuthResult?.({
         allowed: visible,
-        reason: data.status?.reason ?? '',
+        reason: data?.status?.reason ?? '',
       });
     }
+    wasAllowed.current = visible;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data]);
+  }, [currentConnection, data]);
 
   if (!isAuthVerbValid) {
     return null;

@@ -25,9 +25,13 @@ import { useTranslation } from 'react-i18next';
 import { useDispatch } from 'react-redux';
 import { useParams } from 'react-router-dom';
 import { useCluster } from '../../lib/k8s';
-import { apply } from '../../lib/k8s/api/v1/apply';
-import { drainNode, drainNodeStatus } from '../../lib/k8s/api/v1/drainNode';
+import { drainNodeForResource, drainNodeStatusForResource } from '../../lib/k8s/api/v1/drainNode';
 import type { ApiError } from '../../lib/k8s/api/v2/ApiError';
+import {
+  getDiscoveredConnectionRevision,
+  useDiscoveredConnectionRevisions,
+} from '../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import { getResourceDiscoveryConnection } from '../../lib/k8s/api/v2/discoveryConnection';
 import type { KubeNodeSummaryStats } from '../../lib/k8s/api/v2/nodeSummaryApi';
 import { KubeContainer, KubeMetrics } from '../../lib/k8s/cluster';
 import Node from '../../lib/k8s/node';
@@ -80,6 +84,17 @@ export default function NodeDetails(props: { name?: string; cluster?: string }) 
   const urlCluster = useCluster();
   const cluster = props.cluster ?? urlCluster ?? undefined;
   const name = props.name ?? params.name;
+
+  return <NodeDetailsContent key={JSON.stringify([cluster, name])} cluster={cluster} name={name} />;
+}
+
+interface DrainTarget {
+  node: Node;
+  cluster: string;
+  revision?: string;
+}
+
+function NodeDetailsContent({ cluster, name }: { cluster?: string; name: string }) {
   const { t } = useTranslation(['glossary']);
   const dispatch: AppDispatch = useDispatch();
 
@@ -87,21 +102,21 @@ export default function NodeDetails(props: { name?: string; cluster?: string }) 
   const [nodeMetrics, metricsError] = Node.useMetrics(cluster);
   const [nodeSummaryStats, nodeSummaryError] = Node.useNodeSummaryStats(name, cluster);
   const [isupdatingNodeScheduleProperty, setisUpdatingNodeScheduleProperty] = React.useState(false);
-  const [isNodeDrainInProgress, setisNodeDrainInProgress] = React.useState(false);
-  const [pollingDrainNodeName, setPollingDrainNodeName] = React.useState<string | null>(null);
-  const [nodeFromAPI, nodeError] = Node.useGet(name, undefined, { cluster });
+  const revision = useDiscoveredConnectionRevisions().get(cluster ?? '');
+  const [submittingDrain, setSubmittingDrain] = useState<DrainTarget | null>(null);
+  const [drainingNode, setDrainingNode] = useState<DrainTarget | null>(null);
+  const isOnCurrentConnection = (target: DrainTarget | null) =>
+    !!target && target.cluster === cluster && target.revision === revision;
   const { items: nodePods, isSuccess: nodePodsLoaded } = Pod.useList({
     fieldSelector: name
       ? `spec.nodeName=${name},status.phase!=Succeeded,status.phase!=Failed`
       : undefined,
     cluster,
   });
-  const [node, setNode] = useState(nodeFromAPI);
   const noMetrics = metricsError?.status === 404;
-  const [drainDialogOpen, setDrainDialogOpen] = useState(false);
+  const [nodeToDrain, setNodeToDrain] = useState<DrainTarget | null>(null);
 
   const isMountedRef = React.useRef(true);
-  const currentNodeIdRef = React.useRef(`${cluster}:${name}`);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -109,17 +124,6 @@ export default function NodeDetails(props: { name?: string; cluster?: string }) 
       isMountedRef.current = false;
     };
   }, []);
-
-  useEffect(() => {
-    currentNodeIdRef.current = `${cluster}:${name}`;
-    setisNodeDrainInProgress(false);
-    setisUpdatingNodeScheduleProperty(false);
-    setPollingDrainNodeName(null);
-  }, [name, cluster]);
-
-  useEffect(() => {
-    setNode(nodeFromAPI);
-  }, [nodeFromAPI]);
 
   function getAddresses(item: Node) {
     return (
@@ -134,21 +138,15 @@ export default function NodeDetails(props: { name?: string; cluster?: string }) 
 
   function handleNodeScheduleState(node: Node, cordon: boolean) {
     if (!cluster) return;
-    const reqId = `${cluster}:${node.metadata.name}`;
     setisUpdatingNodeScheduleProperty(true);
-    const cloneNode = _.cloneDeep(node);
 
-    cloneNode.spec.unschedulable = !cordon;
     dispatch(
       clusterAction(
         () =>
-          apply(cloneNode.jsonData, cluster)
-            .then(() => {
-              if (isMountedRef.current && currentNodeIdRef.current === reqId) setNode(cloneNode);
-            })
+          node
+            .update({ ...node.jsonData, spec: { ...node.spec, unschedulable: !cordon } })
             .finally(() => {
-              if (isMountedRef.current && currentNodeIdRef.current === reqId)
-                setisUpdatingNodeScheduleProperty(false);
+              if (isMountedRef.current) setisUpdatingNodeScheduleProperty(false);
             }),
         {
           startMessage: cordon
@@ -166,8 +164,7 @@ export default function NodeDetails(props: { name?: string; cluster?: string }) 
             ? t('Uncordon node {{name}} cancelled.', { name: node.metadata.name })
             : t('Cordon node {{name}} cancelled.', { name: node.metadata.name }),
           cancelCallback: () => {
-            if (isMountedRef.current && currentNodeIdRef.current === reqId)
-              setisUpdatingNodeScheduleProperty(false);
+            if (isMountedRef.current) setisUpdatingNodeScheduleProperty(false);
           },
         }
       )
@@ -175,28 +172,25 @@ export default function NodeDetails(props: { name?: string; cluster?: string }) 
   }
 
   useEffect(() => {
-    const clusterName = cluster;
-    const nodeName = pollingDrainNodeName;
-
-    if (!nodeName || !clusterName) {
+    if (!drainingNode || drainingNode.cluster !== cluster || drainingNode.revision !== revision) {
       return;
     }
 
-    const drainCluster = clusterName;
-    const drainNodeName = nodeName;
-    const reqId = `${drainCluster}:${drainNodeName}`;
-    let timer: ReturnType<typeof setTimeout> | null = null;
+    const { cluster: drainCluster, node, revision: drainRevision } = drainingNode;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let active = true;
+    const isCurrent = () =>
+      active && getDiscoveredConnectionRevision(drainCluster) === drainRevision;
+    const finish = () => setDrainingNode(current => (current === drainingNode ? null : current));
 
     function poll() {
-      drainNodeStatus(drainCluster, drainNodeName)
+      drainNodeStatusForResource(drainCluster, node, drainRevision)
         .then(data => {
-          if (!isMountedRef.current || currentNodeIdRef.current !== reqId) {
-            return;
-          }
+          if (!isCurrent()) return;
 
           if (data && data.id.startsWith('error')) {
             enqueueSnackbar(data.id, { variant: 'error' });
-            setPollingDrainNodeName(null);
+            finish();
             return;
           }
 
@@ -205,98 +199,70 @@ export default function NodeDetails(props: { name?: string; cluster?: string }) 
             return;
           }
 
-          setNode(currentNode => {
-            if (!currentNode) return currentNode;
-            const cloneNode = _.cloneDeep(currentNode);
-            cloneNode.spec.unschedulable = true;
-            return cloneNode;
-          });
-          setPollingDrainNodeName(null);
+          finish();
         })
         .catch(error => {
-          if (!isMountedRef.current || currentNodeIdRef.current !== reqId) return;
-
+          if (!isCurrent()) return;
           enqueueSnackbar(error.message, { variant: 'error' });
-          setPollingDrainNodeName(null);
+          finish();
         });
     }
 
     poll();
-
     return () => {
-      if (timer) {
-        clearTimeout(timer);
-      }
+      active = false;
+      clearTimeout(timer);
     };
-  }, [pollingDrainNodeName, cluster, enqueueSnackbar]);
+  }, [drainingNode, cluster, revision, enqueueSnackbar]);
 
-  function toggleDrainDialogVisibility() {
-    setDrainDialogOpen(drainDialogOpen => !drainDialogOpen);
-  }
-
-  function handleNodeDrain(node: Node) {
-    const clusterName = cluster;
-    if (!clusterName) return;
-    const reqId = `${clusterName}:${node.metadata.name}`;
-
-    setisNodeDrainInProgress(true);
+  function handleNodeDrain(target: DrainTarget) {
+    const { node, cluster: drainCluster, revision: drainRevision } = target;
+    setSubmittingDrain(target);
+    const finish = () => {
+      if (isMountedRef.current)
+        setSubmittingDrain(current => (current === target ? null : current));
+    };
     dispatch(
       clusterAction(
         () =>
-          drainNode(clusterName, node.metadata.name)
+          drainNodeForResource(drainCluster, node, drainRevision)
             .then(() => {
-              if (isMountedRef.current && currentNodeIdRef.current === reqId)
-                setPollingDrainNodeName(node.metadata.name);
+              if (
+                isMountedRef.current &&
+                getDiscoveredConnectionRevision(drainCluster) === drainRevision
+              ) {
+                setDrainingNode(target);
+              }
             })
-            .catch(error => {
-              if (isMountedRef.current && currentNodeIdRef.current === reqId)
-                enqueueSnackbar(error.message, { variant: 'error' });
-            })
-            .finally(() => {
-              if (isMountedRef.current && currentNodeIdRef.current === reqId)
-                setisNodeDrainInProgress(false);
-            }),
+            .finally(finish),
         {
           startMessage: t('Draining node {{name}}…', { name: node.metadata.name }),
           successMessage: t('Drained node {{name}}.', { name: node.metadata.name }),
           errorMessage: t('Failed to drain node {{name}}.', { name: node.metadata.name }),
           cancelledMessage: t('Draining node {{name}} cancelled.', { name: node.metadata.name }),
-          cancelCallback: () => {
-            if (isMountedRef.current && currentNodeIdRef.current === reqId)
-              setisNodeDrainInProgress(false);
-          },
+          cancelCallback: finish,
         }
       )
     );
   }
 
-  function DrainDialog() {
-    return (
-      <>
-        <ConfirmDialog
-          title={t('Drain Node')}
-          description={t('Are you sure you want to drain the node {{name}}?', {
-            name: node?.metadata.name,
-          })}
-          onConfirm={() => {
-            setDrainDialogOpen(false);
-            handleNodeDrain(node!);
-          }}
-          handleClose={() => setDrainDialogOpen(false)}
-          open={drainDialogOpen}
-        />
-      </>
-    );
-  }
-
   return (
     <>
-      <DrainDialog />
+      <ConfirmDialog
+        title={t('Drain Node')}
+        description={t('Are you sure you want to drain the node {{name}}?', {
+          name: nodeToDrain?.node.metadata.name,
+        })}
+        onConfirm={() => {
+          if (nodeToDrain) handleNodeDrain(nodeToDrain);
+        }}
+        handleClose={() => setNodeToDrain(null)}
+        open={nodeToDrain !== null}
+      />
       <DetailsGrid
         resourceType={Node}
         name={name}
         cluster={cluster}
-        error={nodeError}
         headerSection={item => (
           <ChartsSection
             node={item}
@@ -336,9 +302,19 @@ export default function NodeDetails(props: { name?: string; cluster?: string }) 
                   <ActionButton
                     description={t('Drain')}
                     icon="mdi:delete-variant"
-                    onClick={() => toggleDrainDialogVisibility()}
+                    onClick={() => {
+                      if (!item || !cluster) return;
+                      const origin = getResourceDiscoveryConnection(item);
+                      setNodeToDrain({
+                        node: item,
+                        cluster,
+                        revision: origin ? origin.revision : revision,
+                      });
+                    }}
                     iconButtonProps={{
-                      disabled: isNodeDrainInProgress || !!pollingDrainNodeName,
+                      disabled:
+                        isOnCurrentConnection(submittingDrain) ||
+                        isOnCurrentConnection(drainingNode),
                     }}
                   />
                 </AuthVisible>

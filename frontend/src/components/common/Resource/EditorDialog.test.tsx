@@ -17,6 +17,8 @@
 import Button from '@mui/material/Button';
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import React from 'react';
+import { prepareApply } from '../../../lib/k8s/api/v1/apply';
+import { recordDiscoveryConnection } from '../../../lib/k8s/api/v2/discoveryConnection';
 import store from '../../../redux/stores/store';
 import { TestContext } from '../../../test';
 import { ActivitiesRenderer, Activity } from '../../activity/Activity';
@@ -95,6 +97,9 @@ vi.mock('../../../lib/cluster', () => ({
 
 vi.mock('../../../lib/k8s/api/v1/apply', () => ({
   apply: mockApply,
+  prepareApply: vi.fn(
+    (cluster: string) => (body: unknown, options?: unknown) => mockApply(body, cluster, options)
+  ),
 }));
 
 vi.mock('../../../redux/clusterActionSlice', async importOriginal => {
@@ -817,6 +822,7 @@ describe('EditorDialog', () => {
       })
     );
 
+    expect(vi.mocked(prepareApply).mock.lastCall?.[0]).toBe(expectedCluster);
     await act(async () => capturedAction.current?.());
     expect(mockApply).toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'Node' }),
@@ -841,6 +847,191 @@ describe('EditorDialog', () => {
       undefined
     );
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it.each([/dry run/i, /save & apply/i])(
+    'uses the editing connection for %s until Undo accepts the new baseline',
+    async actionName => {
+      const initialItem = {
+        apiVersion: 'v1',
+        kind: 'ConfigMap',
+        metadata: { name: 'settings', resourceVersion: '1' },
+        data: { key: 'original' },
+      };
+      const replacementItem = { ...initialItem, data: { key: 'replacement' } };
+      recordDiscoveryConnection(initialItem, 'discovered', 'original:1');
+      recordDiscoveryConnection(replacementItem, 'discovered', 'replacement:2');
+      const onBaselineAccepted = vi.fn();
+      const content = (item: typeof initialItem) => (
+        <TestContext>
+          <EditorDialog
+            open
+            keepMounted
+            noDialog
+            item={item}
+            onClose={vi.fn()}
+            onBaselineAccepted={onBaselineAccepted}
+          />
+        </TestContext>
+      );
+      const { rerender } = render(content(initialItem));
+      const edit = () => {
+        fireEvent.change(screen.getByRole('textbox', { name: /code/i }), {
+          target: { value: 'valid yaml' },
+        });
+        act(() => vi.advanceTimersByTime(500));
+      };
+
+      edit();
+      rerender(content(replacementItem));
+      expect(screen.getByRole('textbox', { name: /code/i })).toHaveValue('valid yaml');
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: actionName }));
+      expect(vi.mocked(prepareApply).mock.lastCall?.[0]).toBe('discovered');
+      expect(vi.mocked(prepareApply).mock.lastCall?.[1]).toBe(initialItem);
+
+      fireEvent.click(screen.getByRole('button', { name: /undo/i }));
+      expect(onBaselineAccepted).toHaveBeenCalledWith(replacementItem);
+      edit();
+      fireEvent.click(screen.getByRole('button', { name: actionName }));
+      expect(vi.mocked(prepareApply).mock.lastCall?.[1]).toBe(replacementItem);
+    }
+  );
+
+  it.each([/dry run/i, /save & apply/i])('uses the origin of array elements for %s', action => {
+    const manifest = { apiVersion: 'v1', kind: 'Node', metadata: { name: 'new' } };
+    const saved = { ...manifest, metadata: { name: 'saved' } };
+    recordDiscoveryConnection(saved, 'discovered', 'original:1');
+    renderEditorDialog({ item: [manifest, saved] });
+    fireEvent.change(screen.getByRole('textbox', { name: /code/i }), {
+      target: { value: 'valid yaml' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: action }));
+
+    expect(vi.mocked(prepareApply).mock.lastCall?.[0]).toBe('discovered');
+    expect(vi.mocked(prepareApply).mock.lastCall?.[1]).toBe(saved);
+    expect(mockClusterAction).toHaveBeenCalledOnce();
+  });
+
+  it.each([/dry run/i, /save & apply/i])(
+    'rejects mixed array element origins before %s',
+    action => {
+      const first = { apiVersion: 'v1', kind: 'Node', metadata: { name: 'first' } };
+      const second = { ...first, metadata: { name: 'second' } };
+      recordDiscoveryConnection(first, 'discovered', 'original:1');
+      recordDiscoveryConnection(second, 'discovered', 'replacement:2');
+      renderEditorDialog({ item: [first, second] });
+      fireEvent.change(screen.getByRole('textbox', { name: /code/i }), {
+        target: { value: 'valid yaml' },
+      });
+      fireEvent.click(screen.getByRole('button', { name: action }));
+
+      expect(
+        screen.getByText('Resources belong to different cluster connections.')
+      ).toBeInTheDocument();
+      expect(prepareApply).not.toHaveBeenCalled();
+      expect(mockClusterAction).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([/dry run/i, /save & apply/i])(
+    'keeps an edited array on its original connection until Undo before %s',
+    action => {
+      const original = { apiVersion: 'v1', kind: 'Node', metadata: { name: 'retained' } };
+      const replacement = { ...original };
+      recordDiscoveryConnection(original, 'discovered', 'original:1');
+      recordDiscoveryConnection(replacement, 'discovered', 'replacement:2');
+      const content = (items: object[]) => (
+        <TestContext>
+          <EditorDialog open keepMounted noDialog item={items} onClose={vi.fn()} />
+        </TestContext>
+      );
+      const { rerender } = render(content([original]));
+      const edit = () => {
+        fireEvent.change(screen.getByRole('textbox', { name: /code/i }), {
+          target: { value: 'valid yaml' },
+        });
+        act(() => vi.advanceTimersByTime(500));
+      };
+      edit();
+      rerender(content([replacement]));
+      expect(screen.getByRole('textbox', { name: /code/i })).toHaveValue('valid yaml');
+      fireEvent.click(screen.getByRole('button', { name: action }));
+      expect(vi.mocked(prepareApply).mock.lastCall?.[1]).toBe(original);
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: /undo/i }));
+      edit();
+      fireEvent.click(screen.getByRole('button', { name: action }));
+      expect(vi.mocked(prepareApply).mock.lastCall?.[1]).toBe(replacement);
+    }
+  );
+
+  describe('pending editor baseline', () => {
+    const original = {
+      kind: 'ConfigMap',
+      apiVersion: 'v1',
+      metadata: { name: 'settings', resourceVersion: '1' },
+      data: { key: 'original' },
+    };
+    const replacement = { ...original, data: { key: 'replacement' } };
+    const template = { kind: 'ConfigMap', apiVersion: 'v1', data: { key: 'template' } };
+    const content = (item: object, onBaselineAccepted: (item: unknown) => void) => (
+      <TestContext>
+        <EditorDialog
+          open
+          keepMounted
+          noDialog
+          item={item}
+          onClose={vi.fn()}
+          onBaselineAccepted={onBaselineAccepted}
+        />
+      </TestContext>
+    );
+
+    beforeEach(() => {
+      recordDiscoveryConnection(original, 'discovered', 'original:1');
+      recordDiscoveryConnection(replacement, 'discovered', 'replacement:2');
+    });
+
+    function edit(code: string) {
+      fireEvent.change(screen.getByRole('textbox', { name: /code/i }), { target: { value: code } });
+      act(() => vi.advanceTimersByTime(500));
+    }
+
+    it('discards a pending connection when accepting a different template', () => {
+      const accepted = vi.fn();
+      const { rerender } = render(content(original, accepted));
+      edit('local edits');
+      rerender(content(replacement, accepted));
+      expect(screen.getByRole('alert')).toBeInTheDocument();
+
+      rerender(content(template, accepted));
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      edit('template edits');
+      fireEvent.click(screen.getByRole('button', { name: /undo/i }));
+      expect(accepted).not.toHaveBeenCalled();
+      edit('valid yaml');
+      fireEvent.click(screen.getByRole('button', { name: /save & apply/i }));
+      expect(vi.mocked(prepareApply).mock.lastCall?.[1]).toBe(template);
+    });
+
+    it('keeps Undo available after dismissing a warning when the text already matches', () => {
+      const accepted = vi.fn();
+      const { rerender } = render(content(original, accepted));
+      const updatedCode = JSON.stringify(replacement);
+      edit(updatedCode);
+      rerender(content(replacement, accepted));
+      const alert = screen.getByRole('alert');
+      fireEvent.click(within(alert).getByRole('button', { name: /close/i }));
+      expect(screen.getByRole('textbox', { name: /code/i })).toHaveValue(updatedCode);
+
+      const undo = screen.getByRole('button', { name: /undo/i });
+      expect(undo).toBeEnabled();
+      expect(accepted).not.toHaveBeenCalled();
+      fireEvent.click(undo);
+      expect(accepted).toHaveBeenCalledWith(replacement);
+    });
   });
 
   it('uses fallback resource labels and an empty cluster for dry runs', async () => {

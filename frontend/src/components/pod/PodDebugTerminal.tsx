@@ -24,9 +24,10 @@ import { useTranslation } from 'react-i18next';
 import { DEFAULT_POD_DEBUG_IMAGE, loadClusterSettings } from '../../helpers/clusterSettings';
 import { getCluster } from '../../lib/cluster';
 import { KubeContainer, KubeContainerStatus } from '../../lib/k8s/cluster';
-import Pod from '../../lib/k8s/pod';
+import type Pod from '../../lib/k8s/pod';
 import { Channel, useTerminalStream, XTerminalConnected } from '../../lib/k8s/useTerminalStream';
 import { useTypedSelector } from '../../redux/hooks';
+import { fetchLatestKubeObject } from '../common/Resource/fetchLatestKubeObject';
 
 /**
  * Props for PodDebugTerminal.
@@ -92,6 +93,21 @@ function generateContainerName(item: Pod): string {
   return 'headlamp-debug';
 }
 
+function waitForDebugPoll(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    signal.throwIfAborted();
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, 1000);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(signal.reason);
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /**
  * Creates an ephemeral debug container and waits for it to be ready.
  * Polls pod status up to 30 times (30 seconds) for container to reach running state.
@@ -99,6 +115,7 @@ function generateContainerName(item: Pod): string {
  * @param item - Pod to add ephemeral container to
  * @param containerName - Name for the new container
  * @param debugImage - Container image for debugging
+ * @param signal - Signal for the terminal session
  * @param onError - Error handler callback
  * @param targetContainerName - Optional name of the container to target.
  *   When set, the debug container shares the target's PID namespace.
@@ -109,10 +126,12 @@ async function debugPod(
   item: Pod,
   containerName: string,
   debugImage: string,
+  signal: AbortSignal,
   onError: (message: string) => void,
   targetContainerName?: string
 ) {
   try {
+    signal.throwIfAborted();
     // Add ephemeral container to the pod
     await item.addEphemeralContainer(containerName, debugImage, ['sh'], targetContainerName);
 
@@ -121,24 +140,8 @@ async function debugPod(
     let retries = 0;
 
     while (retries < maxRetries) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
-
-      // Refresh pod data
-      const updatedPod: Pod = await new Promise<Pod>((resolve, reject) => {
-        Pod.apiGet(
-          (pod: Pod) => {
-            resolve(pod);
-          },
-          item.getName(),
-          item.getNamespace(),
-          (err: any) => {
-            if (err) reject(err);
-          },
-          {
-            cluster: item.cluster || undefined,
-          }
-        )();
-      });
+      await waitForDebugPoll(signal);
+      const updatedPod = await fetchLatestKubeObject(item, signal);
 
       // Check if ephemeral container is running
       const ephemeralStatus = updatedPod.status?.ephemeralContainerStatuses?.find(
@@ -162,6 +165,7 @@ async function debugPod(
 
     throw new Error('Timeout waiting for ephemeral container to start');
   } catch (e: any) {
+    if (signal.aborted) return {};
     console.error('Error:DebugPod: creating ephemeral container', e);
     onError(e.message || 'Failed to create debug container');
     return {};
@@ -199,7 +203,7 @@ export function PodDebugTerminal(props: PodDebugTerminalProps) {
   }, [defaultPodDebugImage]);
 
   const connectStream = useCallback(
-    async (onDataCallback: (data: ArrayBuffer) => void) => {
+    async (onDataCallback: (data: ArrayBuffer) => void, signal: AbortSignal) => {
       const cluster = getCluster();
       if (!cluster) {
         enqueueSnackbar(t('translation|No cluster selected'), { variant: 'error' });
@@ -240,6 +244,7 @@ export function PodDebugTerminal(props: PodDebugTerminalProps) {
           item,
           containerName,
           debugImage,
+          signal,
           (errorMessage: string) => {
             enqueueSnackbar(
               t('translation|Failed to create debug container: {{message}}', {
@@ -252,7 +257,7 @@ export function PodDebugTerminal(props: PodDebugTerminalProps) {
           targetContainer
         );
 
-        if (!readyContainerName) {
+        if (!readyContainerName || signal.aborted) {
           return { stream: null };
         }
 

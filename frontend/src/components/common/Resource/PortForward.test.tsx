@@ -16,7 +16,11 @@
 
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { ApiError } from '../../../lib/k8s/api/v2/ApiError';
+import { getDiscoveredConnectionRevision } from '../../../lib/k8s/api/v2/discoveredConnectionRevisions';
+import { recordDiscoveryConnection } from '../../../lib/k8s/api/v2/discoveryConnection';
 import { KubePod } from '../../../lib/k8s/pod';
+import { setConfig } from '../../../redux/configSlice';
+import appStore from '../../../redux/stores/store';
 import { TestContext } from '../../../test';
 import PortForward, { PORT_FORWARD_STOP_STATUS, PORT_FORWARDS_STORAGE_KEY } from './PortForward';
 
@@ -46,9 +50,10 @@ vi.mock('react-i18next', () => ({
 vi.mock('../../../helpers/isElectron', () => ({ isElectron: mockIsElectron }));
 vi.mock('../../../helpers/isDockerDesktop', () => ({ isDockerDesktop: mockIsDockerDesktop }));
 vi.mock('../../../lib/cluster', () => ({ getCluster: () => 'test-cluster' }));
-vi.mock('../../../lib/k8s/api/v1/portForward', () => ({
+vi.mock('../../../lib/k8s/api/v1/portForward', async importOriginal => ({
+  ...(await importOriginal<object>()),
   listPortForward: mockListPortForward,
-  startPortForward: mockStartPortForward,
+  startPortForwardForConnection: mockStartPortForward,
   stopOrDeletePortForward: mockStopOrDeletePortForward,
 }));
 vi.mock('../../../lib/k8s/pod', () => ({
@@ -253,19 +258,251 @@ describe('PortForward stop handler', () => {
 
     await screen.findByRole('link', { name: 'http://127.0.0.1:8080' });
     expect(mockStartPortForward).toHaveBeenCalledWith(
-      'test-cluster',
-      'default',
-      'my-pod',
-      80,
-      '',
-      'default',
-      '8080',
-      'localhost',
-      undefined
+      { cluster: 'test-cluster', revision: undefined },
+      {
+        id: '',
+        namespace: 'default',
+        pod: 'my-pod',
+        targetPort: '80',
+        service: '',
+        serviceNamespace: 'default',
+        port: '8080',
+        address: 'localhost',
+      }
     );
     expect(JSON.parse(localStorage.getItem(PORT_FORWARDS_STORAGE_KEY)!)).toEqual([
       runningPortForward,
     ]);
+  });
+
+  function selectPortForwardConnection(revision: string) {
+    const cluster = 'discovered-forward';
+    const previous = appStore.getState().config.clusters;
+    appStore.dispatch(
+      setConfig({
+        clusters: {
+          ...previous,
+          [cluster]: {
+            name: cluster,
+            auth_type: 'oidc',
+            server: 'https://proxy.example.test',
+            meta_data: {
+              discoveryConnectionRevision: revision,
+              discoveryOrigin: {
+                cluster: 'management',
+                resource: {
+                  apiVersion: 'fleet.example.test/v1',
+                  kind: 'Cluster',
+                  namespace: 'default',
+                  name: cluster,
+                  uid: revision,
+                },
+              },
+            },
+          },
+        },
+      })
+    );
+    const pod = makePod();
+    pod.cluster = cluster;
+    recordDiscoveryConnection(pod, cluster, getDiscoveredConnectionRevision(cluster));
+    return pod;
+  }
+
+  const renderResource = (pod: KubePod, containerPort: number | string = 80) => (
+    <TestContext>
+      <PortForward containerPort={containerPort} resource={pod} />
+    </TestContext>
+  );
+
+  it('rejects confirmation for a pod from a replaced connection', async () => {
+    const previous = appStore.getState().config.clusters;
+    mockListPortForward.mockResolvedValue([]);
+    const { rerender, unmount } = render(renderResource(selectPortForwardConnection('original')));
+    try {
+      fireEvent.click(await screen.findByLabelText(/start port forward/i));
+      act(() => rerender(renderResource(selectPortForwardConnection('replacement'))));
+      fireEvent.click(screen.getByRole('button', { name: 'translation|Start' }));
+      expect(mockStartPortForward).not.toHaveBeenCalled();
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'Discovered cluster connection changed'
+      );
+    } finally {
+      unmount();
+      appStore.dispatch(setConfig({ clusters: previous }));
+    }
+  });
+
+  it.each(['stop', 'delete'] as const)(
+    'keeps the replacement start pending after a late %s',
+    async action => {
+      const previous = appStore.getState().config.clusters;
+      const original = {
+        ...runningPortForward,
+        cluster: 'discovered-forward',
+        connectionRevision: 'original',
+        status: action === 'stop' ? runningPortForward.status : PORT_FORWARD_STOP_STATUS,
+      };
+      const replacement = {
+        ...original,
+        id: 'replacement-id',
+        port: '8081',
+        connectionRevision: 'replacement',
+        status: runningPortForward.status,
+      };
+      const oldAction = Promise.withResolvers<string>();
+      const newStart = Promise.withResolvers<typeof replacement>();
+      mockListPortForward.mockResolvedValueOnce([original]).mockResolvedValue([]);
+      mockStopOrDeletePortForward.mockReturnValueOnce(oldAction.promise);
+      mockStartPortForward.mockReturnValueOnce(newStart.promise);
+      const { rerender, unmount } = render(renderResource(selectPortForwardConnection('original')));
+      try {
+        fireEvent.click(await screen.findByLabelText(new RegExp(`${action} port forward`, 'i')));
+        expect(mockStopOrDeletePortForward).toHaveBeenCalledWith(
+          original.cluster,
+          original.id,
+          action === 'stop'
+        );
+
+        await act(async () => rerender(renderResource(selectPortForwardConnection('replacement'))));
+        fireEvent.click(await screen.findByLabelText(/start port forward/i));
+        fireEvent.click(await screen.findByRole('button', { name: 'translation|Start' }));
+        expect(await screen.findByRole('progressbar')).toBeInTheDocument();
+        if (action === 'delete') {
+          localStorage.setItem(PORT_FORWARDS_STORAGE_KEY, JSON.stringify([original, replacement]));
+        }
+
+        await act(async () => oldAction.resolve('ok'));
+        expect(screen.getByRole('progressbar')).toBeInTheDocument();
+        if (action === 'delete') {
+          expect(JSON.parse(localStorage.getItem(PORT_FORWARDS_STORAGE_KEY)!)).toEqual([
+            replacement,
+          ]);
+        }
+
+        await act(async () => newStart.resolve(replacement));
+        expect(
+          await screen.findByRole('link', { name: 'http://127.0.0.1:8081' })
+        ).toBeInTheDocument();
+      } finally {
+        unmount();
+        appStore.dispatch(setConfig({ clusters: previous }));
+      }
+    }
+  );
+
+  it.each(['Stop', 'Delete'] as const)(
+    'does not expose the replacement %s control on a retained Pod',
+    async action => {
+      const previous = appStore.getState().config.clusters;
+      const original = selectPortForwardConnection('original');
+      const forward = {
+        ...runningPortForward,
+        cluster: original.cluster,
+        connectionRevision: 'original',
+        status: action === 'Stop' ? runningPortForward.status : PORT_FORWARD_STOP_STATUS,
+      };
+      mockListPortForward
+        .mockResolvedValueOnce([forward])
+        .mockResolvedValue([
+          { ...forward, id: 'replacement-id', connectionRevision: 'replacement' },
+        ]);
+      const { unmount } = render(renderResource(original));
+      try {
+        const control = new RegExp(`${action} port forward`, 'i');
+        await screen.findByLabelText(control);
+        await act(async () => {
+          selectPortForwardConnection('replacement');
+        });
+
+        expect(screen.queryByLabelText(control)).not.toBeInTheDocument();
+        expect(mockListPortForward).toHaveBeenCalledOnce();
+        expect(mockStopOrDeletePortForward).not.toHaveBeenCalled();
+      } finally {
+        unmount();
+        appStore.dispatch(setConfig({ clusters: previous }));
+      }
+    }
+  );
+
+  it('does not display original sessions for a same-named replacement pod', async () => {
+    const previous = appStore.getState().config.clusters;
+    const oldForward = {
+      ...runningPortForward,
+      cluster: 'discovered-forward',
+      connectionRevision: 'original',
+    };
+    const lateStart = Promise.withResolvers<typeof oldForward>();
+    mockListPortForward.mockResolvedValueOnce([]).mockResolvedValue([oldForward]);
+    mockStartPortForward.mockReturnValue(lateStart.promise);
+    const { rerender, unmount } = render(renderResource(selectPortForwardConnection('original')));
+    try {
+      fireEvent.click(await screen.findByLabelText(/start port forward/i));
+      fireEvent.click(screen.getByRole('button', { name: 'translation|Start' }));
+      expect(mockStartPortForward).toHaveBeenCalledOnce();
+      act(() => rerender(renderResource(selectPortForwardConnection('replacement'))));
+      await act(async () => lateStart.resolve(oldForward));
+      expect(screen.queryByRole('link', { name: 'http://127.0.0.1:8080' })).not.toBeInTheDocument();
+      expect(
+        await screen.findByRole('button', { name: 'translation|Start port forward' })
+      ).toBeEnabled();
+    } finally {
+      unmount();
+      appStore.dispatch(setConfig({ clusters: previous }));
+    }
+  });
+
+  it('clears a pending start when the retained pod loses its connection', async () => {
+    const previous = appStore.getState().config.clusters;
+    const original = selectPortForwardConnection('original');
+    const forward = {
+      ...runningPortForward,
+      cluster: original.cluster,
+      connectionRevision: 'original',
+    };
+    const pendingStart = Promise.withResolvers<typeof forward>();
+    mockListPortForward.mockResolvedValue([]);
+    mockStartPortForward.mockReturnValueOnce(pendingStart.promise);
+    const { unmount } = render(renderResource(original));
+    try {
+      fireEvent.click(await screen.findByLabelText(/start port forward/i));
+      fireEvent.click(screen.getByRole('button', { name: 'translation|Start' }));
+      expect(await screen.findByRole('progressbar')).toBeInTheDocument();
+
+      await act(async () => {
+        selectPortForwardConnection('replacement');
+      });
+      expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
+      await act(async () => pendingStart.resolve(forward));
+      expect(screen.queryByRole('link', { name: 'http://127.0.0.1:8080' })).not.toBeInTheDocument();
+    } finally {
+      unmount();
+      appStore.dispatch(setConfig({ clusters: previous }));
+    }
+  });
+
+  it('uses a named port from the supplied pod even when it cannot list pods', async () => {
+    const pod = makePod();
+    pod.spec.containers = [
+      {
+        name: 'web',
+        image: 'web',
+        imagePullPolicy: 'IfNotPresent',
+        ports: [{ name: 'http', containerPort: 8081 }],
+      },
+    ];
+    mockUsePodList.mockReturnValue([null, new ApiError('Cannot list pods', { status: 403 })]);
+    mockListPortForward.mockResolvedValue([]);
+    mockStartPortForward.mockResolvedValue(runningPortForward);
+    render(renderResource(pod, 'http'));
+    fireEvent.click(await screen.findByLabelText(/start port forward/i));
+    fireEvent.click(screen.getByRole('button', { name: 'translation|Start' }));
+    expect(mockUsePodList).toHaveBeenCalledWith(expect.objectContaining({ clusters: [] }));
+    expect(mockStartPortForward).toHaveBeenCalledWith(
+      { cluster: 'test-cluster', revision: undefined },
+      expect.objectContaining({ pod: 'my-pod', targetPort: '8081' })
+    );
+    await screen.findByRole('link', { name: 'http://127.0.0.1:8080' });
   });
 
   it('cancels the start dialog without contacting the backend', async () => {
@@ -320,15 +557,17 @@ describe('PortForward stop handler', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('port is occupied');
     expect(mockStartPortForward).toHaveBeenCalledWith(
-      'test-cluster',
-      'default',
-      'my-pod',
-      80,
-      '',
-      'default',
-      '8080',
-      'localhost',
-      'pf-1'
+      { cluster: 'test-cluster', revision: undefined },
+      {
+        id: 'pf-1',
+        namespace: 'default',
+        pod: 'my-pod',
+        targetPort: '80',
+        service: '',
+        serviceNamespace: 'default',
+        port: '8080',
+        address: 'localhost',
+      }
     );
     expect(JSON.parse(localStorage.getItem(PORT_FORWARDS_STORAGE_KEY)!)).toEqual([]);
     fireEvent.click(screen.getByRole('button', { name: 'Close' }));
@@ -400,15 +639,17 @@ describe('PortForward stop handler', () => {
     fireEvent.click(screen.getByRole('button', { name: 'translation|Start' }));
     await waitFor(() =>
       expect(mockStartPortForward).toHaveBeenCalledWith(
-        'service-cluster',
-        'default',
-        'my-pod',
-        8081,
-        'web-service',
-        'default',
-        undefined,
-        'localhost',
-        undefined
+        { cluster: 'service-cluster', revision: undefined },
+        {
+          id: '',
+          namespace: 'default',
+          pod: 'my-pod',
+          targetPort: '8081',
+          service: 'web-service',
+          serviceNamespace: 'default',
+          port: undefined,
+          address: 'localhost',
+        }
       )
     );
     expect(mockUsePodList).toHaveBeenCalledWith({
@@ -439,15 +680,17 @@ describe('PortForward stop handler', () => {
       fireEvent.click(screen.getByRole('button', { name: 'translation|Start' }));
       await waitFor(() =>
         expect(mockStartPortForward).toHaveBeenCalledWith(
-          'test-cluster',
-          'default',
-          'my-pod',
-          80,
-          '',
-          'default',
-          '31000',
-          '0.0.0.0',
-          undefined
+          { cluster: 'test-cluster', revision: undefined },
+          {
+            id: '',
+            namespace: 'default',
+            pod: 'my-pod',
+            targetPort: '80',
+            service: '',
+            serviceNamespace: 'default',
+            port: '31000',
+            address: '0.0.0.0',
+          }
         )
       );
       expect(random).toHaveBeenCalledTimes(2);

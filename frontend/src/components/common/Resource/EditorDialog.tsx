@@ -33,7 +33,11 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { useDispatch } from 'react-redux';
 import { getCluster } from '../../../lib/cluster';
-import { apply, ApplyOptions } from '../../../lib/k8s/api/v1/apply';
+import { ApplyOptions, prepareApply } from '../../../lib/k8s/api/v1/apply';
+import {
+  createDiscoveryConnectionChangedError,
+  getResourceDiscoveryConnection,
+} from '../../../lib/k8s/api/v2/discoveryConnection';
 import { KubeObjectInterface } from '../../../lib/k8s/KubeObject';
 import { useId } from '../../../lib/util';
 import { clusterAction } from '../../../redux/clusterActionSlice';
@@ -55,6 +59,24 @@ import SimpleEditor from './SimpleEditor';
 import { UploadDialog } from './UploadDialog';
 
 type KubeObjectIsh = Partial<KubeObjectInterface>;
+
+function resolveApplySource(source?: object) {
+  let resource = source;
+  let origin = source && getResourceDiscoveryConnection(source);
+  if (Array.isArray(source)) {
+    for (const item of source) {
+      const itemOrigin = getResourceDiscoveryConnection(item);
+      if (!itemOrigin) continue;
+      if (!origin) {
+        origin = itemOrigin;
+        resource = item;
+      } else if (itemOrigin.cluster !== origin.cluster || itemOrigin.revision !== origin.revision) {
+        return { resource, origin, mixedOrigins: true };
+      }
+    }
+  }
+  return { resource, origin, mixedOrigins: false };
+}
 
 export interface EditorDialogProps extends DialogProps {
   /** The object(s) to edit, or null to make the dialog be in "loading mode". Pass it an empty object if no contents are to be shown when the dialog is first open. */
@@ -128,6 +150,7 @@ export default function EditorDialog(props: EditorDialogProps) {
   };
   const initialCode = typeof item === 'string' ? item : yaml.dump(item || {});
   const originalCodeRef = React.useRef({ code: initialCode, format: item ? 'yaml' : '' });
+  const applySourceRef = React.useRef(item && typeof item === 'object' ? item : undefined);
   const [code, setCode] = React.useState(originalCodeRef.current);
   const codeRef = React.useRef(code);
   const lastCodeCheckHandler = React.useRef(0);
@@ -137,7 +160,10 @@ export default function EditorDialog(props: EditorDialogProps) {
   // The server object `originalCodeRef` was last rebased onto, so Undo can hand the
   // same version to the save-baseline owner (see `onBaselineAccepted`). Only Undo
   // consumes this — plain edits never rebase the save baseline while they're unsaved.
-  const pendingBaselineItemRef = React.useRef<KubeObjectInterface | null>(null);
+  const pendingBaselineRef = React.useRef<{
+    item?: KubeObjectInterface;
+    source: object;
+  } | null>(null);
   const [error, setError] = React.useState('');
   const [resourceModifiedWarning, setResourceModifiedWarning] = React.useState(false);
   const [docSpecs, setDocSpecs] = React.useState<
@@ -205,10 +231,13 @@ export default function EditorDialog(props: EditorDialogProps) {
 
   // Update the code when the item changes, but only if the code hasn't been touched.
   React.useEffect(() => {
+    const source = item && typeof item === 'object' ? item : undefined;
     const clonedItem = _.cloneDeep(item);
     if (!item || Object.keys(item || {}).length === 0) {
       const defaultCode = '# Enter your YAML or JSON here';
       originalCodeRef.current = { code: defaultCode, format: 'yaml' };
+      applySourceRef.current = source;
+      pendingBaselineRef.current = null;
       setCode({ code: defaultCode, format: 'yaml' });
       return;
     }
@@ -225,28 +254,44 @@ export default function EditorDialog(props: EditorDialogProps) {
 
     // Check for external modification conflict BEFORE any setCode call so that
     // user edits are never silently overwritten when a version conflict is detected.
-    if (isKubeObjectIsh(item) && item.metadata) {
-      const newVersion = item.metadata!.resourceVersion || '';
-      const resourceVersionsDiffer = (previousVersionRef.current || '') !== newVersion;
+    const metadata = isKubeObjectIsh(item) ? item.metadata : undefined;
+    if (source && (metadata || Array.isArray(item))) {
+      const newVersion = metadata?.resourceVersion || '';
+      const resourceVersionsDiffer = !!metadata && previousVersionRef.current !== newVersion;
+      const current = resolveApplySource(applySourceRef.current);
+      const incoming = resolveApplySource(source);
+      const connectionChanged =
+        current.origin?.cluster !== incoming.origin?.cluster ||
+        current.origin?.revision !== incoming.origin?.revision ||
+        current.mixedOrigins !== incoming.mixedOrigins;
+      const hasPendingBaseline = !!pendingBaselineRef.current;
       // We use the codeRef in this effect instead of the code, because we need to access
       // the current state of the code but we don't want to trigger a re-render here.
       const userHasEdits = codeRef.current.code !== originalCodeRef.current.code;
 
-      if (resourceVersionsDiffer && userHasEdits && !treatItemChangesAsEdits && onSave !== null) {
+      if (
+        (resourceVersionsDiffer || connectionChanged || hasPendingBaseline) &&
+        (userHasEdits || (connectionChanged && hasPendingBaseline)) &&
+        !treatItemChangesAsEdits &&
+        onSave !== null
+      ) {
         // Resource was externally modified (server-side) while the user has unsaved edits —
         // warn them and return early to preserve their work. Skipped when treatItemChangesAsEdits
         // is true because in that mode item changes come from the user's own form, not the server.
         // Update the baseline so "Undo Changes" restores to the latest server
         // version rather than the stale version the editor was opened with.
         originalCodeRef.current = { code: itemCode, format };
-        pendingBaselineItemRef.current = clonedItem as KubeObjectInterface;
+        pendingBaselineRef.current = {
+          item: metadata ? (clonedItem as KubeObjectInterface) : undefined,
+          source,
+        };
         if (newVersion !== '') {
           previousVersionRef.current = newVersion;
         }
         // The server's change may coincidentally match what the user already has in the
         // editor (e.g. once rebased onto the baseline above) — only warn and preserve the
         // early return when there is still a real difference from the latest version.
-        if (codeRef.current.code !== itemCode) {
+        if (connectionChanged || codeRef.current.code !== itemCode) {
           setResourceModifiedWarning(true);
           return;
         }
@@ -258,6 +303,11 @@ export default function EditorDialog(props: EditorDialogProps) {
       // conflict, so make sure a warning left over from a previous item doesn't stay
       // stuck on screen.
       setResourceModifiedWarning(false);
+    }
+
+    if (!treatItemChangesAsEdits) {
+      applySourceRef.current = source;
+      pendingBaselineRef.current = null;
     }
 
     // Update the code if the item representation has changed.
@@ -494,18 +544,20 @@ export default function EditorDialog(props: EditorDialogProps) {
     // The user is discarding their edits in favour of whatever server version
     // originalCodeRef was last rebased onto — let the save-baseline owner rebase too,
     // so a subsequent edit + save diffs against this version rather than the stale one.
-    if (pendingBaselineItemRef.current) {
-      onBaselineAccepted?.(pendingBaselineItemRef.current);
-      pendingBaselineItemRef.current = null;
+    if (pendingBaselineRef.current) {
+      const { source, item } = pendingBaselineRef.current;
+      applySourceRef.current = source;
+      if (item) onBaselineAccepted?.(item);
+      pendingBaselineRef.current = null;
     }
   }
 
   const applyFunc = async (
     newItems: KubeObjectInterface[],
-    clusterName: string,
+    applyToCluster: ReturnType<typeof prepareApply>,
     options?: ApplyOptions
   ) => {
-    await Promise.allSettled(newItems.map(newItem => apply(newItem, clusterName, options))).then(
+    await Promise.allSettled(newItems.map(newItem => applyToCluster(newItem, options))).then(
       (values: any) => {
         values.forEach((value: any, index: number) => {
           if (value.status === 'rejected') {
@@ -554,17 +606,35 @@ export default function EditorDialog(props: EditorDialogProps) {
       return;
     }
 
+    if (mode === 'apply' && typeof onSave === 'function') {
+      onSave(obj);
+      return;
+    }
+    if (mode === 'apply' && onSave !== 'default') return;
+
     const newItemDefs = obj!;
+    const source =
+      treatItemChangesAsEdits && item && typeof item === 'object' ? item : applySourceRef.current;
+    const { resource: applySource, origin, mixedOrigins } = resolveApplySource(source);
+    if (mixedOrigins) {
+      setError(t('Resources belong to different cluster connections.'));
+      return;
+    }
+    const clusterName =
+      cluster || origin?.cluster || (source as KubeObjectIsh)?.cluster || getCluster() || '';
+    if (origin && origin.cluster !== clusterName) {
+      setError(createDiscoveryConnectionChangedError().message);
+      return;
+    }
+    const applyToCluster = prepareApply(clusterName, applySource);
+    const resourceNames = newItemDefs.map(
+      newItemDef => newItemDef.metadata?.name || newItemDef.kind || t('translation|resource')
+    );
+    setError('');
 
     if (mode === 'dryRun') {
-      const resourceNames = newItemDefs.map(
-        newItemDef => newItemDef.metadata?.name || newItemDef.kind || t('translation|resource')
-      );
-      const clusterName = cluster || (item as KubeObjectIsh)?.cluster || getCluster() || '';
-
-      setError('');
       dispatch(
-        clusterAction(() => applyFunc(newItemDefs, clusterName, { dryRun: true }), {
+        clusterAction(() => applyFunc(newItemDefs, applyToCluster, { dryRun: true }), {
           startMessage: t('translation|Running dry run for {{ newItemName }}…', {
             newItemName: resourceNames.join(','),
           }),
@@ -582,36 +652,26 @@ export default function EditorDialog(props: EditorDialogProps) {
       return;
     }
 
-    if (typeof onSave === 'string' && onSave === 'default') {
-      const resourceNames = newItemDefs.map(
-        newItemDef => newItemDef.metadata?.name || newItemDef.kind || t('translation|resource')
-      );
-      const clusterName = cluster || (item as KubeObjectIsh)?.cluster || getCluster() || '';
+    dispatch(
+      clusterAction(() => applyFunc(newItemDefs, applyToCluster), {
+        startMessage: t('translation|Applying {{ newItemName }}…', {
+          newItemName: resourceNames.join(','),
+        }),
+        cancelledMessage: t('translation|Cancelled applying {{ newItemName }}.', {
+          newItemName: resourceNames.join(','),
+        }),
+        successMessage: t('translation|Applied {{ newItemName }}.', {
+          newItemName: resourceNames.join(','),
+        }),
+        errorMessage: t('translation|Failed to apply {{ newItemName }}.', {
+          newItemName: resourceNames.join(','),
+        }),
+      })
+    );
 
-      setError('');
-      dispatch(
-        clusterAction(() => applyFunc(newItemDefs, clusterName), {
-          startMessage: t('translation|Applying {{ newItemName }}…', {
-            newItemName: resourceNames.join(','),
-          }),
-          cancelledMessage: t('translation|Cancelled applying {{ newItemName }}.', {
-            newItemName: resourceNames.join(','),
-          }),
-          successMessage: t('translation|Applied {{ newItemName }}.', {
-            newItemName: resourceNames.join(','),
-          }),
-          errorMessage: t('translation|Failed to apply {{ newItemName }}.', {
-            newItemName: resourceNames.join(','),
-          }),
-        })
-      );
-
-      dispatchCreateEvent({
-        status: EventStatus.CONFIRMED,
-      });
-    } else if (typeof onSave === 'function') {
-      onSave!(obj);
-    }
+    dispatchCreateEvent({
+      status: EventStatus.CONFIRMED,
+    });
   }
 
   function makeEditor() {
@@ -863,7 +923,7 @@ export default function EditorDialog(props: EditorDialogProps) {
       <DialogActions>
         {!isReadOnly() && (
           <ConfirmButton
-            disabled={originalCodeRef.current.code === code.code}
+            disabled={originalCodeRef.current.code === code.code && !pendingBaselineRef.current}
             color="secondary"
             variant="contained"
             aria-label={t('translation|Undo')}
